@@ -1,332 +1,241 @@
-"""
-histogram_engine_4d.py - 4D Histogram Computation with Progress Reporting
+"""Robust 2-D histogram computation for paired 4-D datasets."""
 
-Computes and caches 2D histograms for 4D datasets
-"""
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
-from typing import Tuple, Optional, Dict, Callable
-from dataclasses import dataclass
-from collections import OrderedDict
 
-# Try to import torch for GPU acceleration
 try:
     import torch
-    TORCH_AVAILABLE = torch.cuda.is_available()
-except ImportError:
-    TORCH_AVAILABLE = False
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None
+
+Range2D = Tuple[Tuple[float, float], Tuple[float, float]]
 
 
-@dataclass
+@dataclass(frozen=True)
 class HistogramData:
-    """Container for histogram data and metadata"""
-    histogram: np.ndarray  # 2D histogram array
-    x_edges: np.ndarray    # Bin edges for x-axis (neutron)
-    y_edges: np.ndarray    # Bin edges for y-axis (x-ray)
-    x_centers: np.ndarray  # Bin centers for x-axis
-    y_centers: np.ndarray  # Bin centers for y-axis
-    data_range: Tuple[Tuple[float, float], Tuple[float, float]]
+    histogram: np.ndarray
+    x_edges: np.ndarray
+    y_edges: np.ndarray
+    x_centers: np.ndarray
+    y_centers: np.ndarray
+    data_range: Range2D
     num_voxels: int
-    
+    ignored_voxels: int = 0
+
     def to_log_scale(self) -> np.ndarray:
-        """Return histogram in log scale for better visualization"""
-        return np.log10(self.histogram + 1)
+        return np.log10(self.histogram.astype(np.float64, copy=False) + 1.0)
 
 
 class HistogramEngine4D:
-    """
-    Compute and manage 2D histograms for 4D bivariate datasets
-    """
-    
     def __init__(self, bins: int = 256, cache_size: int = 10, use_gpu: bool = True):
-        """
-        Initialize histogram engine
-        
-        Args:
-            bins: Number of bins for 2D histogram
-            cache_size: Number of local histograms to cache
-            use_gpu: Whether to use GPU acceleration if available
-        """
-        self.bins = bins
-        self.cache_size = cache_size
-        self.use_gpu = use_gpu and TORCH_AVAILABLE
-        
-        # Cache for local histograms (LRU cache)
+        if bins < 2:
+            raise ValueError("bins must be at least 2")
+        if cache_size < 0:
+            raise ValueError("cache_size must be non-negative")
+        self.bins = int(bins)
+        self.cache_size = int(cache_size)
+        self.use_gpu = bool(
+            use_gpu and torch is not None and torch.cuda.is_available()
+        )
         self._local_cache: OrderedDict[int, HistogramData] = OrderedDict()
-        
-        # Global histogram (computed once)
         self._global_histogram: Optional[HistogramData] = None
-        
-        # Data range for consistent binning
-        self._data_range: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
-        
-        if self.use_gpu:
-            print("GPU acceleration enabled for histogram computation")
-        else:
-            print("Using CPU for histogram computation")
-    
+        self._data_range: Optional[Range2D] = None
+
+    @staticmethod
+    def _validate_pair(neutron: np.ndarray, xray: np.ndarray) -> None:
+        if neutron.shape != xray.shape:
+            raise ValueError(
+                f"Shape mismatch: neutron {neutron.shape} vs X-ray {xray.shape}"
+            )
+        if neutron.size == 0:
+            raise ValueError("Cannot compute a histogram from empty arrays")
+
+    @staticmethod
+    def _finite_pair(neutron: np.ndarray, xray: np.ndarray):
+        neutron_flat = np.asarray(neutron).ravel()
+        xray_flat = np.asarray(xray).ravel()
+        finite = np.isfinite(neutron_flat) & np.isfinite(xray_flat)
+        valid = int(np.count_nonzero(finite))
+        if valid == 0:
+            raise ValueError("No finite neutron/X-ray voxel pairs are available")
+        return neutron_flat[finite], xray_flat[finite], neutron_flat.size - valid
+
+    @staticmethod
+    def _safe_range(values: np.ndarray) -> tuple[float, float]:
+        minimum = float(np.min(values))
+        maximum = float(np.max(values))
+        if maximum > minimum:
+            return minimum, maximum
+        padding = max(abs(minimum) * 1e-6, 0.5)
+        return minimum - padding, maximum + padding
+
     def compute_global_histogram(
-        self, 
-        neutron_4d: np.ndarray, 
+        self,
+        neutron_4d: np.ndarray,
         xray_4d: np.ndarray,
         subsample: Optional[int] = None,
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> HistogramData:
-        """
-        Compute global histogram from entire 4D dataset
-        
-        Args:
-            neutron_4d: 4D neutron data (T, Z, Y, X)
-            xray_4d: 4D X-ray data (T, Z, Y, X)
-            subsample: If provided, subsample data by this factor
-            progress_callback: Optional callback(percentage, message)
-            
-        Returns:
-            HistogramData object containing global histogram
-        """
-        def report_progress(pct: int, msg: str):
-            if progress_callback:
-                progress_callback(pct, msg)
-        
-        report_progress(0, f"Computing global histogram ({self.bins}x{self.bins})...")
-        
-        # Apply subsampling if requested
-        if subsample and subsample > 1:
-            neutron_data = neutron_4d[::subsample, ::subsample, ::subsample, ::subsample]
-            xray_data = xray_4d[::subsample, ::subsample, ::subsample, ::subsample]
-            report_progress(20, f"Subsampled to {neutron_data.shape}")
-        else:
-            neutron_data = neutron_4d
-            xray_data = xray_4d
-        
-        report_progress(30, "Flattening data...")
-        
-        # Flatten to 1D arrays
-        neutron_flat = neutron_data.ravel()
-        xray_flat = xray_data.ravel()
-        
-        report_progress(50, "Determining data range...")
-        
-        # Determine data range for consistent binning
-        neutron_range = (float(neutron_flat.min()), float(neutron_flat.max()))
-        xray_range = (float(xray_flat.min()), float(xray_flat.max()))
-        self._data_range = (neutron_range, xray_range)
-        
-        report_progress(60, "Computing 2D histogram...")
-        
-        # Compute histogram
-        if self.use_gpu:
-            hist_data = self._compute_histogram_gpu(
-                neutron_flat, xray_flat, neutron_range, xray_range
-            )
-        else:
-            hist_data = self._compute_histogram_cpu(
-                neutron_flat, xray_flat, neutron_range, xray_range
-            )
-        
-        # Cache global histogram
-        self._global_histogram = hist_data
-        
-        report_progress(100, f"Global histogram complete: {hist_data.num_voxels:,} voxels")
-        
-        print(f"compute_global_histogram returning: {type(hist_data)}")
-        print(f"  histogram shape: {hist_data.histogram.shape}")
-        print(f"  data_range: {hist_data.data_range}")
-        
-        return hist_data
-    
+        self._validate_pair(neutron_4d, xray_4d)
+        if neutron_4d.ndim != 4:
+            raise ValueError("Global histogram inputs must be 4-D")
+        factor = 1 if subsample is None else int(subsample)
+        if factor < 1:
+            raise ValueError("subsample must be a positive integer")
+        if factor > 1:
+            slicing = (slice(None, None, factor),) * 4
+            neutron_4d = neutron_4d[slicing]
+            xray_4d = xray_4d[slicing]
+
+        if progress_callback:
+            progress_callback(25, "Filtering invalid voxel pairs...")
+        neutron, xray, ignored = self._finite_pair(neutron_4d, xray_4d)
+        data_range = (self._safe_range(neutron), self._safe_range(xray))
+
+        # A new global range invalidates every local histogram.
+        self._data_range = data_range
+        self._local_cache.clear()
+        if progress_callback:
+            progress_callback(60, "Computing global histogram...")
+        result = self._compute(neutron, xray, data_range, ignored)
+        self._global_histogram = result
+        if progress_callback:
+            progress_callback(100, "Global histogram complete")
+        return result
+
     def compute_local_histogram(
-        self, 
-        neutron_3d: np.ndarray, 
+        self,
+        neutron_3d: np.ndarray,
         xray_3d: np.ndarray,
         timepoint: int,
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> HistogramData:
-        """
-        Compute histogram for single timepoint
-        
-        Args:
-            neutron_3d: 3D neutron volume at timepoint
-            xray_3d: 3D X-ray volume at timepoint
-            timepoint: Timepoint index (for caching)
-            progress_callback: Optional callback(percentage, message)
-            
-        Returns:
-            HistogramData object for this timepoint
-        """
-        # Check cache first
+        self._validate_pair(neutron_3d, xray_3d)
+        if neutron_3d.ndim != 3:
+            raise ValueError("Local histogram inputs must be 3-D")
+        if self._data_range is None:
+            raise RuntimeError("Must compute global histogram first")
         if timepoint in self._local_cache:
             self._local_cache.move_to_end(timepoint)
             if progress_callback:
-                progress_callback(100, f"Retrieved from cache")
+                progress_callback(100, "Retrieved local histogram from cache")
             return self._local_cache[timepoint]
-        
-        def report_progress(pct: int, msg: str):
-            if progress_callback:
-                progress_callback(pct, msg)
-        
-        # Use global data range for consistent binning
-        if self._data_range is None:
-            raise RuntimeError("Must compute global histogram first")
-        
-        neutron_range, xray_range = self._data_range
-        
-        report_progress(20, f"Flattening timepoint {timepoint}...")
-        
-        # Flatten to 1D
-        neutron_flat = neutron_3d.ravel()
-        xray_flat = xray_3d.ravel()
-        
-        report_progress(50, "Computing histogram...")
-        
-        # Compute histogram
+
+        neutron, xray, ignored = self._finite_pair(neutron_3d, xray_3d)
+        result = self._compute(neutron, xray, self._data_range, ignored)
+        if self.cache_size > 0:
+            self._local_cache[int(timepoint)] = result
+            self._local_cache.move_to_end(int(timepoint))
+            while len(self._local_cache) > self.cache_size:
+                self._local_cache.popitem(last=False)
+        if progress_callback:
+            progress_callback(100, "Local histogram complete")
+        return result
+
+    def _compute(
+        self,
+        neutron: np.ndarray,
+        xray: np.ndarray,
+        data_range: Range2D,
+        ignored: int,
+    ) -> HistogramData:
         if self.use_gpu:
-            hist_data = self._compute_histogram_gpu(
-                neutron_flat, xray_flat, neutron_range, xray_range
-            )
-        else:
-            hist_data = self._compute_histogram_cpu(
-                neutron_flat, xray_flat, neutron_range, xray_range
-            )
-        
-        report_progress(80, "Caching result...")
-        
-        # Add to cache
-        self._local_cache[timepoint] = hist_data
-        
-        # Enforce cache size limit (LRU eviction)
-        if len(self._local_cache) > self.cache_size:
-            self._local_cache.popitem(last=False)
-        
-        report_progress(100, f"Local histogram complete")
-        
-        return hist_data
-    
+            try:
+                return self._compute_gpu(neutron, xray, data_range, ignored)
+            except (RuntimeError, MemoryError):
+                # A histogram should remain available even when CUDA memory is
+                # insufficient.  The backend is disabled for subsequent calls.
+                self.use_gpu = False
+        return self._compute_cpu(neutron, xray, data_range, ignored)
+
+    def _compute_cpu(
+        self, neutron: np.ndarray, xray: np.ndarray, data_range: Range2D, ignored: int
+    ) -> HistogramData:
+        histogram, x_edges, y_edges = np.histogram2d(
+            neutron,
+            xray,
+            bins=self.bins,
+            range=[data_range[0], data_range[1]],
+        )
+        histogram = histogram.T.astype(np.uint64, copy=False)
+        return self._make_data(histogram, x_edges, y_edges, data_range, len(neutron), ignored)
+
+    def _compute_gpu(
+        self, neutron: np.ndarray, xray: np.ndarray, data_range: Range2D, ignored: int
+    ) -> HistogramData:
+        device = torch.device("cuda")
+        neutron_tensor = torch.as_tensor(neutron, device=device, dtype=torch.float64)
+        xray_tensor = torch.as_tensor(xray, device=device, dtype=torch.float64)
+        n_min, n_max = data_range[0]
+        x_min, x_max = data_range[1]
+        n_bins = torch.clamp(
+            ((neutron_tensor - n_min) / (n_max - n_min) * self.bins).long(),
+            0,
+            self.bins - 1,
+        )
+        x_bins = torch.clamp(
+            ((xray_tensor - x_min) / (x_max - x_min) * self.bins).long(),
+            0,
+            self.bins - 1,
+        )
+        indices = x_bins * self.bins + n_bins
+        counts = torch.bincount(indices, minlength=self.bins * self.bins)
+        histogram = counts.reshape(self.bins, self.bins).cpu().numpy().astype(np.uint64)
+        x_edges = np.linspace(n_min, n_max, self.bins + 1)
+        y_edges = np.linspace(x_min, x_max, self.bins + 1)
+        return self._make_data(histogram, x_edges, y_edges, data_range, len(neutron), ignored)
+
+    @staticmethod
+    def _make_data(histogram, x_edges, y_edges, data_range, valid, ignored):
+        return HistogramData(
+            histogram=histogram,
+            x_edges=x_edges,
+            y_edges=y_edges,
+            x_centers=(x_edges[:-1] + x_edges[1:]) / 2.0,
+            y_centers=(y_edges[:-1] + y_edges[1:]) / 2.0,
+            data_range=data_range,
+            num_voxels=int(valid),
+            ignored_voxels=int(ignored),
+        )
+
     def precompute_all_local_histograms(
         self,
         neutron_4d: np.ndarray,
         xray_4d: np.ndarray,
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> None:
-        """
-        Pre-compute histograms for all timepoints
-        
-        Args:
-            neutron_4d: 4D neutron data
-            xray_4d: 4D X-ray data
-            progress_callback: Optional callback(percentage, message)
-        """
-        num_timepoints = neutron_4d.shape[0]
-        
-        for t in range(num_timepoints):
-            pct = int((t / num_timepoints) * 100)
-            
+        self._validate_pair(neutron_4d, xray_4d)
+        for timepoint in range(neutron_4d.shape[0]):
             self.compute_local_histogram(
-                neutron_4d[t], xray_4d[t], timepoint=t
+                neutron_4d[timepoint], xray_4d[timepoint], timepoint
             )
-            
             if progress_callback:
-                progress_callback(pct, f"Computing histogram {t+1}/{num_timepoints}")
-        
-        if progress_callback:
-            progress_callback(100, "All histograms computed")
-    
-    def _compute_histogram_cpu(
-        self,
-        neutron_flat: np.ndarray,
-        xray_flat: np.ndarray,
-        neutron_range: Tuple[float, float],
-        xray_range: Tuple[float, float]
-    ) -> HistogramData:
-        """Compute 2D histogram using NumPy (CPU)"""
-        hist, x_edges, y_edges = np.histogram2d(
-            neutron_flat,
-            xray_flat,
-            bins=self.bins,
-            range=[neutron_range, xray_range]
-        )
-        
-        # Transpose to get correct orientation
-        hist = hist.T
-        
-        # Calculate bin centers
-        x_centers = (x_edges[:-1] + x_edges[1:]) / 2
-        y_centers = (y_edges[:-1] + y_edges[1:]) / 2
-        
-        return HistogramData(
-            histogram=hist,
-            x_edges=x_edges,
-            y_edges=y_edges,
-            x_centers=x_centers,
-            y_centers=y_centers,
-            data_range=(neutron_range, xray_range),
-            num_voxels=len(neutron_flat)
-        )
-    
-    def _compute_histogram_gpu(
-        self,
-        neutron_flat: np.ndarray,
-        xray_flat: np.ndarray,
-        neutron_range: Tuple[float, float],
-        xray_range: Tuple[float, float]
-    ) -> HistogramData:
-        """Compute 2D histogram using PyTorch (GPU)"""
-        # Transfer to GPU
-        neutron_gpu = torch.from_numpy(neutron_flat).cuda()
-        xray_gpu = torch.from_numpy(xray_flat).cuda()
-        
-        # Compute bin indices
-        neutron_norm = (neutron_gpu - neutron_range[0]) / (neutron_range[1] - neutron_range[0])
-        xray_norm = (xray_gpu - xray_range[0]) / (xray_range[1] - xray_range[0])
-        
-        neutron_bins = torch.clamp(
-            (neutron_norm * self.bins).long(), 0, self.bins - 1
-        )
-        xray_bins = torch.clamp(
-            (xray_norm * self.bins).long(), 0, self.bins - 1
-        )
-        
-        # Compute 2D histogram
-        indices = xray_bins * self.bins + neutron_bins
-        counts = torch.bincount(indices, minlength=self.bins * self.bins)
-        hist = counts.reshape(self.bins, self.bins).float()
-        
-        # Transfer back to CPU
-        hist = hist.cpu().numpy()
-        
-        # Create bin edges
-        x_edges = np.linspace(neutron_range[0], neutron_range[1], self.bins + 1)
-        y_edges = np.linspace(xray_range[0], xray_range[1], self.bins + 1)
-        x_centers = (x_edges[:-1] + x_edges[1:]) / 2
-        y_centers = (y_edges[:-1] + y_edges[1:]) / 2
-        
-        return HistogramData(
-            histogram=hist,
-            x_edges=x_edges,
-            y_edges=y_edges,
-            x_centers=x_centers,
-            y_centers=y_centers,
-            data_range=(neutron_range, xray_range),
-            num_voxels=len(neutron_flat)
-        )
-    
+                progress_callback(
+                    int(100 * (timepoint + 1) / neutron_4d.shape[0]),
+                    f"Computed histogram {timepoint + 1}/{neutron_4d.shape[0]}",
+                )
+
     def get_global_histogram(self) -> Optional[HistogramData]:
-        """Get cached global histogram"""
         return self._global_histogram
-    
+
     def get_cached_local_histogram(self, timepoint: int) -> Optional[HistogramData]:
-        """Get cached local histogram for specific timepoint"""
         return self._local_cache.get(timepoint)
-    
-    def clear_cache(self) -> None:
-        """Clear all cached local histograms"""
+
+    def clear_cache(self, include_global: bool = False) -> None:
         self._local_cache.clear()
-    
+        if include_global:
+            self._global_histogram = None
+            self._data_range = None
+
     def get_cache_stats(self) -> Dict:
-        """Get statistics about cache usage"""
         return {
-            'cache_size': len(self._local_cache),
-            'cache_limit': self.cache_size,
-            'cached_timepoints': list(self._local_cache.keys()),
-            'global_cached': self._global_histogram is not None
+            "cache_size": len(self._local_cache),
+            "cache_limit": self.cache_size,
+            "cached_timepoints": list(self._local_cache.keys()),
+            "global_cached": self._global_histogram is not None,
         }

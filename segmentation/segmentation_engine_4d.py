@@ -1,234 +1,223 @@
-"""
-segmentation_engine_4d.py - Segmentation for 4D datasets
+"""ROI-based segmentation for paired 3-D/4-D tomography datasets."""
 
-Applies ROI-based segmentation to 4D volumes
-"""
+from __future__ import annotations
+
+from typing import Callable, Optional, Tuple
 
 import numpy as np
-from typing import Optional, Callable, Tuple
-import sys
-sys.path.append('..')
+
 from utils.roi_manager import ROIManager
+
+ProgressCallback = Optional[Callable[[int, str], None]]
 
 
 class SegmentationEngine4D:
-    """
-    Apply ROI-based segmentation to 4D datasets
-    """
-    
-    def __init__(self):
-        """Initialize segmentation engine"""
-        self.segmentation_masks = {}  # Cache for segmentation masks
-    
+    """Apply histogram-space ROIs to paired neutron and X-ray volumes."""
+
+    def __init__(self) -> None:
+        self.segmentation_masks: dict[int, np.ndarray] = {}
+
+    @staticmethod
+    def _validate_pair(
+        neutron_data: np.ndarray,
+        xray_data: np.ndarray,
+        expected_ndim: int,
+    ) -> None:
+        if neutron_data.shape != xray_data.shape:
+            raise ValueError(
+                f"Shape mismatch: neutron {neutron_data.shape} vs "
+                f"X-ray {xray_data.shape}"
+            )
+        if neutron_data.ndim != expected_ndim:
+            raise ValueError(
+                f"Expected {expected_ndim}D arrays, got {neutron_data.ndim}D"
+            )
+        if neutron_data.size == 0:
+            raise ValueError("Cannot segment an empty volume")
+
+    @staticmethod
+    def _report(callback: ProgressCallback, value: int, message: str) -> None:
+        if callback is not None:
+            callback(int(value), message)
+
     def segment_volume(
         self,
         neutron_3d: np.ndarray,
         xray_3d: np.ndarray,
         roi_manager: ROIManager,
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: ProgressCallback = None,
     ) -> np.ndarray:
-        """
-        Segment a single 3D volume using ROI
-        
-        Args:
-            neutron_3d: 3D neutron volume
-            xray_3d: 3D X-ray volume
-            roi_manager: ROI manager with defined ROI
-            progress_callback: Optional callback(percentage, message)
-            
-        Returns:
-            Boolean 3D mask (True = inside ROI)
-        """
-        def report_progress(pct: int, msg: str):
-            if progress_callback:
-                progress_callback(pct, msg)
-        
+        """Return a boolean mask for one paired 3-D volume."""
+        self._validate_pair(neutron_3d, xray_3d, expected_ndim=3)
         if not roi_manager.has_roi():
             raise ValueError("No ROI defined in ROI manager")
-        
-        report_progress(10, "Checking voxels against ROI...")
-        
-        # Check each voxel against ROI
-        mask = roi_manager.is_inside_roi(neutron_3d, xray_3d)
-        
-        report_progress(90, "Computing statistics...")
-        
-        # Calculate statistics
-        num_segmented = np.sum(mask)
-        total_voxels = mask.size
-        percentage = (num_segmented / total_voxels) * 100
-        
-        report_progress(100, f"Segmented {num_segmented:,} voxels ({percentage:.1f}%)")
-        
+
+        self._report(progress_callback, 10, "Checking voxels against ROI...")
+        mask = np.asarray(
+            roi_manager.is_inside_roi(neutron_3d, xray_3d), dtype=bool
+        )
+        if mask.shape != neutron_3d.shape:
+            raise ValueError(
+                f"ROI manager returned shape {mask.shape}; expected {neutron_3d.shape}"
+            )
+
+        num_segmented = int(np.count_nonzero(mask))
+        percentage = 100.0 * num_segmented / mask.size
+        self._report(
+            progress_callback,
+            100,
+            f"Segmented {num_segmented:,} voxels ({percentage:.1f}%)",
+        )
         return mask
-    
+
     def segment_all_volumes(
         self,
         neutron_4d: np.ndarray,
         xray_4d: np.ndarray,
         roi_manager: ROIManager,
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: ProgressCallback = None,
     ) -> np.ndarray:
-        """
-        Segment all volumes in 4D dataset
-        
-        Args:
-            neutron_4d: 4D neutron data (T, Z, Y, X)
-            xray_4d: 4D X-ray data (T, Z, Y, X)
-            roi_manager: ROI manager with defined ROI
-            progress_callback: Optional callback(percentage, message)
-            
-        Returns:
-            Boolean 4D mask (same shape as input)
-        """
+        """Return a boolean 4-D mask for all timepoints."""
+        self._validate_pair(neutron_4d, xray_4d, expected_ndim=4)
         if not roi_manager.has_roi():
             raise ValueError("No ROI defined in ROI manager")
-        
-        num_timepoints = neutron_4d.shape[0]
-        mask_4d = np.zeros(neutron_4d.shape, dtype=bool)
-        
-        for t in range(num_timepoints):
-            pct = int((t / num_timepoints) * 100)
-            
-            if progress_callback:
-                progress_callback(pct, f"Segmenting timepoint {t+1}/{num_timepoints}")
-            
-            # Segment this timepoint
-            mask_4d[t] = roi_manager.is_inside_roi(
-                neutron_4d[t], 
-                xray_4d[t]
+
+        mask_4d = np.empty(neutron_4d.shape, dtype=bool)
+        total = neutron_4d.shape[0]
+        for timepoint in range(total):
+            self._report(
+                progress_callback,
+                int(100 * timepoint / max(total, 1)),
+                f"Segmenting timepoint {timepoint + 1}/{total}",
             )
-        
-        if progress_callback:
-            total_segmented = np.sum(mask_4d)
-            total_voxels = mask_4d.size
-            percentage = (total_segmented / total_voxels) * 100
-            progress_callback(
-                100, 
-                f"Complete: {total_segmented:,} voxels ({percentage:.1f}%)"
+            mask_4d[timepoint] = roi_manager.is_inside_roi(
+                neutron_4d[timepoint], xray_4d[timepoint]
             )
-        
+
+        num_segmented = int(np.count_nonzero(mask_4d))
+        percentage = 100.0 * num_segmented / mask_4d.size
+        self._report(
+            progress_callback,
+            100,
+            f"Complete: {num_segmented:,} voxels ({percentage:.1f}%)",
+        )
         return mask_4d
-    
+
+    @staticmethod
     def get_segmentation_statistics(
-        self,
         mask: np.ndarray,
         neutron_data: np.ndarray,
-        xray_data: np.ndarray
+        xray_data: np.ndarray,
     ) -> dict:
-        """
-        Compute statistics for segmented region
-        
-        Args:
-            mask: Boolean mask
-            neutron_data: Neutron intensity values
-            xray_data: X-ray intensity values
-            
-        Returns:
-            Dict with segmentation statistics
-        """
-        num_segmented = np.sum(mask)
-        total_voxels = mask.size
-        percentage = (num_segmented / total_voxels) * 100
-        
-        # Statistics for segmented voxels
-        if num_segmented > 0:
-            neutron_segmented = neutron_data[mask]
-            xray_segmented = xray_data[mask]
-            
-            stats = {
-                'num_voxels': int(num_segmented),
-                'total_voxels': int(total_voxels),
-                'percentage': float(percentage),
-                'neutron_mean': float(np.mean(neutron_segmented)),
-                'neutron_std': float(np.std(neutron_segmented)),
-                'neutron_min': float(np.min(neutron_segmented)),
-                'neutron_max': float(np.max(neutron_segmented)),
-                'xray_mean': float(np.mean(xray_segmented)),
-                'xray_std': float(np.std(xray_segmented)),
-                'xray_min': float(np.min(xray_segmented)),
-                'xray_max': float(np.max(xray_segmented)),
+        if mask.shape != neutron_data.shape or mask.shape != xray_data.shape:
+            raise ValueError("Mask and modality arrays must have identical shapes")
+
+        mask_bool = np.asarray(mask, dtype=bool)
+        num_segmented = int(np.count_nonzero(mask_bool))
+        total_voxels = int(mask_bool.size)
+        percentage = 100.0 * num_segmented / total_voxels if total_voxels else 0.0
+
+        stats = {
+            "num_voxels": num_segmented,
+            "total_voxels": total_voxels,
+            "percentage": float(percentage),
+        }
+        if num_segmented == 0:
+            return stats
+
+        neutron_segmented = np.asarray(neutron_data)[mask_bool]
+        xray_segmented = np.asarray(xray_data)[mask_bool]
+        stats.update(
+            {
+                "neutron_mean": float(np.mean(neutron_segmented)),
+                "neutron_std": float(np.std(neutron_segmented)),
+                "neutron_min": float(np.min(neutron_segmented)),
+                "neutron_max": float(np.max(neutron_segmented)),
+                "xray_mean": float(np.mean(xray_segmented)),
+                "xray_std": float(np.std(xray_segmented)),
+                "xray_min": float(np.min(xray_segmented)),
+                "xray_max": float(np.max(xray_segmented)),
             }
-        else:
-            stats = {
-                'num_voxels': 0,
-                'total_voxels': int(total_voxels),
-                'percentage': 0.0,
-            }
-        
+        )
         return stats
-    
+
+    @staticmethod
     def get_temporal_statistics(
-        self,
         mask_4d: np.ndarray,
         neutron_4d: np.ndarray,
-        xray_4d: np.ndarray
+        xray_4d: np.ndarray,
     ) -> dict:
-        """
-        Compute temporal statistics for 4D segmentation
-        
-        Args:
-            mask_4d: 4D boolean mask
-            neutron_4d: 4D neutron data
-            xray_4d: 4D X-ray data
-            
-        Returns:
-            Dict with temporal statistics
-        """
-        num_timepoints = mask_4d.shape[0]
-        
-        volumes_per_time = np.zeros(num_timepoints)
-        neutron_mean_per_time = np.zeros(num_timepoints)
-        xray_mean_per_time = np.zeros(num_timepoints)
-        
-        for t in range(num_timepoints):
-            volumes_per_time[t] = np.sum(mask_4d[t])
-            
-            if volumes_per_time[t] > 0:
-                neutron_mean_per_time[t] = np.mean(neutron_4d[t][mask_4d[t]])
-                xray_mean_per_time[t] = np.mean(xray_4d[t][mask_4d[t]])
-        
+        if mask_4d.shape != neutron_4d.shape or mask_4d.shape != xray_4d.shape:
+            raise ValueError("Mask and modality arrays must have identical shapes")
+        if mask_4d.ndim != 4:
+            raise ValueError("Temporal statistics require 4-D arrays")
+
+        mask_bool = np.asarray(mask_4d, dtype=bool)
+        num_timepoints = mask_bool.shape[0]
+        volumes_per_time = np.count_nonzero(mask_bool, axis=(1, 2, 3)).astype(float)
+        neutron_mean_per_time = np.full(num_timepoints, np.nan, dtype=float)
+        xray_mean_per_time = np.full(num_timepoints, np.nan, dtype=float)
+
+        for timepoint in range(num_timepoints):
+            if volumes_per_time[timepoint] > 0:
+                current_mask = mask_bool[timepoint]
+                neutron_mean_per_time[timepoint] = float(
+                    np.mean(neutron_4d[timepoint][current_mask])
+                )
+                xray_mean_per_time[timepoint] = float(
+                    np.mean(xray_4d[timepoint][current_mask])
+                )
+
         return {
-            'num_timepoints': num_timepoints,
-            'volumes_per_time': volumes_per_time,
-            'neutron_mean_per_time': neutron_mean_per_time,
-            'xray_mean_per_time': xray_mean_per_time,
-            'total_segmented_voxels': int(np.sum(mask_4d)),
-            'mean_volume': float(np.mean(volumes_per_time)),
-            'std_volume': float(np.std(volumes_per_time)),
+            "num_timepoints": num_timepoints,
+            "volumes_per_time": volumes_per_time,
+            "neutron_mean_per_time": neutron_mean_per_time,
+            "xray_mean_per_time": xray_mean_per_time,
+            "total_segmented_voxels": int(np.count_nonzero(mask_bool)),
+            "mean_volume": float(np.mean(volumes_per_time)),
+            "std_volume": float(np.std(volumes_per_time)),
         }
-    
+
+    @staticmethod
     def apply_overlay(
-        self,
         image: np.ndarray,
         mask: np.ndarray,
         color: Tuple[int, int, int] = (255, 0, 0),
-        alpha: float = 0.3
+        alpha: float = 0.3,
     ) -> np.ndarray:
-        """
-        Apply segmentation mask as colored overlay on image
-        
-        Args:
-            image: 2D grayscale image
-            mask: 2D boolean mask
-            color: RGB color for overlay
-            alpha: Transparency (0-1)
-            
-        Returns:
-            RGB image with overlay
-        """
-        # Normalize image to 0-255
-        img_norm = ((image - image.min()) / (image.max() - image.min()) * 255).astype(np.uint8)
-        
-        # Create RGB image
-        img_rgb = np.stack([img_norm, img_norm, img_norm], axis=-1)
-        
-        # Apply colored overlay where mask is True
-        overlay = img_rgb.copy()
-        overlay[mask] = [
-            int(overlay[mask, 0] * (1 - alpha) + color[0] * alpha),
-            int(overlay[mask, 1] * (1 - alpha) + color[1] * alpha),
-            int(overlay[mask, 2] * (1 - alpha) + color[2] * alpha)
-        ]
-        
-        return overlay
+        """Return an RGB uint8 image with a vectorized coloured mask overlay."""
+        image_array = np.asarray(image)
+        mask_bool = np.asarray(mask, dtype=bool)
+        if image_array.ndim != 2:
+            raise ValueError("Overlay image must be 2-D")
+        if mask_bool.shape != image_array.shape:
+            raise ValueError(
+                f"Mask shape {mask_bool.shape} does not match image {image_array.shape}"
+            )
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be between 0 and 1")
+
+        finite = np.isfinite(image_array)
+        if not np.any(finite):
+            normalized = np.zeros(image_array.shape, dtype=np.float32)
+        else:
+            finite_values = image_array[finite].astype(np.float64, copy=False)
+            minimum = float(np.min(finite_values))
+            maximum = float(np.max(finite_values))
+            if maximum <= minimum:
+                normalized = np.zeros(image_array.shape, dtype=np.float32)
+            else:
+                normalized = (
+                    (image_array.astype(np.float64, copy=False) - minimum)
+                    / (maximum - minimum)
+                    * 255.0
+                ).astype(np.float32)
+                normalized[~finite] = 0.0
+
+        rgb = np.repeat(normalized[..., None], 3, axis=-1)
+        color_array = np.asarray(color, dtype=np.float32)
+        if color_array.shape != (3,):
+            raise ValueError("color must be an RGB triplet")
+        color_array = np.clip(color_array, 0.0, 255.0)
+        rgb[mask_bool] = rgb[mask_bool] * (1.0 - alpha) + color_array * alpha
+        return np.clip(rgb, 0.0, 255.0).astype(np.uint8)
