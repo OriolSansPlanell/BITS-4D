@@ -1,174 +1,206 @@
-"""
-progress_dialog.py - Progress dialog utilities for long-running operations
+"""Cancelable progress dialogs and worker-thread orchestration."""
 
-Provides progress feedback for:
-- Dataset loading
-- Histogram computation
-- Segmentation operations
-"""
+from __future__ import annotations
 
-from PyQt5.QtWidgets import QProgressDialog, QApplication
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from typing import Callable, Any, Optional
-import time
+import inspect
+import traceback
+from typing import Any, Callable, Optional
+
+from PyQt5.QtCore import QEventLoop, QThread, Qt, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QMessageBox, QProgressDialog
+
+from .cancellation import CancellationToken, OperationCancelled, OperationFailed
 
 
 class ProgressDialog(QProgressDialog):
-    """
-    Enhanced progress dialog with better defaults
-    """
-    
-    def __init__(self, title: str, message: str, 
-                 maximum: int = 100, parent=None):
+    """Progress dialog that remains visible while cancellation is acknowledged."""
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        maximum: int = 100,
+        parent=None,
+    ) -> None:
         super().__init__(message, "Cancel", 0, maximum, parent)
         self.setWindowTitle(title)
         self.setWindowModality(Qt.WindowModal)
-        self.setMinimumDuration(500)  # Show after 500ms
-        self.setAutoClose(True)
-        self.setAutoReset(True)
-        
-    def update_progress(self, value: int, message: Optional[str] = None):
-        """Update progress value and optionally message"""
-        self.setValue(value)
+        self.setMinimumDuration(250)
+        self.setAutoClose(False)
+        self.setAutoReset(False)
+
+    def update_progress(self, value: int, message: Optional[str] = None) -> None:
+        self.setValue(max(self.minimum(), min(int(value), self.maximum())))
         if message:
             self.setLabelText(message)
-        QApplication.processEvents()
+
+
+def _accepts_keyword(operation: Callable, keyword: str) -> bool:
+    """Return whether a callable accepts a keyword or arbitrary kwargs."""
+    try:
+        signature = inspect.signature(operation)
+    except (TypeError, ValueError):
+        return False
+    if keyword in signature.parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
 
 
 class WorkerThread(QThread):
-    """
-    Worker thread for running long operations without blocking UI
-    """
-    
-    # Signals
+    """Execute one operation and report progress without blocking the GUI."""
+
     progress_updated = pyqtSignal(int, str)
     operation_completed = pyqtSignal(object)
     operation_failed = pyqtSignal(str)
-    
-    def __init__(self, operation: Callable, *args, **kwargs):
+    operation_cancelled = pyqtSignal()
+
+    def __init__(self, operation: Callable, *args, **kwargs) -> None:
         super().__init__()
         self.operation = operation
         self.args = args
-        self.kwargs = kwargs
-        self.result = None
-        self.error = None
-        
-    def run(self):
-        """Execute the operation"""
+        self.kwargs = dict(kwargs)
+        self.result: Any = None
+        self.error: Optional[str] = None
+        self.traceback_text: Optional[str] = None
+        self.token = CancellationToken()
+
+    def request_cancel(self) -> None:
+        self.token.cancel()
+        self.requestInterruption()
+
+    def run(self) -> None:
         try:
-            # Add progress callback to kwargs if operation supports it
-            if 'progress_callback' not in self.kwargs:
-                self.kwargs['progress_callback'] = self.report_progress
-            
-            self.result = self.operation(*self.args, **self.kwargs)
+            kwargs = dict(self.kwargs)
+            if (
+                "progress_callback" not in kwargs
+                and _accepts_keyword(self.operation, "progress_callback")
+            ):
+                kwargs["progress_callback"] = self.report_progress
+            if (
+                "cancel_check" not in kwargs
+                and _accepts_keyword(self.operation, "cancel_check")
+            ):
+                kwargs["cancel_check"] = self.token.raise_if_cancelled
+
+            self.token.raise_if_cancelled()
+            self.result = self.operation(*self.args, **kwargs)
+            self.token.raise_if_cancelled()
             self.operation_completed.emit(self.result)
-            
-        except Exception as e:
-            self.error = str(e)
+        except OperationCancelled:
+            self.operation_cancelled.emit()
+        except BaseException as exc:  # worker boundary: preserve full traceback
+            self.error = str(exc)
+            self.traceback_text = traceback.format_exc()
             self.operation_failed.emit(self.error)
-    
-    def report_progress(self, value: int, message: str = ""):
-        """Report progress back to main thread"""
-        self.progress_updated.emit(value, message)
+
+    def report_progress(self, value: int, message: str = "") -> None:
+        if self.isInterruptionRequested():
+            self.token.cancel()
+        self.token.raise_if_cancelled()
+        self.progress_updated.emit(int(value), str(message))
 
 
-def run_with_progress(parent, title: str, message: str,
-                     operation: Callable, *args, **kwargs) -> Any:
+def run_with_progress(
+    parent,
+    title: str,
+    message: str,
+    operation: Callable,
+    *args,
+    **kwargs,
+) -> Any:
+    """Run an operation and raise explicit cancellation/failure exceptions.
+
+    Cancellation is cooperative: every progress callback and optional
+    ``cancel_check`` call is a safe cancellation checkpoint.  The dialog no
+    longer disappears while the worker continues in the background, and the
+    caller can distinguish cancellation from failure instead of retrying the
+    operation synchronously.
     """
-    Run an operation with a progress dialog
-    
-    Args:
-        parent: Parent widget
-        title: Progress dialog title
-        message: Progress dialog message
-        operation: Function to execute
-        *args, **kwargs: Arguments for operation
-        
-    Returns:
-        Result from operation or None if cancelled/failed
-    """
-    # Create progress dialog
     progress = ProgressDialog(title, message, 100, parent)
-    
-    # Create worker thread
     worker = WorkerThread(operation, *args, **kwargs)
-    
-    # Connect signals
-    result_container = {'result': None, 'success': False}
-    
-    def on_progress(value, msg):
-        progress.update_progress(value, msg)
-    
-    def on_completed(result):
-        result_container['result'] = result
-        result_container['success'] = True
-        progress.setValue(100)
-    
-    def on_failed(error):
-        from PyQt5.QtWidgets import QMessageBox
-        QMessageBox.critical(parent, "Error", f"Operation failed: {error}")
-        progress.cancel()
-    
-    worker.progress_updated.connect(on_progress)
-    worker.operation_completed.connect(on_completed)
-    worker.operation_failed.connect(on_failed)
-    
-    # Start worker
+    loop = QEventLoop()
+    state = {"result": None, "status": "running", "error": None}
+
+    def finish(status: str, result: Any = None, error: Optional[str] = None) -> None:
+        state.update(result=result, status=status, error=error)
+        if status == "completed":
+            progress.setValue(progress.maximum())
+        progress.close()
+        if loop.isRunning():
+            loop.quit()
+
+    worker.progress_updated.connect(progress.update_progress)
+    worker.operation_completed.connect(
+        lambda result: finish("completed", result=result)
+    )
+    worker.operation_cancelled.connect(lambda: finish("cancelled"))
+    worker.operation_failed.connect(
+        lambda error: finish("failed", error=error)
+    )
+
+    def request_cancel() -> None:
+        if state["status"] != "running":
+            return
+        progress.setLabelText("Cancelling at the next safe checkpoint...")
+        progress.setCancelButton(None)
+        worker.request_cancel()
+
+    progress.canceled.connect(request_cancel)
     worker.start()
-    
-    # Show progress dialog (blocks until done or cancelled)
-    progress.exec_()
-    
-    # Wait for worker to finish
+    progress.show()
+    loop.exec_()
     worker.wait()
-    
-    if result_container['success']:
-        return result_container['result']
-    else:
-        return None
+
+    if state["status"] == "cancelled":
+        raise OperationCancelled("Operation cancelled by user")
+    if state["status"] == "failed":
+        details = worker.traceback_text or state["error"] or "Unknown worker error"
+        QMessageBox.critical(
+            parent,
+            "Operation failed",
+            f"{state['error'] or 'Unknown error'}\n\nSee the console/log for details.",
+        )
+        raise OperationFailed(details)
+    return state["result"]
 
 
 class ProgressCallback:
-    """
-    Helper class for reporting progress from operations
-    """
-    
-    def __init__(self, total_steps: int):
-        self.total_steps = total_steps
+    """Map completed steps to percentage updates."""
+
+    def __init__(self, total_steps: int) -> None:
+        if total_steps <= 0:
+            raise ValueError("total_steps must be positive")
+        self.total_steps = int(total_steps)
         self.current_step = 0
-        self.callback = None
-        
-    def set_callback(self, callback: Callable[[int, str], None]):
-        """Set the callback function"""
+        self.callback: Optional[Callable[[int, str], None]] = None
+
+    def set_callback(self, callback: Callable[[int, str], None]) -> None:
         self.callback = callback
-    
-    def update(self, steps: int = 1, message: str = ""):
-        """Increment progress"""
-        self.current_step += steps
-        if self.callback:
-            percentage = int((self.current_step / self.total_steps) * 100)
+
+    def _emit(self, message: str) -> None:
+        if self.callback is not None:
+            percentage = int(
+                100 * min(max(self.current_step, 0), self.total_steps)
+                / self.total_steps
+            )
             self.callback(percentage, message)
-    
-    def set_step(self, step: int, message: str = ""):
-        """Set absolute step value"""
-        self.current_step = step
-        if self.callback:
-            percentage = int((self.current_step / self.total_steps) * 100)
-            self.callback(percentage, message)
-    
-    def reset(self):
-        """Reset progress to 0"""
+
+    def update(self, steps: int = 1, message: str = "") -> None:
+        self.current_step += int(steps)
+        self._emit(message)
+
+    def set_step(self, step: int, message: str = "") -> None:
+        self.current_step = int(step)
+        self._emit(message)
+
+    def reset(self) -> None:
         self.current_step = 0
 
-
-# Convenience functions for common operations
 
 def show_loading_message(parent, title: str, message: str):
-    """
-    Show an indeterminate progress dialog for quick operations
-    
-    Returns the dialog object - caller should call dialog.close() when done
-    """
     progress = QProgressDialog(message, None, 0, 0, parent)
     progress.setWindowTitle(title)
     progress.setWindowModality(Qt.WindowModal)
@@ -179,37 +211,28 @@ def show_loading_message(parent, title: str, message: str):
     return progress
 
 
-def run_batch_operation(parent, title: str, items: list,
-                       operation: Callable, item_name: str = "item") -> list:
-    """
-    Run an operation on a list of items with progress feedback
-    
-    Args:
-        parent: Parent widget
-        title: Progress dialog title
-        items: List of items to process
-        operation: Function that takes an item and returns result
-        item_name: Name for items in progress message
-        
-    Returns:
-        List of results
-    """
+def run_batch_operation(
+    parent,
+    title: str,
+    items: list,
+    operation: Callable,
+    item_name: str = "item",
+) -> list:
     results = []
     total = len(items)
-    
-    progress = ProgressDialog(title, f"Processing {item_name} 0/{total}", total, parent)
-    
-    for i, item in enumerate(items):
-        if progress.wasCanceled():
-            break
-        
-        try:
-            result = operation(item)
-            results.append(result)
-        except Exception as e:
-            print(f"Error processing {item_name} {i}: {e}")
-            results.append(None)
-        
-        progress.update_progress(i + 1, f"Processing {item_name} {i+1}/{total}")
-    
+    progress = ProgressDialog(
+        title, f"Processing {item_name} 0/{total}", max(total, 1), parent
+    )
+    progress.show()
+    try:
+        for index, item in enumerate(items):
+            if progress.wasCanceled():
+                raise OperationCancelled("Batch operation cancelled by user")
+            results.append(operation(item))
+            progress.update_progress(
+                index + 1, f"Processing {item_name} {index + 1}/{total}"
+            )
+            QApplication.processEvents()
+    finally:
+        progress.close()
     return results

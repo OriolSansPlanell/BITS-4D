@@ -169,3 +169,114 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
         _refresh_histograms(self)
 
     main_window_cls._on_gpu_device_changed = _on_gpu_device_changed
+
+# The function is redefined below so importing this PR-2 file applies both the
+# correctness overrides above and the execution-reliability overrides.
+_PR1_APPLY = apply_runtime_fixes
+
+
+def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
+    global _APPLIED
+    # Temporarily clear the guard so the PR-1 implementation can run exactly
+    # once, then install PR-2 wrappers.
+    already_applied = _APPLIED
+    if already_applied:
+        return
+    _PR1_APPLY(main_window_cls, slice_viewer_cls)
+
+    from utils.cancellation import OperationCancelled, OperationFailed
+    from utils.progress_dialog import run_with_progress
+
+    def _handle_operation_exception(self, exc: BaseException) -> None:
+        if isinstance(exc, OperationCancelled):
+            message = "Operation cancelled"
+        else:
+            message = "Operation failed; see the error dialog/log"
+        if hasattr(self, "status_bar"):
+            self.status_bar.showMessage(message)
+
+    def _guard(method):
+        def guarded(self, *args, **kwargs):
+            try:
+                return method(self, *args, **kwargs)
+            except (OperationCancelled, OperationFailed) as exc:
+                _handle_operation_exception(self, exc)
+                return None
+
+        guarded.__name__ = getattr(method, "__name__", "guarded_operation")
+        guarded.__doc__ = getattr(method, "__doc__")
+        return guarded
+
+    # Replace global histogram computation so worker cancellation/failure never
+    # triggers the legacy synchronous retry path.
+    def _compute_global_histogram(self):
+        if self.dataset is None or self.histogram_engine is None:
+            return None
+
+        def operation(progress_callback):
+            return self.histogram_engine.compute_global_histogram(
+                self.dataset.neutron_data,
+                self.dataset.xray_data,
+                progress_callback=progress_callback,
+            )
+
+        try:
+            histogram = run_with_progress(
+                self,
+                "Computing Global Histogram",
+                "Analyzing the dataset...",
+                operation,
+            )
+        except (OperationCancelled, OperationFailed) as exc:
+            self._bits_histogram_abort = exc
+            self.global_histogram = None
+            return None
+
+        self._bits_histogram_abort = None
+        self.global_histogram = histogram
+        self.dual_histogram.set_global_histogram(histogram)
+        self.status_bar.showMessage("Global histogram computed")
+        return histogram
+
+    main_window_cls._compute_global_histogram = _compute_global_histogram
+
+    original_load_dataset = main_window_cls.load_dataset
+
+    def load_dataset(self, *args, **kwargs):
+        self._bits_histogram_abort = None
+        try:
+            result = original_load_dataset(self, *args, **kwargs)
+        except (OperationCancelled, OperationFailed) as exc:
+            _handle_operation_exception(self, exc)
+            return None
+
+        # The legacy loader catches histogram exceptions internally.  Use the
+        # explicit abort flag set by the replacement method to roll back the
+        # partially initialized dataset rather than continuing with stale state.
+        if self._bits_histogram_abort is not None:
+            _handle_operation_exception(self, self._bits_histogram_abort)
+            self.dataset = None
+            self.histogram_engine = None
+            self.global_histogram = None
+            self.segmentation_masks.clear()
+            self.time_navigation.setEnabled(False)
+            self.segment_current_btn.setEnabled(False)
+            self.segment_all_btn.setEnabled(False)
+            return None
+        return result
+
+    main_window_cls.load_dataset = load_dataset
+
+    # Every remaining slot that invokes run_with_progress now handles explicit
+    # cancellation/failure uniformly instead of leaking a traceback into Qt.
+    for name in (
+        "_segment_current_volume",
+        "_segment_all_volumes",
+        "_run_otsu_segment",
+        "_rf_train",
+        "_rf_predict_current",
+        "_rf_predict_all",
+    ):
+        method = getattr(main_window_cls, name, None)
+        if method is not None:
+            setattr(main_window_cls, name, _guard(method))
