@@ -1,250 +1,218 @@
-"""
-selection_library.py - Selection Library Management
+"""Selection persistence and tabular statistics export."""
 
-Handles saving/loading selections and exporting statistics
-"""
+from __future__ import annotations
 
+import csv
 import json
-import numpy as np
+from datetime import datetime, timezone
 from pathlib import Path
-import sys
-from datetime import datetime
+from typing import Any
+
+import numpy as np
 
 
 class SelectionLibrary:
-    """Manages selection persistence and export"""
-    
-    VERSION = "1.0"
-    
+    """Serialize selection masks and histogram ROIs without losing colour types."""
+
+    VERSION = "1.1"
+
     @staticmethod
-    def save_selections(selections, filepath):
-        """
-        Save selections to .bits file
-        
-        Args:
-            selections: List of Selection objects
-            filepath: Path to save
-            
-        Returns:
-            str: Path to saved file
-        """
-        print(f"Saving {len(selections)} selections...", file=sys.stderr)
-        
-        data = {
-            'version': SelectionLibrary.VERSION,
-            'created': datetime.now().isoformat(),
-            'num_selections': len(selections),
-            'selections': []
+    def _encode_color(color: Any) -> dict | None:
+        if color is None:
+            return None
+        if isinstance(color, str):
+            return {"format": "string", "value": color}
+        values = np.asarray(color).reshape(-1)
+        if values.size not in (3, 4):
+            raise ValueError("Selection colour must be a string, RGB, or RGBA value")
+        return {
+            "format": "rgba" if values.size == 4 else "rgb",
+            "value": [float(value) for value in values],
         }
-        
-        for sel in selections:
-            sel_data = {
-                'name': sel.name,
-                'cluster_id': sel.cluster_id,
-                'visible': sel.visible
-            }
-            
-            # Spatial mask as nested list
-            if sel.spatial_mask is not None:
-                sel_data['spatial_mask'] = sel.spatial_mask.tolist()
-            else:
-                sel_data['spatial_mask'] = None
-            
-            # Histogram ROI
-            if sel.histogram_roi is not None:
-                sel_data['histogram_roi'] = sel.histogram_roi.tolist()
-            else:
-                sel_data['histogram_roi'] = None
-            
-            # Color
-            if sel.color is not None:
-                sel_data['color'] = list(sel.color) if isinstance(sel.color, tuple) else sel.color
-            else:
-                sel_data['color'] = None
-            
-            data['selections'].append(sel_data)
-        
-        # Ensure .bits extension
-        filepath = Path(filepath)
-        if filepath.suffix != '.bits':
-            filepath = filepath.with_suffix('.bits')
-        
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        print(f"Saved to {filepath}", file=sys.stderr)
-        return str(filepath)
-    
+
     @staticmethod
-    def load_selections(filepath):
-        """
-        Load selections from .bits file
-        
-        Args:
-            filepath: Path to .bits file
-            
-        Returns:
-            list: Selection data dictionaries
-        """
-        print(f"Loading selections from {filepath}...", file=sys.stderr)
-        
-        filepath = Path(filepath)
-        if not filepath.exists():
-            raise FileNotFoundError(f"Not found: {filepath}")
-        
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-        
-        selections_data = []
-        for sel_data in data['selections']:
-            # Reconstruct arrays
-            spatial_mask = None
-            if sel_data.get('spatial_mask') is not None:
-                spatial_mask = np.array(sel_data['spatial_mask'], dtype=bool)
-            
-            histogram_roi = None
-            if sel_data.get('histogram_roi') is not None:
-                histogram_roi = np.array(sel_data['histogram_roi'])
-            
-            color = None
-            if sel_data.get('color') is not None:
-                color = tuple(sel_data['color'])
-            
-            selections_data.append({
-                'name': sel_data['name'],
-                'spatial_mask': spatial_mask,
-                'histogram_roi': histogram_roi,
-                'cluster_id': sel_data.get('cluster_id'),
-                'color': color,
-                'visible': sel_data.get('visible', True)
-            })
-        
-        print(f"Loaded {len(selections_data)} selections", file=sys.stderr)
-        return selections_data
-    
+    def _decode_color(payload: Any) -> Any:
+        if payload is None:
+            return None
+        if isinstance(payload, str):
+            return payload
+        if isinstance(payload, dict):
+            value = payload.get("value")
+            if payload.get("format") == "string":
+                return str(value)
+            if payload.get("format") in {"rgb", "rgba"}:
+                return tuple(float(component) for component in value)
+            raise ValueError(f"Unsupported colour format: {payload.get('format')}")
+        # Backward compatibility with version 1.0 numeric lists.  A legacy
+        # hexadecimal string must remain a string rather than becoming a tuple
+        # of characters.
+        if isinstance(payload, list):
+            if all(isinstance(component, (int, float)) for component in payload):
+                return tuple(float(component) for component in payload)
+            return "".join(str(component) for component in payload)
+        return payload
+
     @staticmethod
-    def export_statistics_csv(selections, neutron_data, xray_data, filepath):
-        """
-        Export statistics to CSV
-        
-        Args:
-            selections: List of Selection objects
-            neutron_data: 2D neutron array
-            xray_data: 2D xray array  
-            filepath: Path to save CSV
-        """
-        import csv
-        
-        filepath = Path(filepath)
-        if filepath.suffix != '.csv':
-            filepath = filepath.with_suffix('.csv')
-        
-        with open(filepath, 'w', newline='') as f:
-            writer = csv.writer(f)
-            
-            # Header
-            writer.writerow([
-                'Selection', 'Cluster_ID', 'Pixels', 'Volume_%',
-                'Neutron_Mean', 'Neutron_Std', 'Neutron_Min', 'Neutron_Max',
-                'Xray_Mean', 'Xray_Std', 'Xray_Min', 'Xray_Max'
-            ])
-            
-            # Data
-            total_pixels = neutron_data.size
-            skipped = 0
-            
-            for sel in selections:
-                if sel.spatial_mask is not None and np.sum(sel.spatial_mask) > 0:
-                    mask = sel.spatial_mask
-                    
-                    # Check dimension match
-                    if mask.shape != neutron_data.shape:
-                        print(f"  Skipping '{sel.name}': dimension mismatch "
-                              f"(mask {mask.shape} vs data {neutron_data.shape})", file=sys.stderr)
-                        skipped += 1
-                        continue
-                    
-                    n_pix = np.sum(mask)
-                    
-                    n_vals = neutron_data[mask]
-                    x_vals = xray_data[mask]
-                    
-                    writer.writerow([
-                        sel.name,
-                        sel.cluster_id if sel.cluster_id is not None else '',
-                        n_pix,
-                        f'{100*n_pix/total_pixels:.2f}',
-                        f'{np.mean(n_vals):.1f}',
-                        f'{np.std(n_vals):.1f}',
-                        f'{np.min(n_vals):.1f}',
-                        f'{np.max(n_vals):.1f}',
-                        f'{np.mean(x_vals):.1f}',
-                        f'{np.std(x_vals):.1f}',
-                        f'{np.min(x_vals):.1f}',
-                        f'{np.max(x_vals):.1f}'
-                    ])
-        
-        if skipped > 0:
-            print(f"Exported statistics to {filepath} ({skipped} selections skipped due to dimension mismatch)", file=sys.stderr)
-        else:
-            print(f"Exported statistics to {filepath}", file=sys.stderr)
-        
-        return str(filepath), skipped
-    
+    def save_selections(selections: list, filepath: str | Path) -> str:
+        data = {
+            "version": SelectionLibrary.VERSION,
+            "created": datetime.now(timezone.utc).isoformat(),
+            "num_selections": len(selections),
+            "selections": [],
+        }
+        for selection in selections:
+            spatial_mask = getattr(selection, "spatial_mask", None)
+            histogram_roi = getattr(selection, "histogram_roi", None)
+            data["selections"].append(
+                {
+                    "name": str(selection.name),
+                    "cluster_id": (
+                        None
+                        if getattr(selection, "cluster_id", None) is None
+                        else int(selection.cluster_id)
+                    ),
+                    "visible": bool(getattr(selection, "visible", True)),
+                    "spatial_mask": (
+                        None
+                        if spatial_mask is None
+                        else np.asarray(spatial_mask, dtype=bool).tolist()
+                    ),
+                    "histogram_roi": (
+                        None
+                        if histogram_roi is None
+                        else np.asarray(histogram_roi, dtype=float).tolist()
+                    ),
+                    "color": SelectionLibrary._encode_color(
+                        getattr(selection, "color", None)
+                    ),
+                }
+            )
+
+        output = Path(filepath)
+        if output.suffix.lower() != ".bits":
+            output = output.with_suffix(".bits")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, allow_nan=False)
+        return str(output)
+
     @staticmethod
-    def export_statistics_excel(selections, neutron_data, xray_data, filepath):
-        """Export statistics to Excel (requires pandas)"""
+    def load_selections(filepath: str | Path) -> list[dict]:
+        source = Path(filepath)
+        if not source.exists():
+            raise FileNotFoundError(f"Not found: {source}")
+        with source.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if "selections" not in data or not isinstance(data["selections"], list):
+            raise ValueError("Invalid .bits file: missing selections list")
+
+        selections: list[dict] = []
+        for item in data["selections"]:
+            mask = item.get("spatial_mask")
+            roi = item.get("histogram_roi")
+            selections.append(
+                {
+                    "name": str(item["name"]),
+                    "spatial_mask": (
+                        None if mask is None else np.asarray(mask, dtype=bool)
+                    ),
+                    "histogram_roi": (
+                        None if roi is None else np.asarray(roi, dtype=float)
+                    ),
+                    "cluster_id": item.get("cluster_id"),
+                    "color": SelectionLibrary._decode_color(item.get("color")),
+                    "visible": bool(item.get("visible", True)),
+                }
+            )
+        return selections
+
+    @staticmethod
+    def _statistics_rows(selections, neutron_data, xray_data):
+        neutron = np.asarray(neutron_data)
+        xray = np.asarray(xray_data)
+        if neutron.shape != xray.shape:
+            raise ValueError("Neutron and X-ray arrays must have identical shapes")
+
+        total_pixels = neutron.size
+        rows = []
+        skipped = 0
+        for selection in selections:
+            mask = getattr(selection, "spatial_mask", None)
+            if mask is None:
+                continue
+            mask = np.asarray(mask, dtype=bool)
+            if mask.shape != neutron.shape:
+                skipped += 1
+                continue
+            count = int(np.count_nonzero(mask))
+            if count == 0:
+                continue
+            neutron_values = neutron[mask]
+            xray_values = xray[mask]
+            rows.append(
+                {
+                    "Selection": selection.name,
+                    "Cluster_ID": getattr(selection, "cluster_id", None),
+                    "Pixels": count,
+                    "Volume_%": 100.0 * count / total_pixels,
+                    "Neutron_Mean": float(np.mean(neutron_values)),
+                    "Neutron_Std": float(np.std(neutron_values)),
+                    "Neutron_Min": float(np.min(neutron_values)),
+                    "Neutron_Max": float(np.max(neutron_values)),
+                    "Xray_Mean": float(np.mean(xray_values)),
+                    "Xray_Std": float(np.std(xray_values)),
+                    "Xray_Min": float(np.min(xray_values)),
+                    "Xray_Max": float(np.max(xray_values)),
+                }
+            )
+        return rows, skipped
+
+    @staticmethod
+    def export_statistics_csv(
+        selections, neutron_data, xray_data, filepath: str | Path
+    ) -> tuple[str, int]:
+        rows, skipped = SelectionLibrary._statistics_rows(
+            selections, neutron_data, xray_data
+        )
+        output = Path(filepath)
+        if output.suffix.lower() != ".csv":
+            output = output.with_suffix(".csv")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "Selection",
+            "Cluster_ID",
+            "Pixels",
+            "Volume_%",
+            "Neutron_Mean",
+            "Neutron_Std",
+            "Neutron_Min",
+            "Neutron_Max",
+            "Xray_Mean",
+            "Xray_Std",
+            "Xray_Min",
+            "Xray_Max",
+        ]
+        with output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        return str(output), skipped
+
+    @staticmethod
+    def export_statistics_excel(
+        selections, neutron_data, xray_data, filepath: str | Path
+    ) -> tuple[str, int]:
         try:
             import pandas as pd
-        except ImportError:
-            raise ImportError("pandas required. Install: pip install pandas openpyxl")
-        
-        filepath = Path(filepath)
-        if filepath.suffix not in ['.xlsx', '.xls']:
-            filepath = filepath.with_suffix('.xlsx')
-        
-        # Compute stats
-        stats = []
-        total_pixels = neutron_data.size
-        skipped = 0
-        
-        for sel in selections:
-            if sel.spatial_mask is not None and np.sum(sel.spatial_mask) > 0:
-                mask = sel.spatial_mask
-                
-                # Check dimension match
-                if mask.shape != neutron_data.shape:
-                    print(f"  Skipping '{sel.name}': dimension mismatch "
-                          f"(mask {mask.shape} vs data {neutron_data.shape})", file=sys.stderr)
-                    skipped += 1
-                    continue
-                
-                n_pix = np.sum(mask)
-                
-                n_vals = neutron_data[mask]
-                x_vals = xray_data[mask]
-                
-                stats.append({
-                    'Selection': sel.name,
-                    'Cluster_ID': sel.cluster_id if sel.cluster_id is not None else '',
-                    'Pixels': n_pix,
-                    'Volume_%': f'{100*n_pix/total_pixels:.2f}',
-                    'Neutron_Mean': f'{np.mean(n_vals):.1f}',
-                    'Neutron_Std': f'{np.std(n_vals):.1f}',
-                    'Neutron_Min': f'{np.min(n_vals):.1f}',
-                    'Neutron_Max': f'{np.max(n_vals):.1f}',
-                    'Xray_Mean': f'{np.mean(x_vals):.1f}',
-                    'Xray_Std': f'{np.std(x_vals):.1f}',
-                    'Xray_Min': f'{np.min(x_vals):.1f}',
-                    'Xray_Max': f'{np.max(x_vals):.1f}'
-                })
-        
-        df = pd.DataFrame(stats)
-        df.to_excel(filepath, index=False, engine='openpyxl')
-        
-        if skipped > 0:
-            print(f"Exported to {filepath} ({skipped} selections skipped due to dimension mismatch)", file=sys.stderr)
-        else:
-            print(f"Exported to {filepath}", file=sys.stderr)
-        
-        return str(filepath), skipped
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError("Install pandas and openpyxl for Excel export") from exc
+
+        rows, skipped = SelectionLibrary._statistics_rows(
+            selections, neutron_data, xray_data
+        )
+        output = Path(filepath)
+        if output.suffix.lower() not in {".xlsx", ".xls"}:
+            output = output.with_suffix(".xlsx")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_excel(output, index=False, engine="openpyxl")
+        return str(output), skipped

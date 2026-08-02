@@ -1,0 +1,171 @@
+"""Targeted runtime fixes kept separate from the legacy main-window module.
+
+The GUI is currently monolithic.  These overrides isolate correctness fixes
+without copying the entire window implementation and can be removed once the
+window is split into controllers and services.
+"""
+
+from __future__ import annotations
+
+from typing import Type
+
+import numpy as np
+
+_APPLIED = False
+
+
+def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
+    global _APPLIED
+    if _APPLIED:
+        return
+    _APPLIED = True
+
+    # Backward-compatible alias for a typo in the 3-D univariate region-growing
+    # path.  The canonical attribute remains ``view_mode``.
+    if not hasattr(slice_viewer_cls, "current_view_mode"):
+        slice_viewer_cls.current_view_mode = property(
+            lambda self: self.view_mode,
+            lambda self, value: setattr(self, "view_mode", value),
+        )
+
+    def _on_roi_updated(self):
+        roi_manager = self.dual_histogram.get_roi_manager()
+        has_roi = roi_manager.has_roi()
+
+        # Clearing the active editor ROI must not delete computed segmentation
+        # layers.  It only removes the transient slice highlight when no saved
+        # ROI remains.
+        if not has_roi and self.dataset is not None:
+            self.slice_viewer._clear_highlight()
+
+        self.segment_current_btn.setEnabled(has_roi)
+        self.segment_all_btn.setEnabled(has_roi and self.mode == "4D")
+        self.selection_manager.enable_save_button(has_roi)
+        if has_roi:
+            self.status_bar.showMessage("ROI defined - ready to segment")
+        elif not any(self.segmentation_masks.values()):
+            self.export_current_btn.setEnabled(False)
+            self.export_all_btn.setEnabled(False)
+
+    main_window_cls._on_roi_updated = _on_roi_updated
+
+    def _segment_all_volumes(self):
+        from PyQt5.QtWidgets import QMessageBox
+        from utils.progress_dialog import run_with_progress
+        from utils.roi_manager import ROIManager
+
+        if not self.dataset:
+            return
+        roi_manager = self.dual_histogram.get_roi_manager()
+        if not roi_manager.has_roi():
+            QMessageBox.warning(self, "No ROI", "Please define an ROI first")
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Confirm Batch Segmentation",
+                f"Segment all {self.dataset.num_timepoints} timepoints?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+
+        named_rois = roi_manager.get_named_rois() if roi_manager.has_named_rois() else []
+
+        def operation(progress_callback):
+            results: dict[int, list[tuple[np.ndarray, object, str]]] = {}
+            timepoints = self.dataset.num_timepoints
+            class_count = max(len(named_rois), 1)
+            total_steps = timepoints * class_count
+            completed = 0
+
+            for timepoint in range(timepoints):
+                neutron, xray = self.dataset.get_volume_at_time(timepoint)
+                layers = []
+                if named_rois:
+                    for roi in named_rois:
+                        manager = ROIManager()
+                        if roi["roi_type"] == "polygon":
+                            manager.set_polygon_roi(roi["points"])
+                        else:
+                            manager.set_rectangle_roi(*roi["rectangle"])
+                        mask = self.segmentation_engine.segment_volume(
+                            neutron, xray, manager
+                        )
+                        layers.append((mask, roi["color"], roi["name"]))
+                        completed += 1
+                        progress_callback(
+                            int(100 * completed / total_steps),
+                            f"T={timepoint}: {roi['name']}",
+                        )
+                else:
+                    mask = self.segmentation_engine.segment_volume(
+                        neutron, xray, roi_manager
+                    )
+                    color = self._next_roi_color(roi_manager, 0)
+                    name = self._current_roi_name(roi_manager)
+                    layers.append((mask, color, name))
+                    completed += 1
+                    progress_callback(
+                        int(100 * completed / total_steps),
+                        f"Segmented timepoint {timepoint + 1}/{timepoints}",
+                    )
+                results[timepoint] = layers
+            return results
+
+        segmented = run_with_progress(
+            self,
+            "Batch Segmentation",
+            f"Segmenting {self.dataset.num_timepoints} timepoints...",
+            operation,
+        )
+        if segmented is None:
+            return
+
+        import matplotlib.colors as mcolors
+
+        for timepoint, layers in segmented.items():
+            destination = self.segmentation_masks.setdefault(timepoint, [])
+            for mask, color, name in layers:
+                try:
+                    red, green, blue, _ = mcolors.to_rgba(color)
+                    color = (red, green, blue, 0.5)
+                except Exception:
+                    color = self._OVERLAY_COLORS[len(destination) % len(self._OVERLAY_COLORS)]
+                destination.append((mask, color, name))
+
+        self.export_current_btn.setEnabled(True)
+        self.export_all_btn.setEnabled(True)
+        self._update_current_timepoint(self.dataset.current_timepoint)
+        QMessageBox.information(
+            self,
+            "Segmentation Complete",
+            f"Segmented {len(segmented)} timepoint(s) while preserving "
+            f"{max(len(named_rois), 1)} class layer(s).",
+        )
+
+    main_window_cls._segment_all_volumes = _segment_all_volumes
+
+    def _refresh_histograms(self):
+        if self.dataset is None or self.histogram_engine is None:
+            return
+        self._compute_global_histogram()
+        if self.global_histogram is not None:
+            self._update_current_timepoint(self.dataset.current_timepoint)
+
+    original_cpu_toggle = main_window_cls._on_cpu_gpu_toggled
+
+    def _on_cpu_gpu_toggled(self, force_cpu):
+        original_cpu_toggle(self, force_cpu)
+        _refresh_histograms(self)
+
+    main_window_cls._on_cpu_gpu_toggled = _on_cpu_gpu_toggled
+
+    original_gpu_change = main_window_cls._on_gpu_device_changed
+
+    def _on_gpu_device_changed(self, gpu_id):
+        original_gpu_change(self, gpu_id)
+        _refresh_histograms(self)
+
+    main_window_cls._on_gpu_device_changed = _on_gpu_device_changed
