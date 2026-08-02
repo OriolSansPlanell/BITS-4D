@@ -1,580 +1,445 @@
-"""
-random_forest_4d.py - Random Forest Segmentation for 4D Multimodal Datasets
+"""Memory-bounded Random Forest segmentation for paired 3-D/4-D datasets."""
 
-Trains a Random Forest classifier using labels derived from:
-  - Manual ROI segmentation
-  - K-means clustering
-  - Multi-level Otsu thresholding
+from __future__ import annotations
 
-Background (label = 0) is always included as an explicit class during training.
-Predictions propagate to all timepoints using 3D spatial + intensity features.
-
-Version: 15.2  (ported from BiTS_v16 / improved_rf.py)
-"""
+import pickle
+from pathlib import Path
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
-import sys
-import pickle
-from typing import Optional, Callable, Dict, Tuple
-
+from scipy.ndimage import laplace, uniform_filter
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-from scipy.ndimage import sobel, uniform_filter, generic_filter, laplace
 
 
-# ─────────────────────────────────────────────────────────────
-#  Feature extraction helpers
-# ─────────────────────────────────────────────────────────────
+_VALID_LEVELS = {"basic", "advanced", "expert"}
 
-def _extract_features(
+
+def _validate_pair(neutron_vol: np.ndarray, xray_vol: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    neutron = np.asarray(neutron_vol)
+    xray = np.asarray(xray_vol)
+    if neutron.shape != xray.shape:
+        raise ValueError(f"Shape mismatch: neutron {neutron.shape} vs X-ray {xray.shape}")
+    if neutron.ndim != 3:
+        raise ValueError("Feature extraction requires paired 3-D volumes")
+    return neutron, xray
+
+
+def _extract_features_at_indices(
     neutron_vol: np.ndarray,
     xray_vol: np.ndarray,
+    indices: np.ndarray,
     level: str = "basic",
 ) -> np.ndarray:
-    """
-    Build a feature matrix from a single 3-D volume pair.
+    if level not in _VALID_LEVELS:
+        raise ValueError(f"Unknown feature level {level!r}; choose {_VALID_LEVELS}")
+    neutron, xray = _validate_pair(neutron_vol, xray_vol)
+    indices = np.asarray(indices, dtype=np.int64)
+    n_flat = neutron.reshape(-1).astype(np.float32, copy=False)
+    x_flat = xray.reshape(-1).astype(np.float32, copy=False)
+    n = n_flat[indices]
+    x = x_flat[indices]
 
-    Parameters
-    ----------
-    neutron_vol, xray_vol : (Z, Y, X) float arrays
-    level : 'basic' | 'advanced' | 'expert'
-
-    Feature layout
-    --------------
-    basic (6):
-        neutron, xray, ratio (n/x), sum, difference, magnitude
-
-    advanced (+3):
-        normalised Z, Y, X spatial coordinates
-
-    expert (+6):
-        local mean & std of each channel (3×3×3 window)
-        laplacian of neutron channel
-    """
-    n = neutron_vol.astype(np.float32)
-    x = xray_vol.astype(np.float32)
-
-    feats = [
-        n.ravel(),
-        x.ravel(),
-        (n / (x + 1e-6)).ravel(),
-        (n + x).ravel(),
-        (n - x).ravel(),
-        np.sqrt(n ** 2 + x ** 2).ravel(),
+    features = [
+        n,
+        x,
+        n / (x + np.float32(1e-6)),
+        n + x,
+        n - x,
+        np.hypot(n, x),
     ]
 
-    if level in ("advanced", "expert"):
-        Z, Y, X = np.meshgrid(
-            np.linspace(0, 1, n.shape[0]),
-            np.linspace(0, 1, n.shape[1]),
-            np.linspace(0, 1, n.shape[2]),
-            indexing="ij",
+    if level in {"advanced", "expert"}:
+        z, y, x_coord = np.unravel_index(indices, neutron.shape)
+        denominators = [max(size - 1, 1) for size in neutron.shape]
+        features.extend(
+            [
+                z.astype(np.float32) / denominators[0],
+                y.astype(np.float32) / denominators[1],
+                x_coord.astype(np.float32) / denominators[2],
+            ]
         )
-        feats += [Z.ravel(), Y.ravel(), X.ravel()]
 
     if level == "expert":
-        for vol in (n, x):
-            feats.append(uniform_filter(vol, size=3).ravel())
-            feats.append(generic_filter(vol, np.std, size=3).ravel())
-        feats.append(laplace(n).ravel())
+        for volume in (neutron, xray):
+            volume_float = volume.astype(np.float32, copy=False)
+            mean = uniform_filter(volume_float, size=3, mode="nearest")
+            mean_square = uniform_filter(volume_float * volume_float, size=3, mode="nearest")
+            variance = np.maximum(mean_square - mean * mean, 0.0)
+            features.append(mean.reshape(-1)[indices])
+            features.append(np.sqrt(variance, dtype=np.float32).reshape(-1)[indices])
+        features.append(
+            laplace(neutron.astype(np.float32, copy=False), mode="nearest")
+            .reshape(-1)[indices]
+        )
 
-    return np.column_stack(feats)
+    matrix = np.column_stack(features).astype(np.float32, copy=False)
+    if not np.all(np.isfinite(matrix)):
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+    return matrix
 
 
-# ─────────────────────────────────────────────────────────────
-#  Label-generation helpers
-# ─────────────────────────────────────────────────────────────
-
-def labels_from_manual(
-    mask: np.ndarray,
-    multi_class_masks: Optional[Dict[int, np.ndarray]] = None,
-) -> np.ndarray:
-    """
-    Convert a binary ROI mask (or dict of class masks) to an integer label array.
-
-    Parameters
-    ----------
-    mask : (Z, Y, X) bool  – single foreground mask (class 1); rest = background (0)
-    multi_class_masks : optional dict {class_id -> bool mask}
-        If provided, overrides `mask` and assigns each class its own integer label.
-        Unassigned voxels get label 0 (background).
-
-    Returns
-    -------
-    labels : (Z, Y, X) int32
-        0 = background, 1+ = foreground classes
-    """
-    labels = np.zeros(mask.shape, dtype=np.int32)
-
-    if multi_class_masks is not None and len(multi_class_masks) > 0:
-        for class_id, m in sorted(multi_class_masks.items()):
-            labels[m.astype(bool)] = int(class_id)
-    else:
-        labels[mask.astype(bool)] = 1
-
-    print(
-        f"  Manual labels: {np.sum(labels > 0):,} foreground voxels, "
-        f"{np.sum(labels == 0):,} background",
-        file=sys.stderr,
+def _extract_features(neutron_vol, xray_vol, level="basic") -> np.ndarray:
+    """Compatibility helper; callers should prefer chunked indexed extraction."""
+    neutron, _ = _validate_pair(neutron_vol, xray_vol)
+    return _extract_features_at_indices(
+        neutron_vol, xray_vol, np.arange(neutron.size, dtype=np.int64), level
     )
+
+
+def labels_from_manual(mask, multi_class_masks: Optional[Dict[int, np.ndarray]] = None):
+    mask_array = np.asarray(mask, dtype=bool)
+    labels = np.zeros(mask_array.shape, dtype=np.int32)
+    if multi_class_masks:
+        for class_id, class_mask in sorted(multi_class_masks.items()):
+            class_mask = np.asarray(class_mask, dtype=bool)
+            if class_mask.shape != labels.shape:
+                raise ValueError("All class masks must have the same shape")
+            labels[class_mask] = int(class_id)
+    else:
+        labels[mask_array] = 1
     return labels
 
 
 def labels_from_kmeans(
-    cluster_map: np.ndarray,
-    neutron_vol: np.ndarray,
-    xray_vol: np.ndarray,
+    cluster_map,
+    neutron_vol,
+    xray_vol,
     background_cluster: Optional[int] = None,
-) -> np.ndarray:
-    """
-    Convert a k-means cluster map to a label array with explicit background class.
-
-    Parameters
-    ----------
-    cluster_map : (Z, Y, X) int – cluster ids 0 … K-1
-    neutron_vol, xray_vol : volumes for auto-detecting background cluster
-    background_cluster : if given, that cluster id is designated class 0;
-                         otherwise the cluster with the lowest combined
-                         mean intensity is chosen automatically.
-
-    Returns
-    -------
-    labels : (Z, Y, X) int32
-        0 = background cluster, 1+ = remaining clusters (renumbered sequentially)
-    """
-    cluster_ids = np.unique(cluster_map)
-
-    # Auto-detect background = cluster with lowest mean (neutron + xray) intensity
+):
+    clusters = np.asarray(cluster_map)
+    neutron, xray = _validate_pair(neutron_vol, xray_vol)
+    if clusters.shape != neutron.shape:
+        raise ValueError("cluster_map must match the volume shape")
+    cluster_ids = np.unique(clusters)
     if background_cluster is None:
-        mean_intensity = {}
-        for cid in cluster_ids:
-            m = cluster_map == cid
-            mean_intensity[cid] = (
-                float(np.mean(neutron_vol[m])) + float(np.mean(xray_vol[m]))
-            ) / 2.0
-        background_cluster = min(mean_intensity, key=mean_intensity.get)
-        print(
-            f"  K-means: auto-selected cluster {background_cluster} as background "
-            f"(mean intensity {mean_intensity[background_cluster]:.1f})",
-            file=sys.stderr,
-        )
+        means = {}
+        for cluster_id in cluster_ids:
+            mask = clusters == cluster_id
+            means[int(cluster_id)] = float(
+                np.mean(neutron[mask].astype(np.float64))
+                + np.mean(xray[mask].astype(np.float64))
+            )
+        background_cluster = min(means, key=means.get)
+    if background_cluster not in cluster_ids:
+        raise ValueError("background_cluster is not present in cluster_map")
 
-    # Build label map: background → 0, rest → 1, 2, …
-    labels = np.zeros_like(cluster_map, dtype=np.int32)
-    new_id = 1
-    for cid in sorted(cluster_ids):
-        if cid == background_cluster:
-            continue  # stays 0
-        labels[cluster_map == cid] = new_id
-        new_id += 1
-
-    for lbl in sorted(np.unique(labels)):
-        count = int(np.sum(labels == lbl))
-        name = "Background" if lbl == 0 else f"Class {lbl}"
-        print(f"    {name}: {count:,} voxels", file=sys.stderr)
-
+    labels = np.zeros(clusters.shape, dtype=np.int32)
+    next_label = 1
+    for cluster_id in sorted(cluster_ids):
+        if cluster_id == background_cluster:
+            continue
+        labels[clusters == cluster_id] = next_label
+        next_label += 1
     return labels
 
 
-def labels_from_otsu(
-    neutron_vol: np.ndarray,
-    xray_vol: np.ndarray,
-    n_classes: int = 3,
-    channel: str = "both",
-) -> np.ndarray:
-    """
-    Apply multi-level Otsu thresholding and return a label array.
-
-    Parameters
-    ----------
-    neutron_vol, xray_vol : (Z, Y, X) arrays
-    n_classes : total number of classes (including background = 0).
-                Multi-level Otsu will find (n_classes - 1) thresholds.
-    channel : 'neutron' | 'xray' | 'both'
-        Which channel to threshold. 'both' averages the two.
-
-    Returns
-    -------
-    labels : (Z, Y, X) int32
-        0 = lowest-intensity class (background), 1+ = brighter classes
-    """
+def labels_from_otsu(neutron_vol, xray_vol, n_classes=3, channel="both"):
     try:
-        from skimage.filters import threshold_multiotsu
-    except ImportError:
-        raise ImportError(
-            "scikit-image is required for Otsu segmentation. "
-            "Install it with: pip install scikit-image"
-        )
+        from skimage.filters import threshold_multiotsu, threshold_otsu
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("scikit-image is required for Otsu segmentation") from exc
 
+    neutron, xray = _validate_pair(neutron_vol, xray_vol)
+    if n_classes < 2:
+        raise ValueError("n_classes must be at least 2")
     if channel == "neutron":
-        data = neutron_vol.astype(np.float32)
+        data = neutron.astype(np.float32, copy=False)
     elif channel == "xray":
-        data = xray_vol.astype(np.float32)
-    else:  # both
-        data = (
-            neutron_vol.astype(np.float32) / (neutron_vol.max() + 1e-6)
-            + xray_vol.astype(np.float32) / (xray_vol.max() + 1e-6)
-        ) / 2.0
+        data = xray.astype(np.float32, copy=False)
+    elif channel == "both":
+        def normalize(volume):
+            array = volume.astype(np.float32, copy=False)
+            minimum = float(np.nanmin(array))
+            maximum = float(np.nanmax(array))
+            if maximum <= minimum:
+                return np.zeros(array.shape, dtype=np.float32)
+            return (array - minimum) / (maximum - minimum)
 
-    n_thresholds = max(1, n_classes - 1)
+        data = (normalize(neutron) + normalize(xray)) / 2.0
+    else:
+        raise ValueError("channel must be 'neutron', 'xray', or 'both'")
 
+    finite_data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
     try:
-        thresholds = threshold_multiotsu(data, classes=n_classes)
-    except Exception as e:
-        print(f"  Multi-Otsu failed ({e}), falling back to single Otsu", file=sys.stderr)
-        from skimage.filters import threshold_otsu
-        thresholds = [threshold_otsu(data)]
+        thresholds = threshold_multiotsu(finite_data, classes=n_classes)
+    except ValueError:
+        thresholds = [threshold_otsu(finite_data)]
+    return np.digitize(finite_data, bins=thresholds).astype(np.int32)
 
-    labels = np.digitize(data, bins=thresholds).astype(np.int32)
-    # digitize returns 0…N-1 → already 0-based; class 0 = below first threshold = background
-
-    print(f"  Otsu thresholds: {[f'{t:.2f}' for t in thresholds]}", file=sys.stderr)
-    for lbl in sorted(np.unique(labels)):
-        count = int(np.sum(labels == lbl))
-        name = "Background" if lbl == 0 else f"Class {lbl}"
-        print(f"    {name}: {count:,} voxels", file=sys.stderr)
-
-    return labels
-
-
-# ─────────────────────────────────────────────────────────────
-#  Main class
-# ─────────────────────────────────────────────────────────────
 
 class RandomForestSegmentation4D:
-    """
-    Random Forest segmentation for 4D dual-modality (neutron + X-ray) datasets.
-
-    Workflow
-    --------
-    1. Generate training labels via one of:
-         - ``train_from_manual()``  – uses existing ROI segmentation mask(s)
-         - ``train_from_kmeans()``  – uses 3-D k-means cluster map
-         - ``train_from_otsu()``    – runs multi-level Otsu on the reference volume
-
-    2. Call ``predict_timepoint()`` or ``predict_all_timepoints()`` to propagate.
-
-    In every case **background (label 0) is always included** as a training class.
-
-    Parameters
-    ----------
-    n_estimators : int
-        Number of trees in the forest.
-    """
-
-    def __init__(self, n_estimators: int = 100):
-        self.n_estimators = n_estimators
+    def __init__(
+        self,
+        n_estimators: int = 100,
+        max_samples_per_class: int = 100_000,
+        prediction_chunk_size: int = 1_000_000,
+        random_state: int = 42,
+    ) -> None:
+        self.n_estimators = int(n_estimators)
+        self.max_samples_per_class = int(max_samples_per_class)
+        self.prediction_chunk_size = int(prediction_chunk_size)
+        self.random_state = int(random_state)
         self.rf: Optional[RandomForestClassifier] = None
-        self.scaler: Optional[StandardScaler] = None
-        self.feature_level: str = "basic"
-        self.trained: bool = False
+        self.scaler = None  # retained for backward-compatible model payloads
+        self.feature_level = "basic"
+        self.trained = False
         self.train_stats: dict = {}
         self.classes_: Optional[np.ndarray] = None
 
-    # ── training ──────────────────────────────────────────────
+    def _sample_indices(self, labels_flat: np.ndarray) -> np.ndarray:
+        rng = np.random.default_rng(self.random_state)
+        sampled = []
+        for class_id in np.unique(labels_flat):
+            class_indices = np.flatnonzero(labels_flat == class_id)
+            count = min(len(class_indices), self.max_samples_per_class)
+            if count == 0:
+                continue
+            if len(class_indices) > count:
+                class_indices = rng.choice(class_indices, count, replace=False)
+            sampled.append(np.asarray(class_indices, dtype=np.int64))
+        if len(sampled) < 2:
+            raise ValueError("Random Forest training requires at least two classes")
+        result = np.concatenate(sampled)
+        rng.shuffle(result)
+        return result
 
     def _fit(
         self,
-        neutron_vol: np.ndarray,
-        xray_vol: np.ndarray,
-        labels: np.ndarray,
-        feature_level: str,
-        verbose: bool,
+        neutron_vol,
+        xray_vol,
+        labels,
+        feature_level,
+        verbose=True,
     ) -> dict:
-        """
-        Internal training routine shared by all ``train_from_*`` methods.
+        neutron, xray = _validate_pair(neutron_vol, xray_vol)
+        labels_array = np.asarray(labels, dtype=np.int32)
+        if labels_array.shape != neutron.shape:
+            raise ValueError("labels must match the training volume shape")
+        if feature_level not in _VALID_LEVELS:
+            raise ValueError(f"Unknown feature level {feature_level!r}")
 
-        ``labels`` must be a (Z, Y, X) int32 array where
-        0 = background and positive integers are foreground classes.
-        ALL labelled voxels (including background=0) are used for training.
-        """
-        if verbose:
-            print(
-                f"\nRandom Forest training  [{feature_level} features]",
-                file=sys.stderr,
-            )
-
+        labels_flat = labels_array.reshape(-1)
+        sampled_indices = self._sample_indices(labels_flat)
+        x_train = _extract_features_at_indices(
+            neutron, xray, sampled_indices, feature_level
+        )
+        y_train = labels_flat[sampled_indices]
         self.feature_level = feature_level
-
-        # Feature matrix for the training timepoint
-        X_all = _extract_features(neutron_vol, xray_vol, feature_level)
-        y_all = labels.ravel().astype(np.int32)
-
-        # Statistics
-        unique_cls, counts = np.unique(y_all, return_counts=True)
-        class_dist = {int(c): int(n) for c, n in zip(unique_cls, counts)}
-
-        if verbose:
-            print(
-                f"  Total voxels: {len(y_all):,}  |  "
-                f"features: {X_all.shape[1]}",
-                file=sys.stderr,
-            )
-            for cls_id, cnt in class_dist.items():
-                name = "Background" if cls_id == 0 else f"Class {cls_id}"
-                print(
-                    f"    {name}: {cnt:,} ({100*cnt/len(y_all):.1f}%)",
-                    file=sys.stderr,
-                )
-
-        # Normalise
-        self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(X_all)
-
-        # Train
-        if verbose:
-            print("  Training Random Forest …", file=sys.stderr)
 
         self.rf = RandomForestClassifier(
             n_estimators=self.n_estimators,
-            max_depth=None,
             min_samples_split=10,
             min_samples_leaf=5,
-            random_state=42,
+            random_state=self.random_state,
             n_jobs=-1,
-            verbose=0,
+            class_weight="balanced_subsample",
+            oob_score=True,
+            max_samples=0.8,
         )
-        self.rf.fit(X_scaled, y_all)
+        self.rf.fit(x_train, y_train)
         self.classes_ = self.rf.classes_
         self.trained = True
 
-        # Training accuracy
-        acc = float(np.mean(self.rf.predict(X_scaled) == y_all))
-        if verbose:
-            print(f"  Training accuracy: {acc * 100:.2f}%", file=sys.stderr)
-            print("  ✓ Training complete!", file=sys.stderr)
-
+        train_accuracy = float(np.mean(self.rf.predict(x_train) == y_train))
+        unique_all, counts_all = np.unique(labels_flat, return_counts=True)
+        unique_sample, counts_sample = np.unique(y_train, return_counts=True)
         self.train_stats = {
-            "n_voxels": int(len(y_all)),
-            "n_features": int(X_all.shape[1]),
-            "n_classes": int(len(unique_cls)),
-            "classes": unique_cls.tolist(),
-            "class_counts": class_dist,
-            "training_accuracy": acc,
+            "n_voxels": int(labels_flat.size),
+            "sampled_voxels": int(len(sampled_indices)),
+            "n_features": int(x_train.shape[1]),
+            "n_classes": int(len(unique_all)),
+            "classes": unique_all.tolist(),
+            "class_counts": {
+                int(class_id): int(count)
+                for class_id, count in zip(unique_all, counts_all)
+            },
+            "sampled_class_counts": {
+                int(class_id): int(count)
+                for class_id, count in zip(unique_sample, counts_sample)
+            },
+            "training_accuracy": train_accuracy,
+            "oob_score": float(getattr(self.rf, "oob_score_", np.nan)),
             "feature_level": feature_level,
+            "class_balanced": True,
         }
-        return self.train_stats
-
-    # ── public training entry-points ─────────────────────────
+        return dict(self.train_stats)
 
     def train_from_manual(
         self,
-        neutron_vol: np.ndarray,
-        xray_vol: np.ndarray,
-        mask: np.ndarray,
-        feature_level: str = "basic",
-        multi_class_masks: Optional[Dict[int, np.ndarray]] = None,
-        verbose: bool = True,
-    ) -> dict:
-        """
-        Train using an existing binary (or multi-class) ROI segmentation mask.
-
-        Parameters
-        ----------
-        neutron_vol, xray_vol : (Z, Y, X) arrays  – reference timepoint volumes
-        mask : (Z, Y, X) bool – True = foreground
-        feature_level : 'basic' | 'advanced' | 'expert'
-        multi_class_masks : optional dict {class_id (int) -> bool mask}
-            For multi-class manual segmentation; overrides ``mask``.
-        """
-        if verbose:
-            print("\n[RF] Source: Manual ROI segmentation", file=sys.stderr)
-        labels = labels_from_manual(mask, multi_class_masks)
-        return self._fit(neutron_vol, xray_vol, labels, feature_level, verbose)
+        neutron_vol,
+        xray_vol,
+        mask,
+        feature_level="basic",
+        multi_class_masks=None,
+        verbose=True,
+    ):
+        return self._fit(
+            neutron_vol,
+            xray_vol,
+            labels_from_manual(mask, multi_class_masks),
+            feature_level,
+            verbose,
+        )
 
     def train_from_kmeans(
         self,
-        neutron_vol: np.ndarray,
-        xray_vol: np.ndarray,
-        cluster_map: np.ndarray,
-        feature_level: str = "basic",
-        background_cluster: Optional[int] = None,
-        verbose: bool = True,
-    ) -> dict:
-        """
-        Train using a k-means cluster label map.
-
-        Parameters
-        ----------
-        cluster_map : (Z, Y, X) int  – cluster ids 0 … K-1 (from KMeans3D)
-        background_cluster : cluster id to designate as background (0).
-            If None the cluster with the lowest combined mean intensity is used.
-        """
-        if verbose:
-            print("\n[RF] Source: K-means cluster map", file=sys.stderr)
-        labels = labels_from_kmeans(
-            cluster_map, neutron_vol, xray_vol, background_cluster
+        neutron_vol,
+        xray_vol,
+        cluster_map,
+        feature_level="basic",
+        background_cluster=None,
+        verbose=True,
+    ):
+        return self._fit(
+            neutron_vol,
+            xray_vol,
+            labels_from_kmeans(
+                cluster_map, neutron_vol, xray_vol, background_cluster
+            ),
+            feature_level,
+            verbose,
         )
-        return self._fit(neutron_vol, xray_vol, labels, feature_level, verbose)
 
     def train_from_otsu(
         self,
-        neutron_vol: np.ndarray,
-        xray_vol: np.ndarray,
-        n_classes: int = 3,
-        feature_level: str = "basic",
-        channel: str = "both",
-        verbose: bool = True,
-    ) -> dict:
-        """
-        Train using multi-level Otsu thresholding.
-
-        Parameters
-        ----------
-        n_classes : total number of output classes (including background = 0)
-        channel : 'neutron' | 'xray' | 'both' – channel used for thresholding
-        """
-        if verbose:
-            print("\n[RF] Source: Multi-level Otsu thresholding", file=sys.stderr)
-        labels = labels_from_otsu(neutron_vol, xray_vol, n_classes, channel)
-        return self._fit(neutron_vol, xray_vol, labels, feature_level, verbose)
-
-    # ── prediction ────────────────────────────────────────────
+        neutron_vol,
+        xray_vol,
+        n_classes=3,
+        feature_level="basic",
+        channel="both",
+        verbose=True,
+    ):
+        return self._fit(
+            neutron_vol,
+            xray_vol,
+            labels_from_otsu(neutron_vol, xray_vol, n_classes, channel),
+            feature_level,
+            verbose,
+        )
 
     def predict_timepoint(
         self,
-        neutron_vol: np.ndarray,
-        xray_vol: np.ndarray,
-        return_confidence: bool = True,
+        neutron_vol,
+        xray_vol,
+        return_confidence=True,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        cancel_check: Optional[Callable[[], None]] = None,
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """
-        Predict segmentation labels for a single 3-D volume pair.
+        if not self.trained or self.rf is None:
+            raise RuntimeError("Model not trained")
+        neutron, xray = _validate_pair(neutron_vol, xray_vol)
+        total = neutron.size
+        labels_flat = np.empty(total, dtype=np.int32)
+        confidence_flat = (
+            np.empty(total, dtype=np.float32) if return_confidence else None
+        )
 
-        Returns
-        -------
-        labels : (Z, Y, X) int32
-        confidence : (Z, Y, X) float32 or None
-            Maximum predicted-class probability at each voxel.
-        """
-        if not self.trained:
-            raise RuntimeError("Model not trained – call one of the train_from_*() methods first.")
+        for start in range(0, total, self.prediction_chunk_size):
+            if cancel_check:
+                cancel_check()
+            stop = min(start + self.prediction_chunk_size, total)
+            indices = np.arange(start, stop, dtype=np.int64)
+            features = _extract_features_at_indices(
+                neutron, xray, indices, self.feature_level
+            )
+            labels_flat[start:stop] = self.rf.predict(features).astype(np.int32)
+            if return_confidence:
+                probabilities = self.rf.predict_proba(features)
+                confidence_flat[start:stop] = np.max(probabilities, axis=1).astype(
+                    np.float32
+                )
+            if progress_callback:
+                progress_callback(
+                    int(100 * stop / total),
+                    f"Predicting voxels {stop:,}/{total:,}",
+                )
 
-        X = _extract_features(neutron_vol, xray_vol, self.feature_level)
-        X_scaled = self.scaler.transform(X)
-
-        labels_flat = self.rf.predict(X_scaled).astype(np.int32)
-        labels = labels_flat.reshape(neutron_vol.shape)
-
-        if return_confidence:
-            proba = self.rf.predict_proba(X_scaled)
-            conf_flat = np.max(proba, axis=1).astype(np.float32)
-            confidence = conf_flat.reshape(neutron_vol.shape)
-            return labels, confidence
-
-        return labels, None
+        labels = labels_flat.reshape(neutron.shape)
+        confidence = (
+            None
+            if confidence_flat is None
+            else confidence_flat.reshape(neutron.shape)
+        )
+        return labels, confidence
 
     def predict_all_timepoints(
         self,
-        neutron_4d: np.ndarray,
-        xray_4d: np.ndarray,
-        confidence_threshold: float = 0.70,
-        progress_callback: Optional[Callable[[int, str], None]] = None,
-        verbose: bool = True,
+        neutron_4d,
+        xray_4d,
+        confidence_threshold=0.70,
+        progress_callback=None,
+        verbose=True,
+        cancel_check=None,
     ) -> Dict[int, dict]:
-        """
-        Predict labels for every timepoint in a 4-D dataset.
+        neutron = np.asarray(neutron_4d)
+        xray = np.asarray(xray_4d)
+        if neutron.shape != xray.shape or neutron.ndim != 4:
+            raise ValueError("Prediction inputs must be matching 4-D arrays")
+        results = {}
+        for timepoint in range(neutron.shape[0]):
+            if cancel_check:
+                cancel_check()
 
-        Parameters
-        ----------
-        neutron_4d, xray_4d : (T, Z, Y, X) arrays
-        confidence_threshold : voxels below this confidence are flagged for review
-        progress_callback : optional callable(percent: int, message: str)
+            def local_progress(value, message):
+                if progress_callback:
+                    overall = int(
+                        100 * (timepoint + value / 100.0) / neutron.shape[0]
+                    )
+                    progress_callback(overall, f"T={timepoint}: {message}")
 
-        Returns
-        -------
-        results : dict  {timepoint_index -> {
-            'labels'            : (Z,Y,X) int32,
-            'confidence'        : (Z,Y,X) float32,
-            'mean_confidence'   : float,
-            'uncertain_fraction': float,
-            'needs_review'      : bool,
-        }}
-        """
-        if not self.trained:
-            raise RuntimeError("Model not trained – call one of the train_from_*() methods first.")
-
-        T = neutron_4d.shape[0]
-        results: Dict[int, dict] = {}
-
-        for t in range(T):
-            pct = int((t / T) * 100)
-            msg = f"RF predicting timepoint {t + 1}/{T}"
-            if progress_callback:
-                progress_callback(pct, msg)
-            if verbose:
-                print(f"  {msg} …", file=sys.stderr)
-
-            lbl, conf = self.predict_timepoint(
-                neutron_4d[t], xray_4d[t], return_confidence=True
+            labels, confidence = self.predict_timepoint(
+                neutron[timepoint],
+                xray[timepoint],
+                return_confidence=True,
+                progress_callback=local_progress,
+                cancel_check=cancel_check,
             )
-            mean_conf = float(np.mean(conf))
-            unc_frac = float(np.sum(conf < confidence_threshold) / conf.size)
-
-            results[t] = {
-                "labels": lbl,
-                "confidence": conf,
-                "mean_confidence": mean_conf,
-                "uncertain_fraction": unc_frac,
-                "needs_review": unc_frac > 0.10,
+            uncertain_fraction = float(
+                np.mean(confidence < float(confidence_threshold))
+            )
+            results[timepoint] = {
+                "labels": labels,
+                "confidence": confidence,
+                "mean_confidence": float(np.mean(confidence)),
+                "uncertain_fraction": uncertain_fraction,
+                "needs_review": uncertain_fraction > 0.10,
             }
-
-            if verbose:
-                flag = " ⚠ REVIEW" if results[t]["needs_review"] else ""
-                print(
-                    f"    confidence {mean_conf * 100:.1f}% "
-                    f"| uncertain {unc_frac * 100:.1f}%{flag}",
-                    file=sys.stderr,
-                )
-
         if progress_callback:
             progress_callback(100, "RF prediction complete")
-        if verbose:
-            avg_conf = np.mean([r["mean_confidence"] for r in results.values()])
-            n_review = sum(1 for r in results.values() if r["needs_review"])
-            print(
-                f"\n  RF summary: {T} timepoints | "
-                f"avg confidence {avg_conf * 100:.1f}% | "
-                f"{n_review} flagged for review",
-                file=sys.stderr,
-            )
-
         return results
 
-    # ── model persistence ─────────────────────────────────────
-
     def save_model(self, filepath: str) -> None:
-        """Serialise trained model to disk (pickle)."""
         if not self.trained:
-            raise RuntimeError("No trained model to save.")
+            raise RuntimeError("No trained model to save")
         payload = {
             "rf": self.rf,
             "scaler": self.scaler,
             "feature_level": self.feature_level,
             "train_stats": self.train_stats,
             "classes": self.classes_,
+            "max_samples_per_class": self.max_samples_per_class,
+            "prediction_chunk_size": self.prediction_chunk_size,
+            "random_state": self.random_state,
         }
-        with open(filepath, "wb") as fh:
-            pickle.dump(payload, fh, protocol=4)
-        print(f"[RF] Model saved → {filepath}", file=sys.stderr)
+        with Path(filepath).open("wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     def load_model(self, filepath: str) -> None:
-        """Deserialise a previously saved model from disk."""
-        with open(filepath, "rb") as fh:
-            payload = pickle.load(fh)
+        with Path(filepath).open("rb") as handle:
+            payload = pickle.load(handle)
         self.rf = payload["rf"]
-        self.scaler = payload["scaler"]
+        self.scaler = payload.get("scaler")
         self.feature_level = payload["feature_level"]
         self.train_stats = payload.get("train_stats", {})
-        self.classes_ = payload.get("classes", None)
-        self.trained = True
-        print(
-            f"[RF] Model loaded ← {filepath}  "
-            f"(feature level: {self.feature_level}, "
-            f"classes: {self.train_stats.get('classes', '?')})",
-            file=sys.stderr,
+        self.classes_ = payload.get("classes")
+        self.max_samples_per_class = payload.get(
+            "max_samples_per_class", self.max_samples_per_class
         )
-
-    # ── convenience ───────────────────────────────────────────
+        self.prediction_chunk_size = payload.get(
+            "prediction_chunk_size", self.prediction_chunk_size
+        )
+        self.random_state = payload.get("random_state", self.random_state)
+        self.trained = True
 
     @property
     def is_trained(self) -> bool:
@@ -586,7 +451,6 @@ class RandomForestSegmentation4D:
     def __repr__(self) -> str:
         status = "trained" if self.trained else "untrained"
         return (
-            f"RandomForestSegmentation4D("
-            f"n_estimators={self.n_estimators}, "
-            f"status={status})"
+            "RandomForestSegmentation4D("
+            f"n_estimators={self.n_estimators}, status={status})"
         )
