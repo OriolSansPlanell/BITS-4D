@@ -14,12 +14,8 @@ import numpy as np
 _APPLIED = False
 
 
-def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
-    global _APPLIED
-    if _APPLIED:
-        return
-    _APPLIED = True
-
+def _apply_correctness_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
+    """Install behavioural corrections on the legacy window classes."""
     # Backward-compatible alias for a typo in the 3-D univariate region-growing
     # path.  The canonical attribute remains ``view_mode``.
     if not hasattr(slice_viewer_cls, "current_view_mode"):
@@ -71,20 +67,25 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
         ):
             return
 
-        named_rois = roi_manager.get_named_rois() if roi_manager.has_named_rois() else []
+        # Segment every ROI shown on the histogram: all named class ROIs plus
+        # the active (unsaved) one, so batch results match the display.
+        if roi_manager.has_named_rois():
+            roi_specs = self._enumerate_roi_specs(roi_manager)
+        else:
+            roi_specs = None
 
         def operation(progress_callback):
             results: dict[int, list[tuple[np.ndarray, object, str]]] = {}
             timepoints = self.dataset.num_timepoints
-            class_count = max(len(named_rois), 1)
+            class_count = len(roi_specs) if roi_specs else 1
             total_steps = timepoints * class_count
             completed = 0
 
             for timepoint in range(timepoints):
                 neutron, xray = self.dataset.get_volume_at_time(timepoint)
                 layers = []
-                if named_rois:
-                    for roi in named_rois:
+                if roi_specs:
+                    for roi in roi_specs:
                         manager = ROIManager()
                         if roi["roi_type"] == "polygon":
                             manager.set_polygon_roi(roi["points"])
@@ -126,7 +127,13 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
         import matplotlib.colors as mcolors
 
         for timepoint, layers in segmented.items():
-            destination = self.segmentation_masks.setdefault(timepoint, [])
+            existing = self.segmentation_masks.get(timepoint, [])
+            new_names = {name for _mask, _color, name in layers}
+            # Replace earlier layers with the same name so repeated batch runs
+            # stay idempotent instead of stacking duplicate overlays.
+            destination = [
+                layer for layer in existing if layer[2] not in new_names
+            ]
             for mask, color, name in layers:
                 try:
                     red, green, blue, _ = mcolors.to_rgba(color)
@@ -134,6 +141,7 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
                 except Exception:
                     color = self._OVERLAY_COLORS[len(destination) % len(self._OVERLAY_COLORS)]
                 destination.append((mask, color, name))
+            self.segmentation_masks[timepoint] = destination
 
         self.export_current_btn.setEnabled(True)
         self.export_all_btn.setEnabled(True)
@@ -141,14 +149,21 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
         QMessageBox.information(
             self,
             "Segmentation Complete",
-            f"Segmented {len(segmented)} timepoint(s) while preserving "
-            f"{max(len(named_rois), 1)} class layer(s).",
+            f"Segmented {len(segmented)} timepoint(s) with "
+            f"{len(roi_specs) if roi_specs else 1} class layer(s).",
         )
 
     main_window_cls._segment_all_volumes = _segment_all_volumes
 
     def _refresh_histograms(self):
+        """Recompute histograms only when no valid global histogram exists.
+
+        CPU and GPU accumulation produce identical counts, so a plain
+        backend switch keeps every cached histogram valid.
+        """
         if self.dataset is None or self.histogram_engine is None:
+            return
+        if self.global_histogram is not None:
             return
         self._compute_global_histogram()
         if self.global_histogram is not None:
@@ -177,13 +192,6 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
                     )
                 except (ImportError, RuntimeError):
                     engine.use_gpu = False
-
-                try:
-                    engine.clear_cache(include_global=True)
-                except TypeError:
-                    engine.clear_cache()
-                except AttributeError:
-                    pass
 
             status_bar = getattr(self, "status_bar", None)
             if status_bar is not None:
@@ -223,13 +231,6 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
                 except (ImportError, RuntimeError):
                     engine.use_gpu = False
 
-                try:
-                    engine.clear_cache(include_global=True)
-                except TypeError:
-                    engine.clear_cache()
-                except AttributeError:
-                    pass
-
             status_bar = getattr(self, "status_bar", None)
             if status_bar is not None:
                 status_bar.showMessage(
@@ -240,19 +241,13 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
 
     main_window_cls._on_gpu_device_changed = _on_gpu_device_changed
 
-# The function is redefined below so importing this PR-2 file applies both the
-# correctness overrides above and the execution-reliability overrides.
-_PR1_APPLY = apply_runtime_fixes
-
-
 def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
+    """Apply all runtime overrides exactly once (idempotent)."""
     global _APPLIED
-    # Temporarily clear the guard so the PR-1 implementation can run exactly
-    # once, then install PR-2 wrappers.
-    already_applied = _APPLIED
-    if already_applied:
+    if _APPLIED:
         return
-    _PR1_APPLY(main_window_cls, slice_viewer_cls)
+    _APPLIED = True
+    _apply_correctness_fixes(main_window_cls, slice_viewer_cls)
 
     from utils.cancellation import OperationCancelled, OperationFailed
     from utils.progress_dialog import run_with_progress

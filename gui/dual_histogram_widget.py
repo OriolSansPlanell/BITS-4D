@@ -17,8 +17,7 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.patches import Rectangle as MplRectangle
 import numpy as np
-import sys
-sys.path.append('..')
+
 from histograms import HistogramData
 from utils.roi_manager import ROIManager
 
@@ -71,59 +70,32 @@ class HistogramCanvas(FigureCanvas):
     
     def set_histogram_data(self, hist_data: HistogramData):
         """Update histogram data and redraw"""
-        print(f"{self.title} - set_histogram_data called")
-        print(f"  hist_data type: {type(hist_data)}")
-        print(f"  hist_data is None: {hist_data is None}")
-        if hist_data is not None:
-            print(f"  histogram shape: {hist_data.histogram.shape}")
-            print(f"  num_voxels: {hist_data.num_voxels}")
         self.histogram_data = hist_data
-        print(f"  self.histogram_data set: {self.histogram_data is not None}")
         self.update_plot()
-    
+
     def update_plot(self):
-        """Redraw the histogram"""
-        import sys
-        print(f">>> {self.title} - update_plot() called", file=sys.stderr)
-        
+        """Redraw the histogram, the active ROI, and any named-ROI overlays."""
         if self.histogram_data is None:
-            print(f">>> {self.title} - No histogram data to plot", file=sys.stderr)
-            print(f"Warning: {self.title} - No histogram data to plot")
             return
-        
-        print(f">>> {self.title} - Has histogram data", file=sys.stderr)
-        print(f"    Shape: {self.histogram_data.histogram.shape}", file=sys.stderr)
-        print(f"    Sum: {self.histogram_data.histogram.sum()}", file=sys.stderr)
-        
-        print(f"Updating {self.title}...")
-        
+
         self.ax.clear()
         self._setup_plot()
-        
-        # Get histogram data
+
         if self.use_log_scale:
             data = self.histogram_data.to_log_scale()
         else:
             data = self.histogram_data.histogram
-        
-        # Plot histogram
+
+        # The stored histogram is oriented [xray_bin, neutron_bin]; with
+        # origin='lower' this puts neutron on the x-axis and X-ray on the
+        # y-axis — the same data coordinates the ROI manager tests against.
         extent = [
             self.histogram_data.x_edges[0],
             self.histogram_data.x_edges[-1],
             self.histogram_data.y_edges[0],
             self.histogram_data.y_edges[-1]
         ]
-        
-        print(f"    Calling imshow...", file=sys.stderr)
-        
-        # Determine vmin/vmax for display
-        if self.vmin is not None and self.vmax is not None:
-            vmin_display = self.vmin
-            vmax_display = self.vmax
-        else:
-            vmin_display = None
-            vmax_display = None
-        
+
         im = self.ax.imshow(
             data,
             extent=extent,
@@ -131,72 +103,29 @@ class HistogramCanvas(FigureCanvas):
             aspect='auto',
             cmap='viridis',
             interpolation='nearest',
-            vmin=vmin_display,
-            vmax=vmax_display
+            vmin=self.vmin,
+            vmax=self.vmax
         )
-        print(f"    imshow complete (vmin={vmin_display}, vmax={vmax_display})", file=sys.stderr)
-        
-        # Add colorbar if not present
-        try:
-            if not hasattr(self, '_colorbar') or self._colorbar is None:
-                print(f"    Creating colorbar...", file=sys.stderr)
-                self._colorbar = self.fig.colorbar(im, ax=self.ax)
-            else:
-                print(f"    Updating colorbar...", file=sys.stderr)
-                self._colorbar.update_normal(im)
-        except Exception as e:
-            print(f"    Colorbar error: {e}", file=sys.stderr)
-        
-        # Draw ROI if exists and should be shown
-        if self.show_roi and self.roi_manager and self.roi_manager.has_roi():
-            self._draw_roi()
-        
-        # Draw multiple ROI overlays (from selection manager)
-        if self.show_roi and len(self.roi_overlays) > 0:
-            self._draw_roi_overlays()
-        
-        print(f"    tight_layout...", file=sys.stderr)
+
+        if self._colorbar is None:
+            self._colorbar = self.fig.colorbar(im, ax=self.ax)
+        else:
+            self._colorbar.update_normal(im)
+
+        if self.show_roi:
+            if self.roi_manager and self.roi_manager.has_roi():
+                self._draw_roi()
+            if self.roi_overlays:
+                self._draw_roi_overlays()
+
         self.fig.tight_layout()
-        print(f"    draw...", file=sys.stderr)
-        self.draw()
-        print(f"    flush_events...", file=sys.stderr)
-        self.flush_events()
-        
-        # Force Qt to process events and refresh display
-        from PyQt5.QtWidgets import QApplication
-        from PyQt5.QtCore import QTimer
-        QApplication.processEvents()
-        
-        # Force another draw cycle to ensure rendering
-        self.draw()
-        
-        # Force widget to update
-        self.update()
-        self.repaint()
-        
-        # Check visibility
-        print(f"    Widget visible: {self.isVisible()}", file=sys.stderr)
-        print(f"    Widget size: {self.size().width()}x{self.size().height()}", file=sys.stderr)
-        
-        # Schedule another update to be absolutely sure
-        QTimer.singleShot(100, lambda: self.draw())
-        
-        print(f">>> {self.title} - update_plot() COMPLETE", file=sys.stderr)
-        
-        # Draw ROI if exists and should be shown
-        if self.show_roi and self.roi_manager and self.roi_manager.has_roi():
-            self._draw_roi()
-        
-        self.fig.tight_layout()
-        self.draw()
-        self.flush_events()
-        print(f"{self.title} updated successfully")
-    
+        self.draw_idle()
+
     def _draw_roi(self):
         """Draw the current ROI on the plot"""
         if not self.roi_manager:
             return
-        
+
         if self.roi_manager.roi_type == 'polygon':
             polygon = MplPolygon(
                 self.roi_manager.polygon_points,
@@ -378,9 +307,9 @@ class HistogramCanvas(FigureCanvas):
                     max(x1, x2), max(y1, y2)
                 )
                 self._clear_temp_artists()
-                self.update_plot()
-                self.roi_updated.emit()
                 self.clear_drawing_mode()
+                # roi_updated listeners redraw both canvases
+                self.roi_updated.emit()
 
     def finalize_polygon(self):
         """Finalise polygon ROI"""
@@ -388,9 +317,9 @@ class HistogramCanvas(FigureCanvas):
             if self.roi_manager:
                 self.roi_manager.set_polygon_roi(np.array(self.polygon_points))
                 self._clear_temp_artists()
-                self.update_plot()
-                self.roi_updated.emit()
                 self.clear_drawing_mode()
+                # roi_updated listeners redraw both canvases
+                self.roi_updated.emit()
     
     def set_log_scale(self, use_log: bool):
         """Toggle log scale"""
@@ -514,11 +443,6 @@ class DualHistogramWidget(QWidget):
         self.clear_roi_btn.clicked.connect(self.clear_roi)
         controls_layout.addWidget(self.clear_roi_btn)
 
-        self.sync_to_global_btn = QPushButton("🔄 Sync to Global")
-        self.sync_to_global_btn.setToolTip("Update global histogram with current ROI")
-        self.sync_to_global_btn.clicked.connect(self._sync_to_global)
-        controls_layout.addWidget(self.sync_to_global_btn)
-
         controls_layout.addStretch()
 
         # Display options
@@ -595,45 +519,12 @@ class DualHistogramWidget(QWidget):
     
     def set_global_histogram(self, hist_data: HistogramData):
         """Set global histogram data"""
-        print(f"="*60, file=sys.stderr)
-        print(f"DualHistogramWidget.set_global_histogram called", file=sys.stderr)
-        print(f"  hist_data type: {type(hist_data)}", file=sys.stderr)
-        print(f"  hist_data is None: {hist_data is None}", file=sys.stderr)
-        if hist_data:
-            print(f"  histogram shape: {hist_data.histogram.shape}", file=sys.stderr)
-            print(f"  histogram sum: {hist_data.histogram.sum()}", file=sys.stderr)
-            print(f"  histogram min/max: {hist_data.histogram.min()}/{hist_data.histogram.max()}", file=sys.stderr)
-        print(f"  About to call global_canvas.set_histogram_data()", file=sys.stderr)
         self.global_canvas.set_histogram_data(hist_data)
-        print(f"  Returned from global_canvas.set_histogram_data()", file=sys.stderr)
-        
-        # Force widget to be visible and on top
-        self.global_canvas.show()
-        self.global_canvas.raise_()
-        self.global_canvas.updateGeometry()
-        
-        print(f"="*60, file=sys.stderr)
-    
+
     def set_local_histogram(self, hist_data: HistogramData):
         """Set local histogram data"""
-        print(f"="*60, file=sys.stderr)
-        print(f"DualHistogramWidget.set_local_histogram called", file=sys.stderr)
-        print(f"  hist_data type: {type(hist_data)}", file=sys.stderr)
-        print(f"  hist_data is None: {hist_data is None}", file=sys.stderr)
-        if hist_data:
-            print(f"  histogram shape: {hist_data.histogram.shape}", file=sys.stderr)
-            print(f"  histogram sum: {hist_data.histogram.sum()}", file=sys.stderr)
-        print(f"  About to call local_canvas.set_histogram_data()", file=sys.stderr)
         self.local_canvas.set_histogram_data(hist_data)
-        print(f"  Returned from local_canvas.set_histogram_data()", file=sys.stderr)
-        
-        # Force widget to be visible and on top
-        self.local_canvas.show()
-        self.local_canvas.raise_()
-        self.local_canvas.updateGeometry()
-        
-        print(f"="*60, file=sys.stderr)
-    
+
     def _on_polygon_clicked(self):
         if self.polygon_btn.isChecked():
             self.global_canvas.set_drawing_mode('polygon')
@@ -700,8 +591,6 @@ class DualHistogramWidget(QWidget):
         self.global_canvas.update_plot()
         self.local_canvas.update_plot()
         self.roi_updated.emit()
-
-        print(f"Saved named ROI '{name}' → class {class_id}", file=sys.stderr)
 
     def _update_roi_list(self):
         """Rebuild the QListWidget from roi_manager.named_rois."""
@@ -774,12 +663,6 @@ class DualHistogramWidget(QWidget):
 
     # ── Sync / update ─────────────────────────────────────────────────────────
 
-    def _sync_to_global(self):
-        """Sync current ROI to global histogram"""
-        if not self.roi_manager.has_roi():
-            return
-        self.global_canvas.update_plot()
-
     def _on_roi_updated(self):
         """ROI was updated — refresh both canvases and named-class overlays."""
         self._refresh_named_roi_overlays()
@@ -801,39 +684,27 @@ class DualHistogramWidget(QWidget):
     
     def _on_editable_roi_changed(self, state):
         """Enable/disable editable ROI"""
-        import sys
         enable = state == 2  # Qt.Checked
-        
-        print(f"Editable ROI: {enable}", file=sys.stderr)
-        
+
         if enable:
-            # Enable editable ROI on both canvases
-            if self.roi_manager.has_roi():
+            # Editing only makes sense with an active ROI to edit
+            if self.roi_manager.roi_type is not None:
                 self.global_editable_roi.enable()
                 self.local_editable_roi.enable()
-                print("  Editable ROI enabled on both histograms", file=sys.stderr)
             else:
-                print("  No ROI to edit, disabling checkbox", file=sys.stderr)
                 self.editable_roi_cb.setChecked(False)
         else:
-            # Disable editable ROI
             self.global_editable_roi.disable()
             self.local_editable_roi.disable()
             # Redraw to remove vertex markers
             self.global_canvas.update_plot()
             self.local_canvas.update_plot()
-            print("  Editable ROI disabled", file=sys.stderr)
-    
+
     def _on_editable_roi_updated(self):
         """Called when ROI is modified by dragging vertices"""
-        import sys
-        print("Editable ROI updated - refreshing displays", file=sys.stderr)
-        
-        # Update both canvases to show new ROI
         self.global_canvas.update_plot()
         self.local_canvas.update_plot()
-        
-        # Emit signal to update segmentation preview
+        # Notify listeners so the segmentation state stays in sync
         self.roi_updated.emit()
     
     def get_roi_manager(self) -> ROIManager:
@@ -854,17 +725,21 @@ class DualHistogramWidget(QWidget):
         """Auto-set range based on current histogram data"""
         # Use global histogram if available
         if self.global_canvas.histogram_data is not None:
-            data = self.global_canvas.histogram_data.histogram
             if self.global_canvas.use_log_scale:
                 data = self.global_canvas.histogram_data.to_log_scale()
-            
+            else:
+                data = self.global_canvas.histogram_data.histogram
+
             vmin = float(data.min())
             vmax = float(data.max())
-            
-            # Set spinbox values
-            self.vmin_spinbox.setValue(vmin)
-            self.vmax_spinbox.setValue(vmax)
-            
-            # Update display
+
+            # Update the spinboxes without triggering a redraw per change,
+            # then apply the new range once.
+            for spinbox, value in ((self.vmin_spinbox, vmin),
+                                   (self.vmax_spinbox, vmax)):
+                spinbox.blockSignals(True)
+                spinbox.setValue(value)
+                spinbox.blockSignals(False)
+
             self.global_canvas.set_range(vmin, vmax)
             self.local_canvas.set_range(vmin, vmax)

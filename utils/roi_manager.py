@@ -27,14 +27,21 @@ class ROIManager:
     Manages Region of Interest (ROI) for segmentation.
 
     Two layers:
-      • Single active ROI  – backward-compatible, used by the classic
-        segmentation engine (``is_inside_roi``).
+      • Single active ROI  – the ROI currently drawn on the histogram,
+        used by the classic segmentation engine (``is_inside_roi``).
       • Named ROI list     – a list of {name, class_id, roi_type,
         points/rectangle, color} dicts used for multi-class RF training.
 
-    When named ROIs are present ``has_roi()`` returns True and
-    ``is_inside_roi()`` returns the *union* of every named ROI, so the
-    classic segmentation pipeline continues to work unchanged.
+    ``is_inside_roi()`` returns the union of **every** defined ROI —
+    all named class ROIs plus the active one.  This guarantees that the
+    region highlighted on the histogram is exactly the region that
+    segmentation selects (a previous version silently ignored the active
+    ROI once named ROIs existed, so the displayed selection and the
+    segmented voxels disagreed).
+
+    All containment tests are evaluated in histogram data coordinates:
+    x = neutron intensity, y = X-ray intensity — the same convention the
+    histogram canvases use for display and mouse input.
     """
 
     def __init__(self):
@@ -71,36 +78,61 @@ class ROIManager:
         """
         Return a boolean mask for points inside *any* defined ROI.
 
-        If named ROIs are present, returns the union of all of them.
-        Otherwise falls back to the single active ROI.
+        The mask is the union of every named class ROI and the active
+        ROI (when one is drawn), so it always matches what is shown on
+        the histogram canvases.
         """
         if not self.has_roi():
             raise ValueError("No ROI defined")
 
-        if self.named_rois:
-            result = np.zeros(neutron_values.shape, dtype=bool)
-            for roi in self.named_rois:
-                result |= self._mask_for_named_roi(roi, neutron_values, xray_values)
-            return result
-
-        # Single-ROI fallback
+        result = np.zeros(neutron_values.shape, dtype=bool)
+        for roi in self.named_rois:
+            result |= self._mask_for_named_roi(roi, neutron_values, xray_values)
         if self.roi_type == 'polygon':
-            return self._is_inside_polygon(neutron_values, xray_values)
-        return self._is_inside_rectangle(neutron_values, xray_values)
+            result |= self._polygon_mask(
+                self.polygon_points, neutron_values, xray_values
+            )
+        elif self.roi_type == 'rectangle':
+            result |= self._rectangle_mask(
+                self.rectangle, neutron_values, xray_values
+            )
+        return result
 
-    def _is_inside_polygon(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-        original_shape = x.shape
-        points = np.column_stack([x.ravel(), y.ravel()])
-        path = Path(self.polygon_points)
-        return path.contains_points(points).reshape(original_shape)
+    @staticmethod
+    def _polygon_mask(points: np.ndarray, x: np.ndarray,
+                      y: np.ndarray) -> np.ndarray:
+        """Vectorized point-in-polygon test with a bounding-box prefilter.
 
-    def _is_inside_rectangle(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-        x_min, y_min, x_max, y_max = self.rectangle
+        ``Path.contains_points`` is O(N·V) in the number of tested points
+        and polygon vertices; restricting it to points inside the
+        polygon's bounding box makes segmentation of full volumes fast
+        when the ROI covers a small part of the intensity range.
+        """
+        x_min, y_min = points.min(axis=0)
+        x_max, y_max = points.max(axis=0)
+        candidates = (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
+        result = np.zeros(x.shape, dtype=bool)
+        if not np.any(candidates):
+            return result
+        flat_candidates = candidates.ravel()
+        test_points = np.column_stack(
+            [x.ravel()[flat_candidates], y.ravel()[flat_candidates]]
+        )
+        inside = Path(points).contains_points(test_points)
+        flat_result = result.ravel()
+        flat_result[flat_candidates] = inside
+        return flat_result.reshape(x.shape)
+
+    @staticmethod
+    def _rectangle_mask(rectangle: Tuple[float, float, float, float],
+                        x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        x_min, y_min, x_max, y_max = rectangle
         return (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
 
     def get_roi_bounds(self) -> Tuple[float, float, float, float]:
-        if not self.has_roi():
-            raise ValueError("No ROI defined")
+        """Bounding box (x_min, y_min, x_max, y_max) of the active ROI."""
+        if self.roi_type is None:
+            raise ValueError("No active ROI defined")
         if self.roi_type == 'polygon':
             x_min = self.polygon_points[:, 0].min()
             x_max = self.polygon_points[:, 0].max()
@@ -187,38 +219,43 @@ class ROIManager:
                              x: np.ndarray, y: np.ndarray) -> np.ndarray:
         """Boolean mask for one entry in named_rois."""
         if roi['roi_type'] == 'polygon':
-            pts = roi['points']
-            original_shape = x.shape
-            flat = np.column_stack([x.ravel(), y.ravel()])
-            return Path(pts).contains_points(flat).reshape(original_shape)
-        else:
-            x_min, y_min, x_max, y_max = roi['rectangle']
-            return (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
+            return self._polygon_mask(np.asarray(roi['points']), x, y)
+        return self._rectangle_mask(roi['rectangle'], x, y)
+
+    def _mask_for_active_roi(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Boolean mask for the single active ROI (raises if none)."""
+        if self.roi_type == 'polygon':
+            return self._polygon_mask(self.polygon_points, x, y)
+        if self.roi_type == 'rectangle':
+            return self._rectangle_mask(self.rectangle, x, y)
+        raise ValueError("No active ROI defined")
 
     def get_multi_class_labels(self,
                                 neutron_vol: np.ndarray,
                                 xray_vol: np.ndarray) -> np.ndarray:
         """
-        Build an integer label array from all named ROIs.
+        Build an integer label array from all defined ROIs.
 
-        Returns a (Z, Y, X) int32 array where:
-          0  = background (not covered by any named ROI)
+        Returns an int32 array shaped like the input volumes where:
+          0  = background (not covered by any ROI)
           N  = class_id of the named ROI that covers this voxel.
 
         If two named ROIs overlap, the last one in the list wins.
-        If no named ROIs are defined but a single active ROI exists,
-        it is treated as class 1 with everything else as background.
+        An active (unsaved) ROI is included as the next free class id,
+        so the labels always cover everything shown on the histogram.
+        With no named ROIs, the active ROI alone is class 1.
         """
         labels = np.zeros(neutron_vol.shape, dtype=np.int32)
 
-        if self.named_rois:
-            for roi in self.named_rois:
-                mask = self._mask_for_named_roi(roi, neutron_vol, xray_vol)
-                labels[mask] = roi['class_id']
-        elif self.roi_type is not None:
-            # Single active ROI → class 1
-            mask = self.is_inside_roi(neutron_vol, xray_vol)
-            labels[mask] = 1
+        for roi in self.named_rois:
+            mask = self._mask_for_named_roi(roi, neutron_vol, xray_vol)
+            labels[mask] = roi['class_id']
+        if self.roi_type is not None:
+            active_class = (
+                max(r['class_id'] for r in self.named_rois) + 1
+                if self.named_rois else 1
+            )
+            labels[self._mask_for_active_roi(neutron_vol, xray_vol)] = active_class
 
         return labels
 
