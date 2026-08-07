@@ -3199,40 +3199,7 @@ class BiTS4DMainWindow(QMainWindow):
         """
         import sys
         print(f"Main window: Received {len(cluster_selections)} clusters", file=sys.stderr)
-
-        # Capture valid 3-D cluster payloads immediately. Enabling conversion
-        # must not depend on the optional auxiliary cluster-map reconstruction.
-        received_3d_clusters = [
-            tuple(cluster_data)
-            for cluster_data in cluster_selections
-            if len(cluster_data) == 6
-        ]
-        if received_3d_clusters:
-            self._last_kmeans_cluster_selections = received_3d_clusters
-            self._rf_cluster_timepoint = (
-                self.dataset.current_timepoint
-                if self.dataset is not None
-                else 0
-            )
-
-            if hasattr(self, "kmeans_to_rf_btn"):
-                self.kmeans_to_rf_btn.setEnabled(True)
-
-            if hasattr(self, "kmeans_status_label"):
-                self.kmeans_status_label.setText(
-                    f"Status: {len(received_3d_clusters)} cluster(s) ready "
-                    f"from T={self._rf_cluster_timepoint}"
-                )
-                self.kmeans_status_label.setStyleSheet(
-                    "color: green; font-style: italic; font-size: 9pt;"
-                )
-
-            print(
-                f"  Captured {len(received_3d_clusters)} full 3-D cluster "
-                f"payload(s) for RF conversion",
-                file=sys.stderr,
-            )
-
+        
         # Add each cluster to selection manager
         for cluster_data in cluster_selections:
             # Handle both 5-tuple (2D) and 6-tuple (3D) formats

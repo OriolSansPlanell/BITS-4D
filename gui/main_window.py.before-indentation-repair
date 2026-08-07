@@ -3199,40 +3199,7 @@ class BiTS4DMainWindow(QMainWindow):
         """
         import sys
         print(f"Main window: Received {len(cluster_selections)} clusters", file=sys.stderr)
-
-        # Capture valid 3-D cluster payloads immediately. Enabling conversion
-        # must not depend on the optional auxiliary cluster-map reconstruction.
-        received_3d_clusters = [
-            tuple(cluster_data)
-            for cluster_data in cluster_selections
-            if len(cluster_data) == 6
-        ]
-        if received_3d_clusters:
-            self._last_kmeans_cluster_selections = received_3d_clusters
-            self._rf_cluster_timepoint = (
-                self.dataset.current_timepoint
-                if self.dataset is not None
-                else 0
-            )
-
-            if hasattr(self, "kmeans_to_rf_btn"):
-                self.kmeans_to_rf_btn.setEnabled(True)
-
-            if hasattr(self, "kmeans_status_label"):
-                self.kmeans_status_label.setText(
-                    f"Status: {len(received_3d_clusters)} cluster(s) ready "
-                    f"from T={self._rf_cluster_timepoint}"
-                )
-                self.kmeans_status_label.setStyleSheet(
-                    "color: green; font-style: italic; font-size: 9pt;"
-                )
-
-            print(
-                f"  Captured {len(received_3d_clusters)} full 3-D cluster "
-                f"payload(s) for RF conversion",
-                file=sys.stderr,
-            )
-
+        
         # Add each cluster to selection manager
         for cluster_data in cluster_selections:
             # Handle both 5-tuple (2D) and 6-tuple (3D) formats
@@ -3287,151 +3254,151 @@ class BiTS4DMainWindow(QMainWindow):
 
         print(f"  All clusters saved to selection manager", file=sys.stderr)
     
-    @pyqtSlot()
-    def _convert_kmeans_clusters_to_rf_classes(self):
-        """
-        Convert the most recent 3-D K-means result into RF training classes.
+@pyqtSlot()
+def _convert_kmeans_clusters_to_rf_classes(self):
+    """
+    Convert the most recent 3-D K-means result into RF training classes.
 
-        Every cluster becomes one 3-D segmentation layer. Existing manual and
-        Otsu layers are preserved; earlier K-means-derived layers for the same
-        cluster ids are replaced so the operation is idempotent.
-        """
-        if self.dataset is None:
-            QMessageBox.warning(
-                self, "No Dataset", "Please load a dataset first."
-            )
-            return
+    Every cluster becomes one 3-D segmentation layer. Existing manual and
+    Otsu layers are preserved; earlier K-means-derived layers for the same
+    cluster ids are replaced so the operation is idempotent.
+    """
+    if self.dataset is None:
+        QMessageBox.warning(
+            self, "No Dataset", "Please load a dataset first."
+        )
+        return
 
-        payloads = list(self._last_kmeans_cluster_selections)
-        source_t = self._rf_cluster_timepoint
+    payloads = list(self._last_kmeans_cluster_selections)
+    source_t = self._rf_cluster_timepoint
 
-        if not payloads or source_t is None:
-            QMessageBox.warning(
-                self,
-                "No 3-D K-means Result",
-                "Run Auto-Detect in 3-D K-means mode first.",
-            )
-            return
+    if not payloads or source_t is None:
+        QMessageBox.warning(
+            self,
+            "No 3-D K-means Result",
+            "Run Auto-Detect in 3-D K-means mode first.",
+        )
+        return
 
-        try:
-            from segmentation.kmeans_class_conversion import (
-                build_rf_layers_from_cluster_selections,
-            )
+    try:
+        from segmentation.kmeans_class_conversion import (
+            build_rf_layers_from_cluster_selections,
+        )
 
-            neutron_vol, xray_vol = self.dataset.get_volume_at_time(source_t)
-            new_layers, summary = build_rf_layers_from_cluster_selections(
-                payloads,
-                neutron_vol.shape,
-            )
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "K-means Conversion Failed",
-                f"Could not create RF classes:\n{exc}",
-            )
-            return
+        neutron_vol, xray_vol = self.dataset.get_volume_at_time(source_t)
+        new_layers, summary = build_rf_layers_from_cluster_selections(
+            payloads,
+            neutron_vol.shape,
+        )
+    except Exception as exc:
+        QMessageBox.critical(
+            self,
+            "K-means Conversion Failed",
+            f"Could not create RF classes:\n{exc}",
+        )
+        return
 
-        generated_names = {
-            f"K-means cluster {cluster_id}"
-            for cluster_id in summary.cluster_ids
-        }
-        legacy_names = {
-            f"3D Cluster {cluster_id}"
-            for cluster_id in summary.cluster_ids
-        }
+    generated_names = {
+        f"K-means cluster {cluster_id}"
+        for cluster_id in summary.cluster_ids
+    }
+    legacy_names = {
+        f"3D Cluster {cluster_id}"
+        for cluster_id in summary.cluster_ids
+    }
 
-        existing_layers = self.segmentation_masks.get(source_t, [])
-        preserved_layers = [
-            layer
-            for layer in existing_layers
-            if str(layer[2]) not in generated_names | legacy_names
-        ]
-        self.segmentation_masks[source_t] = preserved_layers + new_layers
+    existing_layers = self.segmentation_masks.get(source_t, [])
+    preserved_layers = [
+        layer
+        for layer in existing_layers
+        if str(layer[2]) not in generated_names | legacy_names
+    ]
+    self.segmentation_masks[source_t] = preserved_layers + new_layers
 
-        # The cluster handler normally saves histogram selections immediately.
-        # Restore any missing selection without duplicating existing entries.
-        existing_selection_keys = {
-            (
-                getattr(selection, "name", None),
-                getattr(selection, "cluster_id", None),
-            )
-            for selection in self.selection_manager.selections
-        }
-        added_selections = 0
-        for payload in sorted(payloads, key=lambda item: int(item[3])):
-            (
-                name,
-                spatial_mask,
-                histogram_roi,
-                cluster_id,
-                color,
-                _mask_3d,
-            ) = payload
-            key = (name, cluster_id)
-            if key in existing_selection_keys:
-                continue
-            self.selection_manager.add_selection(
-                name=name,
-                spatial_mask=spatial_mask,
-                histogram_roi=histogram_roi,
-                cluster_id=cluster_id,
-                color=color,
-            )
-            existing_selection_keys.add(key)
-            added_selections += 1
+    # The cluster handler normally saves histogram selections immediately.
+    # Restore any missing selection without duplicating existing entries.
+    existing_selection_keys = {
+        (
+            getattr(selection, "name", None),
+            getattr(selection, "cluster_id", None),
+        )
+        for selection in self.selection_manager.selections
+    }
+    added_selections = 0
+    for payload in sorted(payloads, key=lambda item: int(item[3])):
+        (
+            name,
+            spatial_mask,
+            histogram_roi,
+            cluster_id,
+            color,
+            _mask_3d,
+        ) = payload
+        key = (name, cluster_id)
+        if key in existing_selection_keys:
+            continue
+        self.selection_manager.add_selection(
+            name=name,
+            spatial_mask=spatial_mask,
+            histogram_roi=histogram_roi,
+            cluster_id=cluster_id,
+            color=color,
+        )
+        existing_selection_keys.add(key)
+        added_selections += 1
 
-        self.rf_ref_spin.setValue(source_t)
-        self.rf_train_btn.setEnabled(True)
-        self.export_current_btn.setEnabled(True)
-        self.export_all_btn.setEnabled(True)
+    self.rf_ref_spin.setValue(source_t)
+    self.rf_train_btn.setEnabled(True)
+    self.export_current_btn.setEnabled(True)
+    self.export_all_btn.setEnabled(True)
 
-        if self.dataset.current_timepoint == source_t:
-            self._apply_segmentation_overlays(
-                source_t, neutron_vol, xray_vol
-            )
-        self._update_rf_histogram_overlays(
+    if self.dataset.current_timepoint == source_t:
+        self._apply_segmentation_overlays(
             source_t, neutron_vol, xray_vol
         )
+    self._update_rf_histogram_overlays(
+        source_t, neutron_vol, xray_vol
+    )
 
-        self.kmeans_status_label.setText(
-            f"Status: {len(new_layers)} RF class(es) created at T={source_t}"
-        )
-        self.kmeans_status_label.setStyleSheet(
-            "color: green; font-style: italic; font-size: 9pt;"
-        )
-        self.status_bar.showMessage(
-            f"Converted {len(new_layers)} K-means clusters to RF classes "
-            f"at T={source_t}"
-        )
+    self.kmeans_status_label.setText(
+        f"Status: {len(new_layers)} RF class(es) created at T={source_t}"
+    )
+    self.kmeans_status_label.setStyleSheet(
+        "color: green; font-style: italic; font-size: 9pt;"
+    )
+    self.status_bar.showMessage(
+        f"Converted {len(new_layers)} K-means clusters to RF classes "
+        f"at T={source_t}"
+    )
 
-        coverage_percent = (
-            100.0 * summary.covered_voxels / summary.total_voxels
-        )
-        details = (
-            f"Created {len(new_layers)} RF training classes from T={source_t}.\n\n"
-            f"Covered voxels: {summary.covered_voxels:,} "
-            f"({coverage_percent:.2f}%)\n"
-            f"Uncovered/background voxels: {summary.uncovered_voxels:,}\n"
-            f"Overlapping voxels: {summary.overlapping_voxels:,}\n"
-            f"New saved histogram selections: {added_selections}\n\n"
-            "The RF reference timepoint has been set automatically. "
-            "You can now click 'Train RF on Current Segmentation'."
-        )
+    coverage_percent = (
+        100.0 * summary.covered_voxels / summary.total_voxels
+    )
+    details = (
+        f"Created {len(new_layers)} RF training classes from T={source_t}.\n\n"
+        f"Covered voxels: {summary.covered_voxels:,} "
+        f"({coverage_percent:.2f}%)\n"
+        f"Uncovered/background voxels: {summary.uncovered_voxels:,}\n"
+        f"Overlapping voxels: {summary.overlapping_voxels:,}\n"
+        f"New saved histogram selections: {added_selections}\n\n"
+        "The RF reference timepoint has been set automatically. "
+        "You can now click 'Train RF on Current Segmentation'."
+    )
 
-        if summary.overlapping_voxels:
-            QMessageBox.warning(
-                self,
-                "K-means Classes Created with Overlap",
-                details
-                + "\n\nOverlapping masks are resolved by layer order during "
-                  "RF label construction.",
-            )
-        else:
-            QMessageBox.information(
-                self,
-                "K-means Classes Ready for RF",
-                details,
-            )
+    if summary.overlapping_voxels:
+        QMessageBox.warning(
+            self,
+            "K-means Classes Created with Overlap",
+            details
+            + "\n\nOverlapping masks are resolved by layer order during "
+              "RF label construction.",
+        )
+    else:
+        QMessageBox.information(
+            self,
+            "K-means Classes Ready for RF",
+            details,
+        )
 
     def _on_save_selection_clicked(self):
         """Handle save selection button click"""

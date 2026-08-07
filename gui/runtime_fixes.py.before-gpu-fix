@@ -154,88 +154,18 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
         if self.global_histogram is not None:
             self._update_current_timepoint(self.dataset.current_timepoint)
 
-    # GPU controls differ between legacy BiTS versions. Install compatible
-    # handlers even when the original main-window class does not define them.
-    original_cpu_toggle = getattr(
-        main_window_cls, "_on_cpu_gpu_toggled", None
-    )
+    original_cpu_toggle = main_window_cls._on_cpu_gpu_toggled
 
-    def _on_cpu_gpu_toggled(self, force_cpu=False):
-        force_cpu = bool(force_cpu)
-
-        if original_cpu_toggle is not None:
-            original_cpu_toggle(self, force_cpu)
-        else:
-            self.force_cpu = force_cpu
-            engine = getattr(self, "histogram_engine", None)
-
-            if engine is not None:
-                try:
-                    import torch
-                    engine.use_gpu = bool(
-                        not force_cpu and torch.cuda.is_available()
-                    )
-                except (ImportError, RuntimeError):
-                    engine.use_gpu = False
-
-                try:
-                    engine.clear_cache(include_global=True)
-                except TypeError:
-                    engine.clear_cache()
-                except AttributeError:
-                    pass
-
-            status_bar = getattr(self, "status_bar", None)
-            if status_bar is not None:
-                mode = "CPU" if force_cpu else "GPU if available"
-                status_bar.showMessage(f"Processing mode: {mode}")
-
+    def _on_cpu_gpu_toggled(self, force_cpu):
+        original_cpu_toggle(self, force_cpu)
         _refresh_histograms(self)
 
     main_window_cls._on_cpu_gpu_toggled = _on_cpu_gpu_toggled
 
-    original_gpu_change = getattr(
-        main_window_cls, "_on_gpu_device_changed", None
-    )
+    original_gpu_change = main_window_cls._on_gpu_device_changed
 
-    def _on_gpu_device_changed(self, gpu_id=0):
-        gpu_id = int(gpu_id)
-
-        if original_gpu_change is not None:
-            original_gpu_change(self, gpu_id)
-        else:
-            self.gpu_device = gpu_id
-
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.set_device(gpu_id)
-            except (ImportError, RuntimeError, ValueError):
-                pass
-
-            engine = getattr(self, "histogram_engine", None)
-            if engine is not None and not getattr(
-                self, "force_cpu", False
-            ):
-                try:
-                    import torch
-                    engine.use_gpu = bool(torch.cuda.is_available())
-                except (ImportError, RuntimeError):
-                    engine.use_gpu = False
-
-                try:
-                    engine.clear_cache(include_global=True)
-                except TypeError:
-                    engine.clear_cache()
-                except AttributeError:
-                    pass
-
-            status_bar = getattr(self, "status_bar", None)
-            if status_bar is not None:
-                status_bar.showMessage(
-                    f"Selected GPU device {gpu_id}"
-                )
-
+    def _on_gpu_device_changed(self, gpu_id):
+        original_gpu_change(self, gpu_id)
         _refresh_histograms(self)
 
     main_window_cls._on_gpu_device_changed = _on_gpu_device_changed
