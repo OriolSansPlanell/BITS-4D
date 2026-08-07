@@ -408,7 +408,10 @@ class HistogramEngine4D:
         for timepoint in range(neutron_4d.shape[0]):
             self._cancel(cancel_check)
             self.compute_local_histogram(
-                neutron_4d[timepoint], xray_4d[timepoint], timepoint
+                neutron_4d[timepoint],
+                xray_4d[timepoint],
+                timepoint,
+                cancel_check=cancel_check,
             )
             self._report(
                 progress_callback,

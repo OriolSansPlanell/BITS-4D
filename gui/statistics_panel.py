@@ -12,7 +12,6 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 import numpy as np
-import sys
 
 
 class StatisticsPanel(QWidget):
@@ -126,8 +125,6 @@ class StatisticsPanel(QWidget):
             neutron_data: 2D neutron array
             xray_data: 2D X-ray array
         """
-        print(f"Updating statistics for {len(selections)} selections", file=sys.stderr)
-        
         # Quick stats
         total = len(selections)
         visible = len([s for s in selections if s.visible])
@@ -151,16 +148,18 @@ class StatisticsPanel(QWidget):
                     # Compute statistics
                     n_vals = neutron_data[mask]
                     x_vals = xray_data[mask]
-                    
+                    n_mean = float(np.mean(n_vals))
+                    x_mean = float(np.mean(x_vals))
+
                     stats = {
                         'name': sel.name,
                         'pixels': n_pixels,
                         'vol_pct': 100 * n_pixels / total_image_pixels,
-                        'n_mean': np.mean(n_vals),
-                        'n_std': np.std(n_vals),
-                        'x_mean': np.mean(x_vals),
-                        'x_std': np.std(x_vals),
-                        'ratio': np.mean(n_vals) / np.mean(x_vals) if np.mean(x_vals) > 0 else 0
+                        'n_mean': n_mean,
+                        'n_std': float(np.std(n_vals)),
+                        'x_mean': x_mean,
+                        'x_std': float(np.std(x_vals)),
+                        'ratio': n_mean / x_mean if x_mean > 0 else 0
                     }
                     
                     valid_selections.append((sel, stats))
@@ -188,8 +187,6 @@ class StatisticsPanel(QWidget):
         
         # Store for comparison
         self.valid_selections = valid_selections
-        
-        print(f"  Updated {len(valid_selections)} valid selections", file=sys.stderr)
     
     def compare_selections(self, sel1_name, sel2_name):
         """
@@ -235,4 +232,4 @@ class StatisticsPanel(QWidget):
     
     def refresh(self):
         """Refresh signal (to be connected to main window)"""
-        print("Statistics refresh requested", file=sys.stderr)
+        pass

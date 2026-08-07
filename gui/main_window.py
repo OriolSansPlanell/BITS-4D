@@ -494,7 +494,7 @@ class SliceViewerWidget(QWidget):
             QApplication.processEvents()
             
             # Perform 3D k-means
-            labels_3d, centers, kmeans = KMeans3D.cluster_volume(
+            labels_3d, centers, cluster_stats = KMeans3D.cluster_volume(
                 neutron_vol,
                 xray_vol,
                 n_clusters=num_clusters
@@ -1652,13 +1652,6 @@ class SliceViewerWidget(QWidget):
         
     def set_slice_data(self, neutron_vol, xray_vol, segmentation_vol=None):
         """Update slice data - now receives full 3D volumes"""
-        print(f"SliceViewer.set_slice_data called", file=sys.stderr)
-        print(f"  neutron_vol shape: {neutron_vol.shape}", file=sys.stderr)
-        print(f"  xray_vol shape: {xray_vol.shape}", file=sys.stderr)
-        if segmentation_vol is not None:
-            print(f"  segmentation_vol shape: {segmentation_vol.shape}", file=sys.stderr)
-            print(f"  segmentation sum: {np.sum(segmentation_vol)}", file=sys.stderr)
-        
         self.current_slice_data = (neutron_vol, xray_vol)
         self.segmentation_mask = segmentation_vol
         
@@ -1669,13 +1662,9 @@ class SliceViewerWidget(QWidget):
     
     def _update_display(self):
         """Update the display"""
-        import sys
-        print(f"SliceViewer._update_display called", file=sys.stderr)
-        
         if self.current_slice_data is None:
-            print(f"  No slice data available", file=sys.stderr)
             return
-        
+
         neutron_vol, xray_vol = self.current_slice_data
         
         # Select volume based on view mode
@@ -1700,9 +1689,6 @@ class SliceViewerWidget(QWidget):
             seg_mask = self.segmentation_mask[:, :, self.current_slice_index] if self.segmentation_mask is not None else None
             title = f"YZ Slice (X={self.current_slice_index}, {view_label})"
         
-        print(f"  Extracted slice shape: {data_slice.shape}", file=sys.stderr)
-        print(f"  Data range: [{data_slice.min()}, {data_slice.max()}]", file=sys.stderr)
-        
         # Store current slice for region growing
         self.current_slice = data_slice
         
@@ -1717,9 +1703,6 @@ class SliceViewerWidget(QWidget):
         else:
             vmin_display = None
             vmax_display = None
-        
-        # Display data slice
-        print(f"  Displaying {view_label} slice (vmin={vmin_display}, vmax={vmax_display})...", file=sys.stderr)
         
         # Define explicit extent to ensure perfect alignment
         # extent = [left, right, bottom, top] for origin='upper'
@@ -1750,17 +1733,9 @@ class SliceViewerWidget(QWidget):
 
         # Draw multi-colour mask overlays (set via set_mask_overlays)
         self._display_mask_overlays()
-        
-        print(f"  Calling tight_layout and draw...", file=sys.stderr)
+
         self.fig.tight_layout()
-        self.canvas.draw()
-        self.canvas.flush_events()
-        
-        # Force Qt event processing
-        from PyQt5.QtWidgets import QApplication
-        QApplication.processEvents()
-        
-        print(f"  SliceViewer display complete", file=sys.stderr)
+        self.canvas.draw_idle()
 
 
 class ExportOptionsDialog(QDialog):
@@ -2363,6 +2338,8 @@ class BiTS4DMainWindow(QMainWindow):
 
     def _create_menu_bar(self):
         """Create the menu bar"""
+        from PyQt5.QtWidgets import QActionGroup
+
         menubar = self.menuBar()
         
         # File menu
@@ -2420,9 +2397,8 @@ class BiTS4DMainWindow(QMainWindow):
             
             # Create submenu for GPU selection
             gpu_menu = settings_menu.addMenu("🖥️ Select GPU Device")
-            
+
             # Create action group for radio button behavior
-            from PyQt5.QtWidgets import QActionGroup
             gpu_action_group = QActionGroup(self)
             gpu_action_group.setExclusive(True)
             
@@ -2543,41 +2519,32 @@ class BiTS4DMainWindow(QMainWindow):
         clear_ts_action.triggered.connect(self._on_clear_time_series)
         time_series_menu.addAction(clear_ts_action)
         
-        # Help menu
-        help_menu = menubar.addMenu("Help")
-        self.mode_4d_action.setChecked(True)  # Default to 4D
-        self.mode_4d_action.setToolTip("Load 4D time series (neutron + X-ray)")
-        self.mode_4d_action.triggered.connect(lambda: self._on_mode_changed('4D'))
-        mode_action_group.addAction(self.mode_4d_action)
-        mode_menu.addAction(self.mode_4d_action)
-        
         settings_menu.addSeparator()
-        
-        # Check GPU availability and show status
-        try:
-            import cupy as cp
-            gpu_available = True
-            if len(self.available_gpus) > 0:
-                gpu_status = f"✅ {len(self.available_gpus)} GPU(s) Available"
-            else:
-                gpu_status = "✅ GPU Available (CuPy detected)"
-        except ImportError:
-            gpu_available = False
-            gpu_status = "⚠️ GPU Not Available (CuPy not installed)"
+
+        # GPU availability status (informational). _detect_gpus already probed
+        # PyTorch and CuPy; don't fire the toggle signal here — the status bar
+        # does not exist yet during menu construction.
+        if self.available_gpus:
+            gpu_status = f"✅ {len(self.available_gpus)} GPU(s) Available"
+        else:
+            gpu_status = "⚠️ GPU Not Available (using CPU)"
+            self.force_cpu = True
+            self.force_cpu_action.blockSignals(True)
             self.force_cpu_action.setChecked(True)
+            self.force_cpu_action.blockSignals(False)
             self.force_cpu_action.setEnabled(False)
-        
+
         gpu_status_action = QAction(gpu_status, self)
         gpu_status_action.setEnabled(False)  # Just informational
         settings_menu.addAction(gpu_status_action)
-        
+
         # Help menu
         help_menu = menubar.addMenu("Help")
-        
+
         about_action = QAction("About BiTS 4D", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
-    
+
 
     def _create_toolbar(self):
         """Create the toolbar."""
@@ -2697,70 +2664,34 @@ class BiTS4DMainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", f"Could not estimate memory: {e}")
         
         # Load with progress dialog
-        print("="*70, file=sys.stderr)
-        print(f"DEBUG: About to load dataset in {self.mode} mode", file=sys.stderr)
-        print(f"  Neutron path: {neutron_path}", file=sys.stderr)
-        print(f"  X-ray path: {xray_path}", file=sys.stderr)
-        print("="*70, file=sys.stderr)
-        
         def load_operation(progress_callback):
-            print(f"DEBUG: Inside load_operation callback (mode={self.mode})", file=sys.stderr)
             result = TIFF4DLoader.load(
                 neutron_path, xray_path,
                 use_memmap=False,
                 progress_callback=progress_callback
             )
-            print(f"DEBUG: TIFF4DLoader.load returned: {type(result)}", file=sys.stderr)
-            
-            # If in 3D mode and data is 4D, extract first timepoint
+
+            # If in 3D mode and data is 4D, keep only the first timepoint
+            # (with a singleton time dimension for a consistent 4-D layout).
             if self.mode == '3D' and result is not None:
-                if result.neutron_data.ndim == 4:
-                    print("  Extracting first timepoint for 3D mode...", file=sys.stderr)
-                    neutron_3d = result.neutron_data[0]
-                    xray_3d = result.xray_data[0]
-                    # Reshape to add singleton time dimension for consistency
-                    neutron_3d = neutron_3d[np.newaxis, ...]
-                    xray_3d = xray_3d[np.newaxis, ...]
-                    # Create new dataset with single timepoint
-                    result = Dataset4D(neutron_3d, xray_3d)
-                    print(f"  3D dataset created with shape: {result.shape}", file=sys.stderr)
-            
+                if result.neutron_data.shape[0] > 1:
+                    result = Dataset4D(
+                        result.neutron_data[:1],
+                        result.xray_data[:1],
+                        result.metadata,
+                    )
             return result
-        
-        print("DEBUG: Calling run_with_progress...", file=sys.stderr)
-        loading_msg = f"Loading {self.mode} bivariate tomography data..."
+
         dataset = run_with_progress(
             self,
             "Loading Dataset",
-            loading_msg,
+            f"Loading {self.mode} bivariate tomography data...",
             load_operation
         )
-        print(f"DEBUG: run_with_progress returned: {type(dataset)}", file=sys.stderr)
-        print(f"DEBUG: dataset is None: {dataset is None}", file=sys.stderr)
-        
-        # FALLBACK: If threading failed, try direct load
+
         if dataset is None:
-            print("WARNING: run_with_progress returned None, trying direct load...", file=sys.stderr)
-            try:
-                dataset = TIFF4DLoader.load(
-                    neutron_path, xray_path,
-                    use_memmap=False,
-                    progress_callback=None
-                )
-                print(f"DEBUG: Direct load succeeded: {type(dataset)}", file=sys.stderr)
-            except Exception as e:
-                print(f"ERROR: Direct load also failed: {e}", file=sys.stderr)
-                import traceback
-                traceback.print_exc()
-        
-        if dataset is None:
-            print("ERROR: Dataset is still None after fallback, returning early!", file=sys.stderr)
-            QMessageBox.warning(
-                self,
-                "Load Failed",
-                "Dataset loading failed. The operation may have been cancelled or encountered an error.\n\n"
-                "Check console output for details."
-            )
+            # Cancelled by the user or failed (already reported by the dialog)
+            self.status_bar.showMessage("Dataset load cancelled")
             return
         
         self.dataset = dataset
@@ -2786,34 +2717,27 @@ class BiTS4DMainWindow(QMainWindow):
         self.rf_ref_spin.setValue(0)
         self.otsu_run_btn.setEnabled(True)
         self.otsu_status_label.setText("Status: ready")
-        print(f"DEBUG: Dataset set successfully: {self.dataset}", file=sys.stderr)
-        print(f"DEBUG: Cleared all segmentation masks", file=sys.stderr)
         self.status_bar.showMessage(
             f"Dataset loaded: {dataset.shape} | "
             f"{dataset.get_memory_usage()['total']:.1f} MB"
         )
         
         # Initialize histogram engine
-        print("DEBUG: Initializing histogram engine...", file=sys.stderr)
         use_gpu = config.USE_GPU_DEFAULT and not self.force_cpu
-        print(f"  force_cpu={self.force_cpu}, use_gpu={use_gpu}", file=sys.stderr)
         self.histogram_engine = HistogramEngine4D(
             bins=config.DEFAULT_BINS,
             cache_size=config.DEFAULT_HISTOGRAM_CACHE_SIZE,
             use_gpu=use_gpu
         )
-        print(f"DEBUG: Histogram engine initialized: {self.histogram_engine}", file=sys.stderr)
-        
+
         # Compute global histogram
-        print("DEBUG: About to call _compute_global_histogram()", file=sys.stderr)
         try:
             self._compute_global_histogram()
-            print("DEBUG: _compute_global_histogram() returned", file=sys.stderr)
-        except Exception as e:
-            print(f"ERROR in _compute_global_histogram: {e}", file=sys.stderr)
+        except Exception:
             import traceback
             traceback.print_exc()
-        
+
+
         # Enable controls based on mode
         if self.mode == '3D':
             # In 3D mode, hide time navigation
@@ -2834,67 +2758,37 @@ class BiTS4DMainWindow(QMainWindow):
             )
         
         # Load first (or only) timepoint
-        print("DEBUG: About to call _update_current_timepoint(0)", file=sys.stderr)
         self._update_current_timepoint(0)
     
     def _compute_global_histogram(self):
-        """Compute global histogram with progress feedback"""
-        print("=" * 60, file=sys.stderr)
-        print("ENTERING _compute_global_histogram()", file=sys.stderr)
-        print("=" * 60, file=sys.stderr)
-        
+        """Compute the global histogram with progress feedback.
+
+        Note: gui.runtime_fixes replaces this method at import time with a
+        variant that also records cancellation state for load_dataset; both
+        implementations share this behaviour.
+        """
         if not self.dataset or not self.histogram_engine:
-            print("Warning: Cannot compute global histogram - dataset or engine not initialized", file=sys.stderr)
-            print(f"  self.dataset: {self.dataset}", file=sys.stderr)
-            print(f"  self.histogram_engine: {self.histogram_engine}", file=sys.stderr)
-            return
-        
-        print("Computing global histogram...", file=sys.stderr)
-        
+            return None
+
         def compute_operation(progress_callback):
-            print("Inside compute_operation callback", file=sys.stderr)
-            result = self.histogram_engine.compute_global_histogram(
+            return self.histogram_engine.compute_global_histogram(
                 self.dataset.neutron_data,
                 self.dataset.xray_data,
                 progress_callback=progress_callback
             )
-            print(f"compute_operation returning: {type(result)}", file=sys.stderr)
-            return result
-        
-        print("About to call run_with_progress", file=sys.stderr)
+
         global_hist = run_with_progress(
             self,
             "Computing Global Histogram",
             "Analyzing entire dataset...",
             compute_operation
         )
-        
-        print(f"run_with_progress returned: {type(global_hist)}", file=sys.stderr)
-        print(f"global_hist is None: {global_hist is None}", file=sys.stderr)
-        
-        # FALLBACK: Try direct computation if run_with_progress failed
-        if global_hist is None:
-            print("WARNING: run_with_progress returned None, trying direct computation...", file=sys.stderr)
-            try:
-                global_hist = self.histogram_engine.compute_global_histogram(
-                    self.dataset.neutron_data,
-                    self.dataset.xray_data,
-                    progress_callback=None
-                )
-                print(f"Direct computation result: {type(global_hist)}", file=sys.stderr)
-            except Exception as e:
-                print(f"ERROR in direct computation: {e}", file=sys.stderr)
-                import traceback
-                traceback.print_exc()
-        
-        if global_hist:
-            print(f"Global histogram computed: {global_hist.histogram.shape}")
+
+        if global_hist is not None:
             self.global_histogram = global_hist
             self.dual_histogram.set_global_histogram(global_hist)
             self.status_bar.showMessage("Global histogram computed")
-            print("Global histogram set in widget")
-        else:
-            print("Error: Global histogram computation returned None")
+        return global_hist
     
     @pyqtSlot(int)
     def _on_timepoint_changed(self, timepoint):
@@ -2904,47 +2798,27 @@ class BiTS4DMainWindow(QMainWindow):
     def _update_current_timepoint(self, timepoint):
         """Update displays for current timepoint"""
         if not self.dataset or not self.histogram_engine:
-            print("Warning: Cannot update timepoint - dataset or engine not initialized")
             return
-        
-        print(f"Updating to timepoint {timepoint}...")
-        
+
         self.dataset.set_timepoint(timepoint)
-        
-        # Get volume data
         neutron_vol, xray_vol = self.dataset.get_current_volume()
-        print(f"Volume shape: {neutron_vol.shape}", file=sys.stderr)
-        
-        # Compute local histogram
+
+        # Compute (or fetch from cache) the local histogram
         try:
-            print(f"Attempting to compute local histogram for timepoint {timepoint}...", file=sys.stderr)
             local_hist = self.histogram_engine.compute_local_histogram(
                 neutron_vol, xray_vol, timepoint
             )
-            print(f"Local histogram computed: {local_hist.histogram.shape}", file=sys.stderr)
-            
             self.dual_histogram.set_local_histogram(local_hist)
-            print("Local histogram set in widget", file=sys.stderr)
         except RuntimeError as e:
-            print(f"ERROR computing local histogram: {e}", file=sys.stderr)
-            print("This usually means global histogram wasn't computed first", file=sys.stderr)
-            # Don't crash, just show warning
-        except Exception as e:
-            print(f"Unexpected error computing local histogram: {e}", file=sys.stderr)
+            # Global histogram not computed yet — leave local display empty
+            print(f"Local histogram unavailable: {e}", file=sys.stderr)
+        except Exception:
             import traceback
             traceback.print_exc()
-        
+
         # Update slice viewer — pass volumes, then apply coloured overlays
-        print(f"Passing volumes to slice viewer...", file=sys.stderr)
-        print(f"  neutron_vol shape: {neutron_vol.shape}", file=sys.stderr)
-
         layers = self.segmentation_masks.get(timepoint, [])
-        print(f"  segmentation layers for t={timepoint}: {len(layers)}", file=sys.stderr)
-
-        # Set base image (no legacy single mask)
         self.slice_viewer.set_slice_data(neutron_vol, xray_vol, segmentation_vol=None)
-
-        # Apply all stored coloured overlays for this timepoint
         if layers:
             self._apply_segmentation_overlays(timepoint, neutron_vol, xray_vol)
         else:
@@ -2956,31 +2830,26 @@ class BiTS4DMainWindow(QMainWindow):
         self.status_bar.showMessage(f"Viewing timepoint {timepoint}")
     
     @pyqtSlot()
-    @pyqtSlot()
     def _on_roi_updated(self):
-        """Handle ROI update"""
-        roi_manager = self.dual_histogram.get_roi_manager()
+        """Handle ROI update.
 
-        # If the active ROI was just cleared, remove the highlight from the slice view
-        # and clear stored segmentation layers for the current timepoint
-        if roi_manager.roi_type is None and self.dataset is not None:
-            current_t = self.dataset.current_timepoint
-            self.segmentation_masks.pop(current_t, None)
+        Clearing the active ROI must not delete computed segmentation layers;
+        it only removes the transient slice highlight when no ROI remains.
+        """
+        roi_manager = self.dual_histogram.get_roi_manager()
+        has_roi = roi_manager.has_roi()
+
+        if not has_roi and self.dataset is not None:
             self.slice_viewer._clear_highlight()
 
-        if roi_manager.has_roi():
-            self.segment_current_btn.setEnabled(True)
-            self.segment_all_btn.setEnabled(True)
-            self.selection_manager.enable_save_button(True)
+        self.segment_current_btn.setEnabled(has_roi)
+        self.segment_all_btn.setEnabled(has_roi and self.mode == '4D')
+        self.selection_manager.enable_save_button(has_roi)
+        if has_roi:
             self.status_bar.showMessage("ROI defined - ready to segment")
-        else:
-            self.segment_current_btn.setEnabled(False)
-            self.segment_all_btn.setEnabled(False)
-            self.selection_manager.enable_save_button(False)
-            # Only disable export if no timepoints have any masks left
-            if not any(self.segmentation_masks.values()):
-                self.export_current_btn.setEnabled(False)
-                self.export_all_btn.setEnabled(False)
+        elif not any(self.segmentation_masks.values()):
+            self.export_current_btn.setEnabled(False)
+            self.export_all_btn.setEnabled(False)
     
     @pyqtSlot(tuple, str, int)
     def _on_create_histogram_roi_from_spatial(self, spatial_coords, axis, slice_index):
@@ -3447,35 +3316,36 @@ class BiTS4DMainWindow(QMainWindow):
     
     def _save_current_selection(self, name):
         """Save current selection (mask + ROI)"""
-        import sys
-        print(f"Saving current selection as '{name}'", file=sys.stderr)
-        
         # Get current mask from slice viewer
         spatial_mask = None
-        if hasattr(self.slice_viewer, 'region_grow_mask') and self.slice_viewer.region_grow_mask is not None:
+        if getattr(self.slice_viewer, 'region_grow_mask', None) is not None:
             spatial_mask = self.slice_viewer.region_grow_mask.copy()
-        
-        # Get current histogram ROI
+
+        # Store the active histogram ROI as polygon vertices; rectangles are
+        # converted to a 4-vertex polygon for a uniform representation.
         histogram_roi = None
         roi_manager = self.dual_histogram.get_roi_manager()
-        if roi_manager.has_roi():
-            # Get ROI vertices
-            if hasattr(roi_manager, 'polygon_roi') and roi_manager.polygon_roi is not None:
-                histogram_roi = roi_manager.polygon_roi.get_xy().copy()
-            elif hasattr(roi_manager, 'rectangle_roi'):
-                # Convert rectangle to polygon vertices
-                x1, y1, x2, y2 = roi_manager.get_rectangle_coords()
-                histogram_roi = np.array([
-                    [x1, y1], [x2, y1], [x2, y2], [x1, y2]
-                ])
-        
-        # Add to selection manager
+        if roi_manager.roi_type == 'polygon':
+            histogram_roi = np.array(roi_manager.polygon_points, dtype=float)
+        elif roi_manager.roi_type == 'rectangle':
+            x1, y1, x2, y2 = roi_manager.rectangle
+            histogram_roi = np.array([
+                [x1, y1], [x2, y1], [x2, y2], [x1, y2]
+            ], dtype=float)
+
+        if spatial_mask is None and histogram_roi is None:
+            QMessageBox.warning(
+                self, "Nothing to Save",
+                "Draw a histogram ROI or a spatial selection first."
+            )
+            return
+
         self.selection_manager.add_selection(
             name=name,
             spatial_mask=spatial_mask,
             histogram_roi=histogram_roi
         )
-        
+
         self.status_bar.showMessage(f"✅ Saved selection: {name}")
     
     def _update_histogram_overlays(self):
@@ -3629,8 +3499,6 @@ class BiTS4DMainWindow(QMainWindow):
         # Push to both canvases (replaces any previous overlay set)
         self.dual_histogram.global_canvas.set_roi_overlays(overlays)
         self.dual_histogram.local_canvas.set_roi_overlays(overlays)
-        print(f"  Histogram overlays: {len(overlays)} total for T={timepoint}",
-              file=sys.stderr)
 
     # ── Segmentation colour helpers ───────────────────────────────────────────
 
@@ -3706,6 +3574,40 @@ class BiTS4DMainWindow(QMainWindow):
 
     # ── Segmentation ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _enumerate_roi_specs(roi_manager):
+        """Return every ROI to segment as a list of uniform spec dicts.
+
+        Includes all named class ROIs plus the active (unsaved) ROI so that
+        segmentation always covers exactly the selection displayed on the
+        histogram canvases.
+        """
+        specs = []
+        for roi in roi_manager.get_named_rois():
+            spec = {
+                'name': roi['name'],
+                'roi_type': roi['roi_type'],
+                'color': roi.get('color', '#e6194b'),
+            }
+            if roi['roi_type'] == 'polygon':
+                spec['points'] = roi['points']
+            else:
+                spec['rectangle'] = roi['rectangle']
+            specs.append(spec)
+
+        if roi_manager.roi_type is not None:
+            spec = {
+                'name': 'Active ROI',
+                'roi_type': roi_manager.roi_type,
+                'color': config.ROI_COLOR,
+            }
+            if roi_manager.roi_type == 'polygon':
+                spec['points'] = roi_manager.polygon_points
+            else:
+                spec['rectangle'] = roi_manager.rectangle
+            specs.append(spec)
+        return specs
+
     def _segment_current_volume(self):
         """Segment current volume with progress feedback.
 
@@ -3727,18 +3629,20 @@ class BiTS4DMainWindow(QMainWindow):
         if current_t not in self.segmentation_masks:
             self.segmentation_masks[current_t] = []
 
-        # ── Multi-class path: one mask per named ROI ──────────────────────────
+        # ── Multi-class path: one mask per ROI shown on the histogram ─────────
+        # This includes the active (unsaved) ROI so the segmented layers always
+        # match the selection displayed on the histogram.
         if roi_manager.has_named_rois():
-            named_rois = roi_manager.get_named_rois()
+            roi_specs = self._enumerate_roi_specs(roi_manager)
 
             def multi_segment_op(progress_callback):
+                from utils.roi_manager import ROIManager as _RM
                 results = []
-                for i, roi in enumerate(named_rois):
-                    pct = int(10 + 80 * i / len(named_rois))
+                for i, roi in enumerate(roi_specs):
+                    pct = int(10 + 80 * i / len(roi_specs))
                     progress_callback(pct, f"Segmenting \'{roi['name']}\' ...")
 
                     # Build a temporary single-ROI manager for this one ROI
-                    from utils.roi_manager import ROIManager as _RM
                     tmp_rm = _RM()
                     if roi['roi_type'] == 'polygon':
                         tmp_rm.set_polygon_roi(roi['points'])
@@ -3754,26 +3658,34 @@ class BiTS4DMainWindow(QMainWindow):
             layers = run_with_progress(
                 self,
                 "Segmenting Volume",
-                f"Segmenting {len(named_rois)} ROIs for T={current_t} ...",
+                f"Segmenting {len(roi_specs)} ROIs for T={current_t} ...",
                 multi_segment_op,
             )
 
             if layers is None:
                 return
 
+            import matplotlib.colors as mcolors
+
+            # Replace earlier layers with the same name so pressing the button
+            # twice does not stack duplicate overlays.
+            new_names = {name for _mask, _color, name in layers}
+            kept = [
+                layer for layer in self.segmentation_masks[current_t]
+                if layer[2] not in new_names
+            ]
+
             total_voxels = 0
             for mask, color, name in layers:
                 try:
-                    import matplotlib.colors as mcolors
                     r, g, b, _ = mcolors.to_rgba(color)
                     color_rgba = (r, g, b, 0.50)
                 except Exception:
-                    idx = len(self.segmentation_masks[current_t])
+                    idx = len(kept)
                     color_rgba = self._OVERLAY_COLORS[idx % len(self._OVERLAY_COLORS)]
-                self.segmentation_masks[current_t].append((mask, color_rgba, name))
+                kept.append((mask, color_rgba, name))
                 total_voxels += int(np.sum(mask))
-                print(f"  Stored layer \'{name}\': {int(np.sum(mask)):,} voxels",
-                      file=sys.stderr)
+            self.segmentation_masks[current_t] = kept
 
             self.status_bar.showMessage(
                 f"T={current_t}: {len(layers)} ROIs | {total_voxels:,} voxels total"
@@ -4523,17 +4435,17 @@ class BiTS4DMainWindow(QMainWindow):
             self.status_bar.showMessage(f"🖥️ Using GPU {gpu_id}: {gpu_name}")
         else:
             self.status_bar.showMessage(f"🖥️ Using GPU {gpu_id}")
-        
-        # Reinitialize histogram engine with new GPU
+
+        # Switch the backend in place. Recreating the engine here would drop
+        # the global data range and cached histograms, breaking subsequent
+        # local-histogram updates; CPU and GPU accumulation produce identical
+        # counts, so the caches stay valid.
         if self.histogram_engine and not self.force_cpu:
-            print(f"Reinitializing histogram engine on GPU {gpu_id}", file=sys.stderr)
-            self.histogram_engine = HistogramEngine4D(
-                bins=config.DEFAULT_BINS,
-                cache_size=config.DEFAULT_HISTOGRAM_CACHE_SIZE,
-                use_gpu=True
-            )
-        
-        print(f"GPU device set to: {gpu_id}", file=sys.stderr)
+            try:
+                import torch
+                self.histogram_engine.use_gpu = bool(torch.cuda.is_available())
+            except ImportError:
+                self.histogram_engine.use_gpu = False
     
     def _on_mode_changed(self, mode):
         """Handle 3D/4D mode change"""
@@ -4604,27 +4516,21 @@ class BiTS4DMainWindow(QMainWindow):
         self.force_cpu = force_cpu
         
         if force_cpu:
-            print("=" * 60, file=sys.stderr)
-            print("SWITCHING TO CPU PROCESSING", file=sys.stderr)
-            print("=" * 60, file=sys.stderr)
             self.status_bar.showMessage("⚠️ CPU Processing Mode (GPU disabled)")
         else:
-            print("=" * 60, file=sys.stderr)
-            print("SWITCHING TO GPU PROCESSING (if available)", file=sys.stderr)
-            print("=" * 60, file=sys.stderr)
             self.status_bar.showMessage("✅ GPU Processing Mode (if available)")
-        
-        # Reinitialize histogram engine with new setting
+
+        # Switch the backend in place (see _on_gpu_device_changed): recreating
+        # the engine would lose the global data range and cached histograms.
         if self.histogram_engine:
-            print(f"Reinitializing histogram engine (use_gpu={not force_cpu})", file=sys.stderr)
-            self.histogram_engine = HistogramEngine4D(
-                bins=config.DEFAULT_BINS,
-                cache_size=config.DEFAULT_HISTOGRAM_CACHE_SIZE,
-                use_gpu=(not force_cpu)
-            )
-        
-        # Note: Segmentation engine will use the force_cpu flag on next operation
-        print(f"Force CPU flag set to: {force_cpu}", file=sys.stderr)
+            if force_cpu:
+                self.histogram_engine.use_gpu = False
+            else:
+                try:
+                    import torch
+                    self.histogram_engine.use_gpu = bool(torch.cuda.is_available())
+                except ImportError:
+                    self.histogram_engine.use_gpu = False
     
     def _show_about(self):
         """Show about dialog"""
