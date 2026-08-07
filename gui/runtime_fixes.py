@@ -126,6 +126,7 @@ def _apply_correctness_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> N
 
         import matplotlib.colors as mcolors
 
+        active_vertices = self._active_roi_vertices(roi_manager)
         for timepoint, layers in segmented.items():
             existing = self.segmentation_masks.get(timepoint, [])
             new_names = {name for _mask, _color, name in layers}
@@ -142,6 +143,17 @@ def _apply_correctness_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> N
                     color = self._OVERLAY_COLORS[len(destination) % len(self._OVERLAY_COLORS)]
                 destination.append((mask, color, name))
             self.segmentation_masks[timepoint] = destination
+
+            # Record the exact histogram outline of each ROI-derived layer so
+            # the histogram overlay shows the drawn shape, not a derived hull.
+            if roi_specs:
+                for roi in roi_specs:
+                    self._record_layer_shape(
+                        timepoint, roi["name"], self._roi_spec_vertices(roi)
+                    )
+            elif active_vertices is not None:
+                for _mask, _color, name in layers:
+                    self._record_layer_shape(timepoint, name, active_vertices)
 
         self.export_current_btn.setEnabled(True)
         self.export_all_btn.setEnabled(True)
@@ -337,6 +349,7 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
             self.histogram_engine = None
             self.global_histogram = None
             self.segmentation_masks.clear()
+            self._clear_layer_shapes()
             self.time_navigation.setEnabled(False)
             self.segment_current_btn.setEnabled(False)
             self.segment_all_btn.setEnabled(False)

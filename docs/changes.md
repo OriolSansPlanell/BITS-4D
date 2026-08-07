@@ -31,6 +31,43 @@ blind spot: they iterated only over named ROIs.
   in the display ↔ data coordinate convention end to end: histogram peak
   position on screen → rectangle drawn there → exact voxel set segmented).
 
+### Histogram overlay showed a smaller, rounder region than the drawn ROI
+
+**Symptom:** after segmenting, the dashed overlay drawn back on the histogram
+was a rounder, smaller shape than the rectangle/polygon the user drew,
+suggesting the wrong voxels had been selected.
+
+**Root cause:** the voxel selection itself was exact, but
+`_update_rf_histogram_overlays` did not draw the ROI — it re-derived a
+**convex hull of the segmented voxels' intensity pairs**, trimmed to the
+2nd–98th percentile per axis and subsampled to 5 000 points
+(`create_convex_hull_roi_3d(percentile=98)`). The hull of the *data inside*
+the ROI is necessarily smaller than the ROI (sparse corners drop out, tails
+are trimmed), so the display contradicted the selection.
+
+**Fix:** every layer created from a histogram ROI now records its exact
+outline (`segmentation_layer_shapes`), and the histogram overlay draws that
+recorded shape. The hull remains only as a fallback for layers that have no
+drawn shape (RF predictions, Otsu, K-means classes), where it is an honest
+approximation of where the class lives in histogram space.
+
+### Old ROIs reappeared and stacked when re-segmenting
+
+**Symptom:** draw ROI → Segment → Clear Active ROI → draw a new ROI →
+Segment: the old ROI's segmentation reappeared alongside the new one; a
+third repetition showed three regions.
+
+**Root cause:** segmentation layers are intentionally kept when the active
+ROI is cleared, but the single-ROI segment path silently *appended* a new
+layer on every press, so every past ROI accumulated with no way to discard
+them.
+
+**Fix:** when previous layers exist for the timepoint, *Segment Current* now
+asks whether to **keep** them (the new ROI is added as an extra, uniquely
+named layer) or **replace** them (previous layers and their recorded
+outlines are dropped), with Cancel leaving everything untouched. Batch
+segmentation and Otsu replace same-name layers, staying idempotent.
+
 ### Startup crash without a CUDA GPU
 
 `_create_menu_bar` imported `QActionGroup` inside an `if self.available_gpus:`

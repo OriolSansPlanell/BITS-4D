@@ -1931,6 +1931,11 @@ class BiTS4DMainWindow(QMainWindow):
         # segmentation_masks: {timepoint -> [(mask_3d, color, name), ...]}
         # Each entry is one coloured segmentation layer for that timepoint.
         self.segmentation_masks = {}
+        # segmentation_layer_shapes: {(timepoint, layer_name) -> Nx2 vertices}
+        # Exact histogram-space outline of layers created from an ROI, so the
+        # histogram overlay can show the true selected shape instead of a
+        # convex hull re-derived from the segmented voxel intensities.
+        self.segmentation_layer_shapes = {}
         
         # Mode setting
         self.mode = '4D'  # '3D' or '4D' - determines if temporal dimension is used
@@ -2696,6 +2701,7 @@ class BiTS4DMainWindow(QMainWindow):
         
         self.dataset = dataset
         self.segmentation_masks.clear()  # Clear any previous segmentation masks
+        self._clear_layer_shapes()
         # Reset RF state for new dataset
         self.rf_engine = RandomForestSegmentation4D(n_estimators=100)
         self.rf_masks.clear()
@@ -3403,6 +3409,29 @@ class BiTS4DMainWindow(QMainWindow):
 
     # ── RF histogram overlay ──────────────────────────────────────────────────
 
+    def _layer_outline(self, timepoint, name, mask_3d, neutron_vol, xray_vol):
+        """Histogram outline for one segmentation layer.
+
+        Layers created from a histogram ROI use the exact recorded ROI shape
+        so the overlay is identical to what the user drew. Layers without a
+        recorded shape (RF predictions, Otsu, K-means) fall back to a convex
+        hull of the segmented voxel intensities — an approximation of where
+        that class lives in histogram space, not a drawn selection.
+        """
+        recorded = self.segmentation_layer_shapes.get((int(timepoint), name))
+        if recorded is not None:
+            return recorded
+
+        from utils.clustering_3d import KMeans3D
+        mask = np.asarray(mask_3d, dtype=bool)
+        n_vals = np.asarray(neutron_vol)[mask].astype(np.float64)
+        x_vals = np.asarray(xray_vol)[mask].astype(np.float64)
+        if len(n_vals) < 4:
+            return None
+        return KMeans3D.create_convex_hull_roi_3d(
+            n_vals, x_vals, percentile=98, density_aware=True
+        )
+
     def _update_rf_histogram_overlays(self, timepoint, neutron_vol=None, xray_vol=None):
         """
         Update both histogram canvases with two layers of overlays:
@@ -3441,17 +3470,16 @@ class BiTS4DMainWindow(QMainWindow):
         if ref_masks and ref_t != timepoint:
             # Show as a visual reference using the ref timepoint volumes
             try:
+                import matplotlib.colors as mcolors
                 ref_n, ref_x = self.dataset.get_volume_at_time(ref_t)
                 for mask_3d, color, name in ref_masks:
-                    n_vals = ref_n[mask_3d.astype(bool)].astype(np.float64)
-                    x_vals = ref_x[mask_3d.astype(bool)].astype(np.float64)
-                    if len(n_vals) < 4:
-                        continue
                     try:
-                        verts = KMeans3D.create_convex_hull_roi_3d(
-                            n_vals, x_vals, percentile=98, density_aware=True)
+                        verts = self._layer_outline(
+                            ref_t, name, mask_3d, ref_n, ref_x
+                        )
+                        if verts is None:
+                            continue
                         # Lighter/faded version of the colour for "reference" look
-                        import matplotlib.colors as mcolors
                         r, g, b, _ = mcolors.to_rgba(color)
                         ref_color = (r, g, b, 0.25)
                         overlays.append((f"Ref: {name}", verts, ref_color))
@@ -3463,14 +3491,12 @@ class BiTS4DMainWindow(QMainWindow):
         # Current timepoint segmentation masks (solid outline for "manual here")
         cur_masks = self.segmentation_masks.get(timepoint, [])
         for mask_3d, color, name in cur_masks:
-            n_vals = neutron_vol[mask_3d.astype(bool)].astype(np.float64)
-            x_vals = xray_vol[mask_3d.astype(bool)].astype(np.float64)
-            if len(n_vals) < 4:
-                continue
             try:
-                verts = KMeans3D.create_convex_hull_roi_3d(
-                    n_vals, x_vals, percentile=98, density_aware=True)
-                overlays.append((f"Seg: {name}", verts, color))
+                verts = self._layer_outline(
+                    timepoint, name, mask_3d, neutron_vol, xray_vol
+                )
+                if verts is not None:
+                    overlays.append((f"Seg: {name}", verts, color))
             except Exception:
                 pass
 
@@ -3608,6 +3634,43 @@ class BiTS4DMainWindow(QMainWindow):
             specs.append(spec)
         return specs
 
+    @staticmethod
+    def _roi_spec_vertices(spec):
+        """Histogram-space outline (Nx2 vertices) for one ROI spec dict."""
+        if spec['roi_type'] == 'polygon':
+            return np.asarray(spec['points'], dtype=float)
+        x1, y1, x2, y2 = spec['rectangle']
+        return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=float)
+
+    @staticmethod
+    def _active_roi_vertices(roi_manager):
+        """Outline of the active ROI, or None when no active ROI exists."""
+        if roi_manager.roi_type == 'polygon':
+            return np.asarray(roi_manager.polygon_points, dtype=float)
+        if roi_manager.roi_type == 'rectangle':
+            x1, y1, x2, y2 = roi_manager.rectangle
+            return np.array(
+                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=float
+            )
+        return None
+
+    def _record_layer_shape(self, timepoint, name, vertices):
+        """Remember the exact histogram outline a layer was created from."""
+        if vertices is not None:
+            self.segmentation_layer_shapes[(int(timepoint), name)] = (
+                np.asarray(vertices, dtype=float)
+            )
+
+    def _clear_layer_shapes(self, timepoint=None):
+        """Drop recorded outlines — all of them, or one timepoint's."""
+        if timepoint is None:
+            self.segmentation_layer_shapes.clear()
+            return
+        timepoint = int(timepoint)
+        for key in [k for k in self.segmentation_layer_shapes
+                    if k[0] == timepoint]:
+            del self.segmentation_layer_shapes[key]
+
     def _segment_current_volume(self):
         """Segment current volume with progress feedback.
 
@@ -3686,6 +3749,10 @@ class BiTS4DMainWindow(QMainWindow):
                 kept.append((mask, color_rgba, name))
                 total_voxels += int(np.sum(mask))
             self.segmentation_masks[current_t] = kept
+            for roi in roi_specs:
+                self._record_layer_shape(
+                    current_t, roi['name'], self._roi_spec_vertices(roi)
+                )
 
             self.status_bar.showMessage(
                 f"T={current_t}: {len(layers)} ROIs | {total_voxels:,} voxels total"
@@ -3693,6 +3760,30 @@ class BiTS4DMainWindow(QMainWindow):
 
         # ── Single active ROI path (original behaviour) ───────────────────────
         else:
+            # Previous Segment-Current layers stay stored (clearing the active
+            # ROI must not destroy them), so ask the user what to do with them
+            # instead of silently stacking every past ROI in the slice viewer.
+            existing = self.segmentation_masks.get(current_t, [])
+            if existing:
+                existing_names = ", ".join(layer[2] for layer in existing)
+                reply = QMessageBox.question(
+                    self,
+                    "Previous Segmentation Layers",
+                    f"Timepoint {current_t} already has {len(existing)} "
+                    f"segmentation layer(s):\n{existing_names}\n\n"
+                    "Keep them and add this ROI as an additional layer?\n"
+                    "• Yes — keep the previous layers as well\n"
+                    "• No — replace them with this ROI only",
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                    QMessageBox.No,
+                )
+                if reply == QMessageBox.Cancel:
+                    return
+                if reply == QMessageBox.No:
+                    self.segmentation_masks[current_t] = []
+                    self._clear_layer_shapes(current_t)
+                existing = self.segmentation_masks[current_t]
+
             def segment_operation(progress_callback):
                 return self.segmentation_engine.segment_volume(
                     neutron_vol, xray_vol, roi_manager,
@@ -3709,10 +3800,20 @@ class BiTS4DMainWindow(QMainWindow):
             if mask is None:
                 return
 
-            existing = self.segmentation_masks.get(current_t, [])
-            color    = self._next_roi_color(roi_manager, len(existing))
-            roi_name = self._current_roi_name(roi_manager)
+            color = self._next_roi_color(roi_manager, len(existing))
+            # Unique layer name so kept layers remain distinguishable
+            base_name = self._current_roi_name(roi_manager)
+            existing_names = {layer[2] for layer in existing}
+            roi_name = base_name
+            suffix = 2
+            while roi_name in existing_names:
+                roi_name = f"{base_name} ({suffix})"
+                suffix += 1
+
             self.segmentation_masks[current_t].append((mask, color, roi_name))
+            self._record_layer_shape(
+                current_t, roi_name, self._active_roi_vertices(roi_manager)
+            )
 
             stats = self.segmentation_engine.get_segmentation_statistics(
                 mask, neutron_vol, xray_vol
@@ -3782,17 +3883,21 @@ class BiTS4DMainWindow(QMainWindow):
             self.otsu_status_label.setStyleSheet("color: red; font-style: italic;")
             return
 
-        # Build one layer per non-background class and store in segmentation_masks
+        # Build one layer per non-background class and store in segmentation_masks.
+        # Earlier Otsu layers are replaced by name so re-running stays idempotent.
         classes = [c for c in np.unique(labels) if c != 0]
-        if current_t not in self.segmentation_masks:
-            self.segmentation_masks[current_t] = []
+        otsu_names = {f"Otsu class {cls_id}" for cls_id in classes}
+        kept_layers = [
+            layer for layer in self.segmentation_masks.get(current_t, [])
+            if layer[2] not in otsu_names
+        ]
 
-        n_existing = len(self.segmentation_masks[current_t])
+        n_existing = len(kept_layers)
         for cls_id in classes:
             mask_3d = (labels == cls_id)
             color   = self._OVERLAY_COLORS[(n_existing + cls_id - 1) % len(self._OVERLAY_COLORS)]
-            name    = f"Otsu class {cls_id}"
-            self.segmentation_masks[current_t].append((mask_3d, color, name))
+            kept_layers.append((mask_3d, color, f"Otsu class {cls_id}"))
+        self.segmentation_masks[current_t] = kept_layers
 
         # Display in viewer and histogram
         self._apply_segmentation_overlays(current_t, neutron_vol, xray_vol)
@@ -4050,6 +4155,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         # --- Build one coloured segmentation layer per non-background class ---
         self.segmentation_masks[t] = []          # replace any previous RF result
+        self._clear_layer_shapes(t)
         for cls_id in classes:
             mask_cls = (lbl == cls_id)
             color    = self._OVERLAY_COLORS[(cls_id - 1) % len(self._OVERLAY_COLORS)]
@@ -4131,6 +4237,7 @@ class BiTS4DMainWindow(QMainWindow):
             lbl     = r["labels"]
             classes = [c for c in np.unique(lbl) if c != 0]
             self.segmentation_masks[t] = []
+            self._clear_layer_shapes(t)
             for cls_id in classes:
                 mask_cls = (lbl == cls_id)
                 color    = self._OVERLAY_COLORS[(cls_id - 1) % len(self._OVERLAY_COLORS)]
@@ -4500,6 +4607,7 @@ class BiTS4DMainWindow(QMainWindow):
             self.dataset = None
             self.global_histogram = None
             self.segmentation_masks.clear()
+            self._clear_layer_shapes()
             self.dual_histogram.clear_roi()
             self.slice_viewer.set_slice_data(
                 np.zeros((10, 10, 10)),
