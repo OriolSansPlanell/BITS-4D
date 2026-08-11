@@ -50,6 +50,28 @@ def test_kmeans_predicts_unsampled_voxels_instead_of_upsampling_blocks():
     assert stats["scaled_features"] is True
 
 
+def test_kmeans_accepts_float32_volumes():
+    """Regression: float32 volumes (the binned display copies) crashed
+    prediction with "Buffer dtype mismatch, expected 'const float' but got
+    'double'" — the model is fitted on float64 samples while float32
+    chunks passed through StandardScaler unconverted."""
+    rng = np.random.default_rng(3)
+    neutron = (rng.uniform(0, 1, size=(6, 8, 8)) > 0.5).astype(np.float32)
+    xray = (neutron * 100 + rng.normal(0, 0.1, neutron.shape)).astype(
+        np.float32
+    )
+    labels, centers, stats = KMeans3D.cluster_volume(
+        neutron,
+        xray,
+        n_clusters=2,
+        prediction_chunk_size=17,
+    )
+    assert labels.shape == neutron.shape
+    assert len(np.unique(labels)) == 2
+    assert len(np.unique(labels[neutron == 0])) == 1
+    assert len(np.unique(labels[neutron == 1])) == 1
+
+
 def test_random_forest_balances_training_and_predicts_in_chunks():
     neutron = np.zeros((8, 8, 8), dtype=np.float32)
     xray = np.zeros_like(neutron)

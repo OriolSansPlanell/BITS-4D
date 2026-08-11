@@ -1,6 +1,21 @@
 # Bug-fix and cleanup notes
 
-## Big-endian TIFF crash (latest)
+## K-means dtype crash on float32 volumes (latest)
+
+**Symptom:** 3-D Auto-Detect crashed in `KMeans3D.cluster_volume` with
+"Buffer dtype mismatch, expected 'const float' but got 'double'".
+
+**Root cause:** the K-means model is fitted on float64 feature samples, but
+prediction chunks kept the volume's dtype. Integer volumes were silently
+upcast to float64 by StandardScaler; float32 volumes — which the binned
+display copies introduced — pass through as float32, and scikit-learn's
+compiled kernel rejects float32 data against float64 cluster centers.
+
+**Fix:** prediction chunks are cast to float64 to match the fitted model.
+Regression-tested with float32 volumes (the test reproduces the crash
+without the fix).
+
+## Big-endian TIFF crash
 
 **Symptom:** loading certain TIFF datasets crashed histogram computation on
 the GPU with "given numpy array has byte order different from the native
