@@ -1,6 +1,23 @@
 # Bug-fix and cleanup notes
 
-## Big-dataset mode (latest)
+## Big-endian TIFF crash (latest)
+
+**Symptom:** loading certain TIFF datasets crashed histogram computation on
+the GPU with "given numpy array has byte order different from the native
+byte order".
+
+**Root cause:** big-endian TIFFs (common from some instruments and older
+ImageJ exports) yield NumPy arrays in the file's byte order; PyTorch cannot
+build tensors from non-native arrays.
+
+**Fix:** the loader normalizes in-RAM data to native byte order at load
+time via an in-place byteswap (no extra memory), and the GPU histogram path
+converts each chunk to native float64 before tensor conversion — covering
+read-only big-endian memory maps that cannot be swapped in place. Values
+are bit-identical after conversion (regression-tested against a real
+big-endian TIFF round trip).
+
+## Big-dataset mode
 
 - **Histograms computed once, served from memory.** After loading, every
   timepoint's local histogram is precomputed into a cache sized to hold the
