@@ -43,9 +43,26 @@ class TIFF4DLoader:
         }
 
     @staticmethod
+    def _to_native_byte_order(array: np.ndarray) -> np.ndarray:
+        """Return the array in native byte order.
+
+        Big-endian TIFFs yield arrays whose dtype byte order differs from the
+        machine's; downstream consumers (PyTorch tensors, some scikit-learn
+        versions) reject such arrays. In-RAM arrays are byteswapped in place
+        (no extra memory); read-only memory maps are returned unchanged and
+        converted chunk-wise by the consumers instead.
+        """
+        if array.dtype.isnative:
+            return array
+        if isinstance(array, np.memmap) or not array.flags.writeable:
+            return array
+        array.byteswap(inplace=True)
+        return array.view(array.dtype.newbyteorder("="))
+
+    @staticmethod
     def _read(path: Path, use_memmap: bool):
         if not use_memmap:
-            return tifffile.imread(path)
+            return TIFF4DLoader._to_native_byte_order(tifffile.imread(path))
         try:
             return tifffile.memmap(path, mode="r")
         except (ValueError, TypeError):

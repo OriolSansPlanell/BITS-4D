@@ -366,11 +366,15 @@ class HistogramEngine4D:
             finite = np.isfinite(n_chunk) & np.isfinite(x_chunk)
             if not np.any(finite):
                 continue
+            # dtype=np.float64 also normalizes byte order: torch rejects
+            # non-native arrays, which big-endian TIFF memory maps produce.
             n_tensor = torch.as_tensor(
-                np.asarray(n_chunk[finite]), device=device, dtype=torch.float64
+                np.asarray(n_chunk[finite], dtype=np.float64),
+                device=device, dtype=torch.float64
             )
             x_tensor = torch.as_tensor(
-                np.asarray(x_chunk[finite]), device=device, dtype=torch.float64
+                np.asarray(x_chunk[finite], dtype=np.float64),
+                device=device, dtype=torch.float64
             )
             n_bins = torch.clamp(
                 ((n_tensor - n_min) / (n_max - n_min) * self.bins).long(),
