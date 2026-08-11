@@ -14,6 +14,10 @@ USE_GPU_DEFAULT = True
 SUBSAMPLE_THRESHOLD_GB = 16
 MEMMAP_THRESHOLD_GB = 8
 HISTOGRAM_CHUNK_VOXELS = 4_000_000
+
+# Slice-viewer display volumes are median-binned until one volume fits in
+# this many bytes (1 GiB). Segmentation always uses the full resolution.
+DISPLAY_MAX_VOLUME_BYTES = 1 << 30
 KMEANS_MAX_FIT_SAMPLES = 250_000
 KMEANS_PREDICTION_CHUNK_SIZE = 2_000_000
 RF_MAX_SAMPLES_PER_CLASS = 100_000

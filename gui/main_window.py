@@ -54,6 +54,17 @@ class SliceViewerWidget(QWidget):
         self.view_mode = 'neutron'  # 'neutron' or 'xray'
         self.vmin = None  # Dynamic range
         self.vmax = None
+        # >1 when the displayed volumes are median-binned copies of the data
+        self.display_bin_factor = 1
+
+        # Debounce slice-slider updates: while dragging, only the label
+        # follows instantly; the full redraw runs once the slider settles.
+        from PyQt5.QtCore import QTimer
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.setInterval(30)
+        self._redraw_timer.timeout.connect(self._update_display)
+
         self.init_ui()
         
     def init_ui(self):
@@ -1050,10 +1061,10 @@ class SliceViewerWidget(QWidget):
         self._update_display()
     
     def _on_slice_changed(self, value):
-        """Handle slice index change"""
+        """Handle slice index change (debounced while dragging)"""
         self.current_slice_index = value
         self.slice_label.setText(str(value))
-        self._update_display()
+        self._redraw_timer.start()
     
     def _on_view_mode_changed(self, mode):
         """Handle view mode change (neutron vs X-ray)"""
@@ -1729,6 +1740,12 @@ class SliceViewerWidget(QWidget):
         else:
             info = f"{view_label} | Shape: {data_slice.shape} | Range: [{data_slice.min():.0f}, {data_slice.max():.0f}]"
 
+        if self.display_bin_factor > 1:
+            info += (
+                f" | display binned x{self.display_bin_factor} (median) — "
+                "segmentation runs at full resolution"
+            )
+
         self.info_label.setText(info)
 
         # Draw multi-colour mask overlays (set via set_mask_overlays)
@@ -1936,6 +1953,13 @@ class BiTS4DMainWindow(QMainWindow):
         # histogram overlay can show the true selected shape instead of a
         # convex hull re-derived from the segmented voxel intensities.
         self.segmentation_layer_shapes = {}
+
+        # Display pyramid for large datasets: median-binned copies of every
+        # timepoint used only for visualization (segmentation stays at full
+        # resolution). None when the data is small enough to show directly.
+        self.display_data = None            # ([neutron_3d...], [xray_3d...])
+        self.display_bin_factor = 1
+        self._display_mask_cache = {}       # {(t, name) -> (mask_ref, binned)}
         
         # Mode setting
         self.mode = '4D'  # '3D' or '4D' - determines if temporal dimension is used
@@ -2496,7 +2520,21 @@ class BiTS4DMainWindow(QMainWindow):
         compare_action = QAction("Compare Selections...", self)
         compare_action.triggered.connect(self._on_compare_selections)
         analytics_menu.addAction(compare_action)
-        
+
+        # Temporal histogram evolution image
+        hist_evolution_action = QAction(
+            "Histogram Evolution vs First Timepoint...", self
+        )
+        hist_evolution_action.setToolTip(
+            "Save an image comparing every timepoint's histogram to the\n"
+            "first one on a log scale — red/blue areas show where voxel\n"
+            "populations grow/shrink over time."
+        )
+        hist_evolution_action.triggered.connect(
+            self._on_export_histogram_evolution
+        )
+        analytics_menu.addAction(hist_evolution_action)
+
         analytics_menu.addSeparator()
         
         # Time series
@@ -2728,11 +2766,15 @@ class BiTS4DMainWindow(QMainWindow):
             f"{dataset.get_memory_usage()['total']:.1f} MB"
         )
         
-        # Initialize histogram engine
+        # Initialize histogram engine. The local-histogram cache is sized to
+        # hold every timepoint so histograms are computed once and then
+        # served from memory while scrolling through time.
         use_gpu = config.USE_GPU_DEFAULT and not self.force_cpu
         self.histogram_engine = HistogramEngine4D(
             bins=config.DEFAULT_BINS,
-            cache_size=config.DEFAULT_HISTOGRAM_CACHE_SIZE,
+            cache_size=max(
+                config.DEFAULT_HISTOGRAM_CACHE_SIZE, dataset.num_timepoints
+            ),
             use_gpu=use_gpu
         )
 
@@ -2742,6 +2784,12 @@ class BiTS4DMainWindow(QMainWindow):
         except Exception:
             import traceback
             traceback.print_exc()
+
+        # Big-dataset preparation: cache every local histogram and build the
+        # median-binned display pyramid. Both are optional accelerations —
+        # cancelling either leaves the application fully functional.
+        self._precompute_local_histograms()
+        self._prepare_display_volumes()
 
 
         # Enable controls based on mode
@@ -2795,25 +2843,146 @@ class BiTS4DMainWindow(QMainWindow):
             self.dual_histogram.set_global_histogram(global_hist)
             self.status_bar.showMessage("Global histogram computed")
         return global_hist
-    
+
+    # ── Big-dataset acceleration helpers ─────────────────────────────────────
+
+    def _precompute_local_histograms(self):
+        """Compute every timepoint's local histogram once and keep it cached.
+
+        Scrolling through time then serves histograms from memory instead of
+        re-reading the volumes. Cancelling is safe: missing histograms are
+        computed lazily on first visit as before.
+        """
+        if (self.dataset is None or self.histogram_engine is None
+                or self.global_histogram is None):
+            return
+        num_timepoints = self.dataset.num_timepoints
+        if num_timepoints <= 1:
+            return
+
+        from utils.cancellation import OperationCancelled, OperationFailed
+
+        def operation(progress_callback=None, cancel_check=None):
+            self.histogram_engine.precompute_all_local_histograms(
+                self.dataset.neutron_data,
+                self.dataset.xray_data,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+            return True
+
+        try:
+            run_with_progress(
+                self,
+                "Caching Histograms",
+                f"Pre-computing {num_timepoints} local histograms...",
+                operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            pass
+
+    def _prepare_display_volumes(self):
+        """Build median-binned display copies of every timepoint.
+
+        The bin factor is the smallest integer that brings one display
+        volume under config.DISPLAY_MAX_VOLUME_BYTES. Factor 1 (small data)
+        displays the original volumes directly. Cancelling falls back to
+        full-resolution display.
+        """
+        from utils.cancellation import OperationCancelled, OperationFailed
+        from utils.display_downsampler import DisplayDownsampler
+
+        self.display_data = None
+        self.display_bin_factor = 1
+        self._display_mask_cache = {}
+        self.slice_viewer.display_bin_factor = 1
+        if self.dataset is None:
+            return
+
+        sample = self.dataset.neutron_data[0]
+        factor = DisplayDownsampler.choose_bin_factor(
+            sample.shape,
+            self.dataset.neutron_data.dtype.itemsize,
+            config.DISPLAY_MAX_VOLUME_BYTES,
+        )
+        if factor == 1:
+            return
+
+        def operation(progress_callback=None, cancel_check=None):
+            return DisplayDownsampler.bin_dataset(
+                self.dataset.neutron_data,
+                self.dataset.xray_data,
+                factor,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+
+        try:
+            result = run_with_progress(
+                self,
+                "Preparing Display Volumes",
+                f"Median-binning volumes x{factor} for smooth display...",
+                operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            result = None
+
+        if result is not None:
+            self.display_data = result
+            self.display_bin_factor = factor
+            self.slice_viewer.display_bin_factor = factor
+            self.status_bar.showMessage(
+                f"Display volumes binned x{factor} (median); segmentation "
+                "still runs at full resolution"
+            )
+
+    def _display_volumes_at(self, timepoint):
+        """Display (possibly binned) volumes for one timepoint."""
+        if self.display_data is not None:
+            neutron_list, xray_list = self.display_data
+            return neutron_list[timepoint], xray_list[timepoint]
+        return self.dataset.get_volume_at_time(timepoint)
+
+    def _current_display_volumes(self):
+        """Display volumes for the current timepoint."""
+        return self._display_volumes_at(self.dataset.current_timepoint)
+
+    def _binned_display_mask(self, timepoint, name, mask):
+        """Full-resolution layer mask scaled to the display grid (cached)."""
+        if self.display_bin_factor <= 1:
+            return mask
+        key = (int(timepoint), name)
+        cached = self._display_mask_cache.get(key)
+        if cached is not None and cached[0] is mask:
+            return cached[1]
+        from utils.display_downsampler import DisplayDownsampler
+        binned = DisplayDownsampler.bin_mask(mask, self.display_bin_factor)
+        self._display_mask_cache[key] = (mask, binned)
+        return binned
+
     @pyqtSlot(int)
     def _on_timepoint_changed(self, timepoint):
         """Handle timepoint change"""
         self._update_current_timepoint(timepoint)
-    
+
     def _update_current_timepoint(self, timepoint):
         """Update displays for current timepoint"""
         if not self.dataset or not self.histogram_engine:
             return
 
         self.dataset.set_timepoint(timepoint)
-        neutron_vol, xray_vol = self.dataset.get_current_volume()
 
-        # Compute (or fetch from cache) the local histogram
+        # Serve the local histogram from the in-memory cache; only compute
+        # when this timepoint has not been visited/precomputed yet.
         try:
-            local_hist = self.histogram_engine.compute_local_histogram(
-                neutron_vol, xray_vol, timepoint
+            local_hist = self.histogram_engine.get_cached_local_histogram(
+                timepoint
             )
+            if local_hist is None:
+                neutron_vol, xray_vol = self.dataset.get_current_volume()
+                local_hist = self.histogram_engine.compute_local_histogram(
+                    neutron_vol, xray_vol, timepoint
+                )
             self.dual_histogram.set_local_histogram(local_hist)
         except RuntimeError as e:
             # Global histogram not computed yet — leave local display empty
@@ -2822,16 +2991,12 @@ class BiTS4DMainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
 
-        # Update slice viewer — pass volumes, then apply coloured overlays
-        layers = self.segmentation_masks.get(timepoint, [])
-        self.slice_viewer.set_slice_data(neutron_vol, xray_vol, segmentation_vol=None)
-        if layers:
-            self._apply_segmentation_overlays(timepoint, neutron_vol, xray_vol)
-        else:
-            self.slice_viewer.clear_mask_overlays()
+        # Slice viewer: base image plus this timepoint's overlays in one pass
+        # (the display volumes are the binned copies for large datasets)
+        self._apply_segmentation_overlays(timepoint)
 
         # Update histogram overlays to show RF class distributions for this timepoint
-        self._update_rf_histogram_overlays(timepoint, neutron_vol, xray_vol)
+        self._update_rf_histogram_overlays(timepoint)
 
         self.status_bar.showMessage(f"Viewing timepoint {timepoint}")
     
@@ -2886,10 +3051,11 @@ class BiTS4DMainWindow(QMainWindow):
             return
         
         try:
-            # Get current volumes
-            neutron_vol, xray_vol = self.dataset.get_current_volume()
-            print(f"  volume shapes: {neutron_vol.shape}", file=sys.stderr)
-            
+            # Spatial coordinates come from the slice viewer, which shows the
+            # (possibly binned) display volumes — extract values from those so
+            # coordinates and mask shapes match what the user drew on.
+            neutron_vol, xray_vol = self._current_display_volumes()
+
             # Check if this is a mask-based or rectangle-based selection
             is_mask = isinstance(spatial_coords, tuple) and len(spatial_coords) == 2 and spatial_coords[0] == 'mask'
             
@@ -3041,9 +3207,10 @@ class BiTS4DMainWindow(QMainWindow):
             return
         
         try:
-            # Get current data
-            neutron_vol, xray_vol = self.dataset.get_current_volume()
-            
+            # Selections are drawn on the displayed slices, so statistics use
+            # the same (possibly binned) display volumes for matching shapes.
+            neutron_vol, xray_vol = self._current_display_volumes()
+
             # Extract current slice
             if self.slice_viewer.current_axis == 'z':
                 neutron = neutron_vol[self.slice_viewer.current_slice_index, :, :]
@@ -3054,7 +3221,7 @@ class BiTS4DMainWindow(QMainWindow):
             else:
                 neutron = neutron_vol[:, :, self.slice_viewer.current_slice_index]
                 xray = xray_vol[:, :, self.slice_viewer.current_slice_index]
-            
+
             # Update panel
             self.statistics_panel.update_statistics(
                 self.selection_manager.selections,
@@ -3127,14 +3294,16 @@ class BiTS4DMainWindow(QMainWindow):
                 color=color
             )
         
-        # Rebuild cluster_map_3d for RF training from 6-tuple cluster selections
+        # Rebuild cluster_map_3d for RF training from 6-tuple cluster selections.
+        # The masks live on whatever grid the clustering ran on (the display
+        # grid for large datasets), so the map uses the masks' own shape.
         try:
             three_d_clusters = [
                 cd for cd in cluster_selections if len(cd) == 6
             ]
             if three_d_clusters and self.dataset is not None:
-                neutron_vol, _ = self.dataset.get_current_volume()
-                cluster_map = np.full(neutron_vol.shape, -1, dtype=np.int32)
+                mask_shape = np.asarray(three_d_clusters[0][5]).shape
+                cluster_map = np.full(mask_shape, -1, dtype=np.int32)
                 for cd in three_d_clusters:
                     _, _, _, cid, _, mask_3d = cd
                     cluster_map[mask_3d.astype(bool)] = int(cid)
@@ -3192,8 +3361,22 @@ class BiTS4DMainWindow(QMainWindow):
             from segmentation.kmeans_class_conversion import (
                 build_rf_layers_from_cluster_selections,
             )
+            from utils.display_downsampler import DisplayDownsampler
 
             neutron_vol, xray_vol = self.dataset.get_volume_at_time(source_t)
+
+            # Clustering runs on the display grid for large datasets; RF
+            # trains at full resolution, so upscale the cluster masks first.
+            if self.display_bin_factor > 1:
+                upscaled = []
+                for payload in payloads:
+                    payload = list(payload)
+                    payload[5] = DisplayDownsampler.upscale_mask(
+                        payload[5], self.display_bin_factor, neutron_vol.shape
+                    )
+                    upscaled.append(tuple(payload))
+                payloads = upscaled
+
             new_layers, summary = build_rf_layers_from_cluster_selections(
                 payloads,
                 neutron_vol.shape,
@@ -3569,14 +3752,22 @@ class BiTS4DMainWindow(QMainWindow):
         return 'ROI'
 
     def _apply_segmentation_overlays(self, timepoint, neutron_vol=None, xray_vol=None):
-        """Push all stored segmentation layers for *timepoint* to the slice viewer."""
+        """Push all stored segmentation layers for *timepoint* to the slice viewer.
+
+        The base image is always the *display* volume pair (median-binned for
+        large datasets); the full-resolution layer masks are scaled to the
+        same grid so overlays line up with the displayed slices. The optional
+        volume arguments are accepted for backward compatibility but the
+        display copies are what gets shown.
+        """
         layers = self.segmentation_masks.get(timepoint, [])
 
-        if neutron_vol is None or xray_vol is None:
-            neutron_vol, xray_vol = self.dataset.get_current_volume()
+        display_neutron, display_xray = self._display_volumes_at(timepoint)
 
         # Always refresh the base image first
-        self.slice_viewer.set_slice_data(neutron_vol, xray_vol, segmentation_vol=None)
+        self.slice_viewer.set_slice_data(
+            display_neutron, display_xray, segmentation_vol=None
+        )
 
         if not layers:
             self.slice_viewer.clear_mask_overlays()
@@ -3588,12 +3779,13 @@ class BiTS4DMainWindow(QMainWindow):
 
         mask_overlays = []
         for mask_3d, color, name in layers:
+            display_mask = self._binned_display_mask(timepoint, name, mask_3d)
             if axis == 'z':
-                slice_2d = mask_3d[idx, :, :]
+                slice_2d = display_mask[idx, :, :]
             elif axis == 'y':
-                slice_2d = mask_3d[:, idx, :]
+                slice_2d = display_mask[:, idx, :]
             else:
-                slice_2d = mask_3d[:, :, idx]
+                slice_2d = display_mask[:, :, idx]
             mask_overlays.append((name, slice_2d, color))
 
         self.slice_viewer.set_mask_overlays(mask_overlays)
@@ -4608,6 +4800,10 @@ class BiTS4DMainWindow(QMainWindow):
             self.global_histogram = None
             self.segmentation_masks.clear()
             self._clear_layer_shapes()
+            self.display_data = None
+            self.display_bin_factor = 1
+            self._display_mask_cache = {}
+            self.slice_viewer.display_bin_factor = 1
             self.dual_histogram.clear_roi()
             self.slice_viewer.set_slice_data(
                 np.zeros((10, 10, 10)),
@@ -4965,9 +5161,9 @@ class BiTS4DMainWindow(QMainWindow):
         
         if filepath:
             try:
-                # Get current data
-                neutron_vol, xray_vol = self.dataset.get_current_volume()
-                
+                # Selection masks live on the displayed (possibly binned) grid
+                neutron_vol, xray_vol = self._current_display_volumes()
+
                 # Extract current slice
                 if self.slice_viewer.current_axis == 'z':
                     neutron = neutron_vol[self.slice_viewer.current_slice_index, :, :]
@@ -4978,7 +5174,7 @@ class BiTS4DMainWindow(QMainWindow):
                 else:
                     neutron = neutron_vol[:, :, self.slice_viewer.current_slice_index]
                     xray = xray_vol[:, :, self.slice_viewer.current_slice_index]
-                
+
                 saved_path, skipped = SelectionLibrary.export_statistics_csv(
                     self.selection_manager.selections, neutron, xray, filepath
                 )
@@ -5016,9 +5212,9 @@ class BiTS4DMainWindow(QMainWindow):
         
         if filepath:
             try:
-                # Get current data
-                neutron_vol, xray_vol = self.dataset.get_current_volume()
-                
+                # Selection masks live on the displayed (possibly binned) grid
+                neutron_vol, xray_vol = self._current_display_volumes()
+
                 # Extract current slice
                 if self.slice_viewer.current_axis == 'z':
                     neutron = neutron_vol[self.slice_viewer.current_slice_index, :, :]
@@ -5029,7 +5225,7 @@ class BiTS4DMainWindow(QMainWindow):
                 else:
                     neutron = neutron_vol[:, :, self.slice_viewer.current_slice_index]
                     xray = xray_vol[:, :, self.slice_viewer.current_slice_index]
-                
+
                 saved_path, skipped = SelectionLibrary.export_statistics_excel(
                     self.selection_manager.selections, neutron, xray, filepath
                 )
@@ -5072,10 +5268,10 @@ class BiTS4DMainWindow(QMainWindow):
         if filepath:
             try:
                 self.status_bar.showMessage("Generating PDF report...")
-                
-                # Get current data
-                neutron_vol, xray_vol = self.dataset.get_current_volume()
-                
+
+                # Selection masks live on the displayed (possibly binned) grid
+                neutron_vol, xray_vol = self._current_display_volumes()
+
                 # Extract current slice
                 if self.slice_viewer.current_axis == 'z':
                     neutron = neutron_vol[self.slice_viewer.current_slice_index, :, :]
@@ -5114,6 +5310,86 @@ class BiTS4DMainWindow(QMainWindow):
     
     # ========== v14.1: Advanced Analytics Methods ==========
     
+    def _on_export_histogram_evolution(self):
+        """Save an image of every timepoint's log-histogram change vs T0.
+
+        Each panel shows log10(h_t+1) − log10(h_0+1) on the shared histogram
+        grid with a diverging colour scale: red where voxel populations grow
+        over time, blue where they shrink. Uses the cached local histograms,
+        computing any that are missing.
+        """
+        from PyQt5.QtWidgets import QFileDialog
+        from utils.cancellation import OperationCancelled, OperationFailed
+        from utils.histogram_evolution import save_histogram_evolution_image
+
+        if not self.dataset or not self.histogram_engine:
+            QMessageBox.information(self, "No Data", "Load a dataset first.")
+            return
+        if self.global_histogram is None:
+            QMessageBox.information(
+                self, "No Histograms", "Compute the global histogram first."
+            )
+            return
+        num_timepoints = self.dataset.num_timepoints
+        if num_timepoints < 2:
+            QMessageBox.information(
+                self, "Single Timepoint",
+                "Histogram evolution needs at least two timepoints."
+            )
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Histogram Evolution Image", "",
+            "PNG Files (*.png);;All Files (*)"
+        )
+        if not filepath:
+            return
+        if not filepath.lower().endswith((".png", ".jpg", ".pdf", ".svg")):
+            filepath += ".png"
+
+        def operation(progress_callback=None, cancel_check=None):
+            histograms = []
+            for timepoint in range(num_timepoints):
+                if cancel_check:
+                    cancel_check()
+                hist = self.histogram_engine.get_cached_local_histogram(
+                    timepoint
+                )
+                if hist is None:
+                    hist = self.histogram_engine.compute_local_histogram(
+                        self.dataset.neutron_data[timepoint],
+                        self.dataset.xray_data[timepoint],
+                        timepoint,
+                    )
+                histograms.append(hist)
+                if progress_callback:
+                    progress_callback(
+                        int(90 * (timepoint + 1) / num_timepoints),
+                        f"Collecting histogram {timepoint + 1}/{num_timepoints}",
+                    )
+            if progress_callback:
+                progress_callback(95, "Rendering evolution figure...")
+            return save_histogram_evolution_image(histograms, filepath)
+
+        try:
+            saved = run_with_progress(
+                self,
+                "Histogram Evolution",
+                "Building temporal histogram comparison...",
+                operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            return
+
+        if saved:
+            self.status_bar.showMessage(f"Histogram evolution saved: {saved}")
+            QMessageBox.information(
+                self, "Image Saved",
+                f"Histogram evolution image saved to:\n{saved}\n\n"
+                "Red areas gained voxels relative to T0, blue areas lost "
+                "them (log scale)."
+            )
+
     def _on_morphological_analysis(self):
         """Perform morphological analysis on selected selections"""
         from PyQt5.QtWidgets import QDialog, QTextEdit, QVBoxLayout
@@ -5278,10 +5554,10 @@ class BiTS4DMainWindow(QMainWindow):
             QMessageBox.information(self, "No Data", "Load dataset first.")
             return
         
-        # Record current timepoint
-        neutron_vol, xray_vol = self.dataset.get_current_volume()
+        # Record current timepoint (display grid matches the selection masks)
+        neutron_vol, xray_vol = self._current_display_volumes()
         current_tp = self.dataset.current_timepoint
-        
+
         self.time_series_analyzer.add_timepoint(
             current_tp,
             self.selection_manager.selections,
@@ -5367,10 +5643,10 @@ class BiTS4DMainWindow(QMainWindow):
                 # Navigate to timepoint
                 self.dataset.set_timepoint(tp)
                 self._on_timepoint_changed(tp)
-                
-                # Get data
-                neutron_vol, xray_vol = self.dataset.get_current_volume()
-                
+
+                # Get data (display grid matches the selection masks)
+                neutron_vol, xray_vol = self._display_volumes_at(tp)
+
                 # Record
                 self.time_series_analyzer.add_timepoint(
                     tp,

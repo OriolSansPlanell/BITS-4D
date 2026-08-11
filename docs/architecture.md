@@ -95,6 +95,40 @@ matches the selection shown on screen. Polygon containment uses a
 bounding-box prefilter before `matplotlib.path.Path.contains_points`, which
 is an order of magnitude faster on full volumes when the ROI is small.
 
+## Big-dataset display pipeline
+
+Loading a dataset performs three preparation passes (each cancellable, each
+optional — cancelling degrades speed, never correctness):
+
+1. **Global histogram** over all timepoints (chunked, CPU or GPU).
+2. **Local-histogram cache**: every timepoint's histogram is computed once
+   (`HistogramEngine4D.precompute_all_local_histograms`) into an LRU cache
+   sized to hold all timepoints, so time navigation never recomputes them.
+3. **Display pyramid** (`utils/display_downsampler.py`): if one volume
+   exceeds `config.DISPLAY_MAX_VOLUME_BYTES` (1 GiB), every timepoint is
+   median-binned by the smallest integer factor that fits the budget. The
+   binned float32 copies are what the slice viewer shows.
+
+Two coordinate spaces follow from this, and the split is strict:
+
+- **Display space** (binned): slice viewer, spatial rectangle/region-grow
+  selections, saved selection masks, per-slice statistics, time-series
+  tracking, and 3-D auto-detect clustering. `SliceViewerWidget.
+  display_bin_factor` and `BiTS4DMainWindow._current_display_volumes()`
+  give access; `DisplayDownsampler.bin_mask` (block-any) scales
+  full-resolution layer masks onto the display grid for overlays, and
+  `upscale_mask` maps display-space cluster masks back to full resolution
+  when they must feed the RF trainer.
+- **Full resolution**: histogram computation, ROI segmentation, Otsu, RF
+  training/prediction, and all mask/volume exports. Histogram-space ROIs are
+  the bridge — they are resolution-independent, so a selection made while
+  looking at binned data segments the original voxels exactly.
+
+`utils/histogram_evolution.py` renders the temporal comparison figure
+(log10(h_t+1) − log10(h_0+1) per timepoint against T0) from the cached
+local histograms; the GUI exposes it under *Analytics → Histogram Evolution
+vs First Timepoint*.
+
 ## Execution model
 
 Long operations (loading, histogram accumulation, segmentation, RF
