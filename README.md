@@ -28,7 +28,16 @@ back to voxels.
   timepoint (intensity, ratio, spatial, and texture features) and predict all
   other timepoints with per-voxel confidence.
 - **Analysis and export** — per-selection statistics, morphological analysis,
-  time-series tracking, and export to TIFF / CSV / Excel / PDF.
+  time-series tracking, histogram-evolution maps, and export to
+  TIFF / CSV / Excel / PDF.
+- **Big-dataset mode** — all histograms are computed once at load and served
+  from memory; volumes larger than 1 GiB are median-binned for display (with
+  segmentation still running at full resolution), so time scrolling and
+  slice browsing stay smooth on multi-gigabyte series.
+- **Histogram evolution** — *Analytics → Histogram Evolution vs First
+  Timepoint* saves an image where each timepoint's histogram is compared to
+  T0 on a log scale, highlighting where voxel populations grow (red) or
+  shrink (blue) over time.
 
 ## Installation
 

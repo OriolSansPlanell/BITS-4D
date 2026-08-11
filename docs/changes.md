@@ -1,5 +1,32 @@
 # Bug-fix and cleanup notes
 
+## Big-dataset mode (latest)
+
+- **Histograms computed once, served from memory.** After loading, every
+  timepoint's local histogram is precomputed into a cache sized to hold the
+  whole series; time navigation and the evolution export read from memory
+  instead of re-scanning volumes.
+- **Median-binned display volumes.** When one volume exceeds 1 GiB
+  (`config.DISPLAY_MAX_VOLUME_BYTES`), all timepoints are binned by block
+  median with the smallest factor that fits the budget. The slice viewer,
+  spatial selections, statistics, and time-series tracking work on the
+  binned copies; segmentation, RF, and exports stay at full resolution.
+  Histogram-space ROIs bridge the two, so selections made on binned display
+  data segment the original voxels exactly.
+- **Masks scaled to the display grid.** Full-resolution segmentation layers
+  are block-any binned (cached) before overlay so they align with the
+  binned slices; display-space cluster masks are upscaled (block
+  replication + edge padding) before RF training.
+- **Histogram evolution export.** *Analytics → Histogram Evolution vs First
+  Timepoint* saves an image of log10(h_t+1) − log10(h_0+1) per timepoint on
+  a shared diverging scale (red = bins gaining voxels, blue = losing),
+  plus the T0 reference panel.
+- **Responsiveness.** Slice-slider redraws are debounced (30 ms) so
+  dragging tracks smoothly; a duplicated base-image render per timepoint
+  switch was removed; timepoint changes now cost one cached-histogram fetch
+  plus one binned-slice render.
+
+
 This pass audited the whole codebase for correctness, performance, and
 maintainability issues. Summary of what changed and why.
 
