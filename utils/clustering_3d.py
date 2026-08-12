@@ -108,7 +108,13 @@ class KMeans3D:
             if cancel_check:
                 cancel_check()
             chunk_indices = valid_indices[start : start + prediction_chunk_size]
-            chunk = np.column_stack((n_flat[chunk_indices], x_flat[chunk_indices]))
+            # float64 to match the dtype the model was fitted with —
+            # scikit-learn's compiled kernels reject a float32 chunk against
+            # float64 cluster centers (float32 volumes are passed through by
+            # StandardScaler, while integer volumes were upcast to float64).
+            chunk = np.column_stack(
+                (n_flat[chunk_indices], x_flat[chunk_indices])
+            ).astype(np.float64, copy=False)
             labels_flat[chunk_indices] = model.predict(scaler.transform(chunk))
             if progress_callback:
                 progress_callback(
