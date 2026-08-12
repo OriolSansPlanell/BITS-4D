@@ -1587,19 +1587,29 @@ class SliceViewerWidget(QWidget):
                 pass
         self.overlay_artists = []
     
-    def _slice_mask_for_display(self, mask):
+    def _slice_mask_for_display(self, mask, plane=None):
         """Return the 2-D view of *mask* matching the current axis and slice.
 
-        3-D masks (whole-volume segmentation layers) are sliced on demand so
-        the highlight follows slice-index and viewing-plane changes. 2-D
-        masks (single-slice selections such as region growing) are shown
-        only while the displayed slice has the same shape. Returns None when
-        the mask cannot be shown in the current view.
+        3-D masks (whole-volume layers) are sliced on demand so the highlight
+        follows slice-index and viewing-plane changes.
+
+        2-D masks belong to the single slice they were created on. When
+        *plane* is given as ``(axis, slice_index)`` the mask is shown only
+        there; without it, only the shape is checked — which is not enough on
+        an isotropic volume, where a stale mask would be drawn on the wrong
+        plane. Returns None when the mask cannot be shown in the current view.
         """
         if mask is None or self.current_slice is None:
             return None
 
         mask = np.asarray(mask)
+
+        if mask.ndim == 2 and plane is not None:
+            source_axis, source_index = plane
+            if source_axis != self.current_axis:
+                return None
+            if source_index is not None and source_index != self.current_slice_index:
+                return None
 
         if mask.ndim == 3:
             index = self.current_slice_index
@@ -1643,8 +1653,12 @@ class SliceViewerWidget(QWidget):
 
         import matplotlib.colors as mcolors
 
-        for name, mask, color in self.mask_overlays:
-            slice_2d = self._slice_mask_for_display(mask)
+        for entry in self.mask_overlays:
+            # Entries are (name, mask, color) or (name, mask, color, plane),
+            # where plane is (axis, slice_index) for single-slice masks.
+            name, mask, color = entry[0], entry[1], entry[2]
+            plane = entry[3] if len(entry) > 3 else None
+            slice_2d = self._slice_mask_for_display(mask, plane)
             if slice_2d is None:
                 continue
             visible = int(np.count_nonzero(slice_2d))
@@ -2586,19 +2600,47 @@ class BiTS4DMainWindow(QMainWindow):
         compare_action.triggered.connect(self._on_compare_selections)
         analytics_menu.addAction(compare_action)
 
-        # Temporal histogram evolution image
+        # Temporal histogram analyses
+        hist_menu = analytics_menu.addMenu("Histogram Time Analysis")
+
         hist_evolution_action = QAction(
-            "Histogram Evolution vs First Timepoint...", self
+            "Evolution vs First Timepoint...", self
         )
         hist_evolution_action.setToolTip(
             "Save an image comparing every timepoint's histogram to the\n"
-            "first one on a log scale — red/blue areas show where voxel\n"
-            "populations grow/shrink over time."
+            "first one on a log scale — shows total drift from the start.\n"
+            "Red/blue areas gained/lost voxels."
         )
         hist_evolution_action.triggered.connect(
             self._on_export_histogram_evolution
         )
-        analytics_menu.addAction(hist_evolution_action)
+        hist_menu.addAction(hist_evolution_action)
+
+        hist_increment_action = QAction(
+            "Change vs Previous Timepoint (incremental)...", self
+        )
+        hist_increment_action.setToolTip(
+            "Save an image comparing each timepoint's histogram to the one\n"
+            "before it — shows *when* changes happen, so a sudden event\n"
+            "stands out instead of being buried in cumulative drift."
+        )
+        hist_increment_action.triggered.connect(
+            self._on_export_histogram_increment
+        )
+        hist_menu.addAction(hist_increment_action)
+
+        hist_marginal_action = QAction(
+            "Marginal Evolution (Neutron / X-ray)...", self
+        )
+        hist_marginal_action.setToolTip(
+            "Save marginal kymographs: each modality's 1-D histogram against\n"
+            "time. Separates a shift in neutron from a shift in X-ray, which\n"
+            "the joint histogram can hide."
+        )
+        hist_marginal_action.triggered.connect(
+            self._on_export_marginal_evolution
+        )
+        hist_menu.addAction(hist_marginal_action)
 
         analytics_menu.addSeparator()
         
@@ -3340,23 +3382,31 @@ class BiTS4DMainWindow(QMainWindow):
                 file=sys.stderr,
             )
 
+        # The plane the 2-D cluster slices were extracted on, so they are not
+        # later drawn over a different plane.
+        source_axis = self.slice_viewer.current_axis
+        source_index = self.slice_viewer.current_slice_index
+
         # Add each cluster to selection manager
         for cluster_data in cluster_selections:
             # Handle both 5-tuple (2D) and 6-tuple (3D) formats
+            mask_3d = None
             if len(cluster_data) == 6:
                 name, spatial_mask, histogram_roi, cluster_id, color, mask_3d = cluster_data
-                # Store 3D mask for future use
-                # Also rebuild the full cluster map for RF training
-                # (first cluster we see has cluster_id == 0, so build progressively)
             else:
                 name, spatial_mask, histogram_roi, cluster_id, color = cluster_data
-            
+
             self.selection_manager.add_selection(
                 name=name,
                 spatial_mask=spatial_mask,
                 histogram_roi=histogram_roi,
                 cluster_id=cluster_id,
-                color=color
+                color=color,
+                # 3-D clusters keep their volume mask so the highlight
+                # follows slice and plane changes
+                spatial_mask_3d=mask_3d,
+                source_axis=source_axis,
+                source_slice_index=source_index,
             )
         
         # Rebuild cluster_map_3d for RF training from 6-tuple cluster selections.
@@ -3488,7 +3538,7 @@ class BiTS4DMainWindow(QMainWindow):
                 histogram_roi,
                 cluster_id,
                 color,
-                _mask_3d,
+                payload_mask_3d,
             ) = payload
             key = (name, cluster_id)
             if key in existing_selection_keys:
@@ -3499,6 +3549,9 @@ class BiTS4DMainWindow(QMainWindow):
                 histogram_roi=histogram_roi,
                 cluster_id=cluster_id,
                 color=color,
+                spatial_mask_3d=payload_mask_3d,
+                source_axis=self.slice_viewer.current_axis,
+                source_slice_index=self.slice_viewer.current_slice_index,
             )
             existing_selection_keys.add(key)
             added_selections += 1
@@ -3594,10 +3647,18 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
+        # A 3-D region-grow result keeps its volume mask so the highlight
+        # follows plane changes; a 2-D one is pinned to the plane it was
+        # grown on.
         self.selection_manager.add_selection(
             name=name,
             spatial_mask=spatial_mask,
-            histogram_roi=histogram_roi
+            histogram_roi=histogram_roi,
+            spatial_mask_3d=getattr(
+                self.slice_viewer, 'region_grow_mask_3d', None
+            ),
+            source_axis=self.slice_viewer.current_axis,
+            source_slice_index=self.slice_viewer.current_slice_index,
         )
 
         self.status_bar.showMessage(f"✅ Saved selection: {name}")
@@ -3826,14 +3887,26 @@ class BiTS4DMainWindow(QMainWindow):
         manager = getattr(self, "selection_manager", None)
         if manager is not None and manager.show_all_cb.isChecked():
             for selection in manager.get_visible_selections():
-                if selection.spatial_mask is not None:
-                    color = (
-                        selection.color
-                        if selection.color is not None
-                        else (1, 0, 0, 0.5)
+                color = (
+                    selection.color
+                    if selection.color is not None
+                    else (1, 0, 0, 0.5)
+                )
+                mask_3d = getattr(selection, "spatial_mask_3d", None)
+                if mask_3d is not None:
+                    # Whole-volume selection (e.g. 3-D k-means): re-sliced by
+                    # the viewer, so it tracks slice and plane changes.
+                    overlays.append((selection.name, mask_3d, color))
+                elif selection.spatial_mask is not None:
+                    # Single-slice selection: pinned to the plane it was made
+                    # on so it is never drawn over a different one.
+                    plane = (
+                        getattr(selection, "source_axis", None),
+                        getattr(selection, "source_slice_index", None),
                     )
                     overlays.append(
-                        (selection.name, selection.spatial_mask, color)
+                        (selection.name, selection.spatial_mask, color,
+                         plane if plane[0] is not None else None)
                     )
         return overlays
 
@@ -5331,17 +5404,16 @@ class BiTS4DMainWindow(QMainWindow):
     
     # ========== v14.1: Advanced Analytics Methods ==========
     
-    def _on_export_histogram_evolution(self):
-        """Save an image of every timepoint's log-histogram change vs T0.
+    def _run_histogram_time_analysis(self, title, dialog_caption, render,
+                                     explanation):
+        """Shared driver for the temporal histogram analyses.
 
-        Each panel shows log10(h_t+1) − log10(h_0+1) on the shared histogram
-        grid with a diverging colour scale: red where voxel populations grow
-        over time, blue where they shrink. Uses the cached local histograms,
-        computing any that are missing.
+        Collects every timepoint's local histogram (from cache, computing any
+        that are missing), then hands the list to *render*, which draws the
+        figure and returns the saved path.
         """
         from PyQt5.QtWidgets import QFileDialog
         from utils.cancellation import OperationCancelled, OperationFailed
-        from utils.histogram_evolution import save_histogram_evolution_image
 
         if not self.dataset or not self.histogram_engine:
             QMessageBox.information(self, "No Data", "Load a dataset first.")
@@ -5355,13 +5427,12 @@ class BiTS4DMainWindow(QMainWindow):
         if num_timepoints < 2:
             QMessageBox.information(
                 self, "Single Timepoint",
-                "Histogram evolution needs at least two timepoints."
+                f"{title} needs at least two timepoints."
             )
             return
 
         filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save Histogram Evolution Image", "",
-            "PNG Files (*.png);;All Files (*)"
+            self, dialog_caption, "", "PNG Files (*.png);;All Files (*)"
         )
         if not filepath:
             return
@@ -5389,27 +5460,68 @@ class BiTS4DMainWindow(QMainWindow):
                         f"Collecting histogram {timepoint + 1}/{num_timepoints}",
                     )
             if progress_callback:
-                progress_callback(95, "Rendering evolution figure...")
-            return save_histogram_evolution_image(histograms, filepath)
+                progress_callback(95, "Rendering figure...")
+            return render(histograms, filepath)
 
         try:
             saved = run_with_progress(
-                self,
-                "Histogram Evolution",
-                "Building temporal histogram comparison...",
-                operation,
+                self, title, f"Building {title.lower()}...", operation
             )
         except (OperationCancelled, OperationFailed):
             return
 
         if saved:
-            self.status_bar.showMessage(f"Histogram evolution saved: {saved}")
+            self.status_bar.showMessage(f"{title} saved: {saved}")
             QMessageBox.information(
                 self, "Image Saved",
-                f"Histogram evolution image saved to:\n{saved}\n\n"
-                "Red areas gained voxels relative to T0, blue areas lost "
-                "them (log scale)."
+                f"{title} saved to:\n{saved}\n\n{explanation}"
             )
+
+    def _on_export_histogram_evolution(self):
+        """Save each timepoint's log-histogram change against T0."""
+        from utils.histogram_evolution import (
+            REFERENCE_FIRST, save_histogram_evolution_image,
+        )
+
+        self._run_histogram_time_analysis(
+            "Histogram Evolution",
+            "Save Histogram Evolution Image",
+            lambda histograms, path: save_histogram_evolution_image(
+                histograms, path, reference_mode=REFERENCE_FIRST
+            ),
+            "Red areas gained voxels relative to T0, blue areas lost them "
+            "(log scale). This is the cumulative drift from the start.",
+        )
+
+    def _on_export_histogram_increment(self):
+        """Save each timepoint's log-histogram change against the previous one."""
+        from utils.histogram_evolution import (
+            REFERENCE_PREVIOUS, save_histogram_evolution_image,
+        )
+
+        self._run_histogram_time_analysis(
+            "Incremental Histogram Change",
+            "Save Incremental Histogram Change Image",
+            lambda histograms, path: save_histogram_evolution_image(
+                histograms, path, reference_mode=REFERENCE_PREVIOUS
+            ),
+            "Each panel compares a timepoint with the one before it, so the "
+            "steps where change actually happens stand out instead of being "
+            "buried in cumulative drift.",
+        )
+
+    def _on_export_marginal_evolution(self):
+        """Save marginal kymographs of each modality against time."""
+        from utils.histogram_evolution import save_marginal_evolution_image
+
+        self._run_histogram_time_analysis(
+            "Marginal Evolution",
+            "Save Marginal Evolution Image",
+            save_marginal_evolution_image,
+            "Each panel stacks one modality's 1-D histogram against time "
+            "(log2 vs T0). Red intensity bands grew, blue bands shrank — "
+            "this separates a shift in neutron from a shift in X-ray.",
+        )
 
     def _on_morphological_analysis(self):
         """Perform morphological analysis on selected selections"""
