@@ -34,10 +34,12 @@ back to voxels.
   from memory; volumes larger than 1 GiB are median-binned for display (with
   segmentation still running at full resolution), so time scrolling and
   slice browsing stay smooth on multi-gigabyte series.
-- **Histogram evolution** — *Analytics → Histogram Evolution vs First
-  Timepoint* saves an image where each timepoint's histogram is compared to
-  T0 on a log scale, highlighting where voxel populations grow (red) or
-  shrink (blue) over time.
+- **Histogram time analysis** — *Analytics → Histogram Time Analysis* saves
+  three complementary images: **evolution** (each timepoint vs T0, showing
+  cumulative drift), **incremental change** (each timepoint vs the previous
+  one, showing *when* events happen), and **marginal evolution** (each
+  modality's 1-D histogram against time, separating a neutron shift from an
+  X-ray shift).
 
 ## Installation
 

@@ -1,5 +1,47 @@
 # Bug-fix and cleanup notes
 
+## K-means highlight showed the previous plane (latest)
+
+**Symptom:** after K-means segmentation, changing the visualization plane
+left the highlight showing the previous plane's voxels.
+
+**Root cause:** cluster selections stored only the **2-D mask slice**
+extracted when clustering ran. The viewer's guard was a shape check, and on
+an isotropic volume every plane yields the same slice shape — so the stale
+2-D mask passed the check and was drawn over the new plane. (The same class
+of bug as the segmentation-layer one, in the selection path.)
+
+**Fix:** `Selection` now carries `spatial_mask_3d` plus the
+`source_axis`/`source_slice_index` the 2-D mask belongs to. 3-D clusters
+hand the viewer their volume mask, which is re-sliced on every redraw so the
+highlight follows the plane; genuinely 2-D selections are pinned to their
+own plane and slice and are never drawn elsewhere. Overlay entries may now
+carry that plane as an optional fourth element. Region-grow selections and
+the K-means→RF conversion record the same provenance.
+
+## New temporal histogram analyses
+
+*Analytics → Histogram Time Analysis* now holds three functions:
+
+- **Evolution vs First Timepoint** — cumulative drift, `log10(h_t+1) −
+  log10(h_0+1)` (the existing figure, moved into the submenu).
+- **Change vs Previous Timepoint (incremental)** — `log10(h_t+1) −
+  log10(h_{t-1}+1)`, so the steps where change actually happens stand out
+  instead of being buried in cumulative drift.
+- **Marginal Evolution (Neutron / X-ray)** — kymographs of each modality's
+  1-D histogram against time, coloured by `log2(m_t / m_0)`, following the
+  reference notebook (`notebooks/joint_hist_4d-5.ipynb`). Each timepoint is
+  count-normalized first so differing finite-voxel counts stay comparable,
+  and the colour scale uses the 99th percentile of |change| so a few extreme
+  bins do not flatten the rest. This separates a shift in neutron from a
+  shift in X-ray, which the joint histogram can hide.
+
+Note that `HistogramData.histogram` is stored `[xray_bin, neutron_bin]`,
+transposed relative to the notebook's `[neutron, xray]`; the neutron
+marginal therefore sums axis 0 and the X-ray marginal axis 1. A test with a
+single-modality change pins this orientation down.
+
+
 ## Slice highlight did not follow slices, planes or timepoints (latest)
 
 **Symptom:** after segmenting, the highlight in the slice viewer was wrong

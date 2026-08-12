@@ -124,10 +124,13 @@ Two coordinate spaces follow from this, and the split is strict:
   the bridge — they are resolution-independent, so a selection made while
   looking at binned data segments the original voxels exactly.
 
-`utils/histogram_evolution.py` renders the temporal comparison figure
-(log10(h_t+1) − log10(h_0+1) per timepoint against T0) from the cached
-local histograms; the GUI exposes it under *Analytics → Histogram Evolution
-vs First Timepoint*.
+`utils/histogram_evolution.py` renders the temporal analyses from the cached
+local histograms — cumulative panels (vs T0), incremental panels (vs the
+previous timepoint) and marginal kymographs per modality. The GUI exposes
+all three under *Analytics → Histogram Time Analysis*, driven by the shared
+`_run_histogram_time_analysis()` helper, which gathers the histograms and
+delegates rendering. `notebooks/joint_hist_4d-5.ipynb` on `main` is the
+reference implementation for these figures.
 
 ## Slice-viewer overlays
 
@@ -139,6 +142,15 @@ redraw, so the highlight follows the slice index and the viewing plane) or a
 the displayed slice matches). Never store a pre-sliced 2-D view of a 3-D
 layer: that was the cause of highlights going stale on scroll and vanishing
 on plane changes.
+
+Overlay entries may carry an optional fourth element, `(axis, slice_index)`,
+pinning a 2-D mask to the plane it was created on. Always set it for
+single-slice masks: a shape check alone is not enough, because on an
+isotropic volume every plane produces the same slice shape and a stale mask
+would be drawn over the wrong plane. Selections that come from a 3-D
+operation (3-D k-means, 3-D region growing) should instead store
+`Selection.spatial_mask_3d`, which the viewer re-slices like any other 3-D
+layer.
 
 Two independent sources feed the overlay list — segmentation layers and
 visible saved selections — so they are merged by

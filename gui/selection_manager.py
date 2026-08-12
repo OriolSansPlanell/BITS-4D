@@ -17,14 +17,26 @@ class Selection:
     """
     Represents a saved selection (mask + histogram ROI)
     """
-    def __init__(self, name, spatial_mask=None, histogram_roi=None, 
-                 cluster_id=None, color=None):
+    def __init__(self, name, spatial_mask=None, histogram_roi=None,
+                 cluster_id=None, color=None, spatial_mask_3d=None,
+                 source_axis=None, source_slice_index=None):
         self.name = name
-        self.spatial_mask = spatial_mask  # 2D boolean array
+        self.spatial_mask = spatial_mask  # 2D boolean array (one slice)
         self.histogram_roi = histogram_roi  # Polygon vertices or None
         self.cluster_id = cluster_id  # For k-means clusters
         self.color = color  # For visualization
         self.visible = True  # Whether to show on histogram
+
+        # Whole-volume mask when the selection came from a 3-D operation
+        # (e.g. 3-D k-means). The slice viewer re-slices this so the
+        # highlight follows the plane and slice being displayed.
+        self.spatial_mask_3d = spatial_mask_3d
+
+        # Plane the 2-D mask was created on. A 2-D mask is only meaningful
+        # there — without this, an isotropic volume happily draws it on a
+        # different plane, showing the wrong voxels.
+        self.source_axis = source_axis
+        self.source_slice_index = source_slice_index
     
     def __repr__(self):
         mask_info = f"{np.sum(self.spatial_mask)} px" if self.spatial_mask is not None else "No mask"
@@ -97,21 +109,30 @@ class SelectionManagerWidget(QWidget):
         
         self.setLayout(layout)
     
-    def add_selection(self, name, spatial_mask, histogram_roi, cluster_id=None, color=None):
+    def add_selection(self, name, spatial_mask, histogram_roi, cluster_id=None,
+                      color=None, spatial_mask_3d=None, source_axis=None,
+                      source_slice_index=None):
         """
         Add a new selection
-        
+
         Args:
             name: Name of selection
-            spatial_mask: 2D boolean array
+            spatial_mask: 2D boolean array (the slice it was created on)
             histogram_roi: Polygon vertices (Nx2 array) or None
             cluster_id: Optional cluster ID
             color: Optional color for visualization
+            spatial_mask_3d: Optional whole-volume mask, so the highlight can
+                follow slice and plane changes
+            source_axis / source_slice_index: the plane the 2-D mask belongs
+                to, so it is not drawn on a different one
         """
-        print(f"SelectionManager: Adding selection '{name}'", file=sys.stderr)
-        
         # Create selection object
-        selection = Selection(name, spatial_mask, histogram_roi, cluster_id, color)
+        selection = Selection(
+            name, spatial_mask, histogram_roi, cluster_id, color,
+            spatial_mask_3d=spatial_mask_3d,
+            source_axis=source_axis,
+            source_slice_index=source_slice_index,
+        )
         self.selections.append(selection)
         
         # Add to list widget
@@ -129,8 +150,6 @@ class SelectionManagerWidget(QWidget):
         
         # Emit signal
         self.selections_changed.emit()
-        
-        print(f"  Selection added: {selection}", file=sys.stderr)
     
     def get_current_selection(self):
         """Get currently selected selection"""

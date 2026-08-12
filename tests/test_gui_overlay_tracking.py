@@ -171,14 +171,14 @@ def test_selection_changes_do_not_erase_segmentation_highlight(window):
     window.selection_manager.show_all_cb.setChecked(True)
     window._update_histogram_overlays()
 
-    shown = {name for name, _m, _c in viewer.mask_overlays}
+    shown = {entry[0] for entry in viewer.mask_overlays}
     assert seg_names <= shown, "segmentation layers were erased by selections"
     assert "picked" in shown
 
     # Turning it back off must keep the segmentation layers
     window.selection_manager.show_all_cb.setChecked(False)
     window._update_histogram_overlays()
-    shown = {name for name, _m, _c in viewer.mask_overlays}
+    shown = {entry[0] for entry in viewer.mask_overlays}
     assert seg_names <= shown, "segmentation layers lost when hiding selections"
     assert "picked" not in shown
 
