@@ -81,16 +81,22 @@ def test_segmentation_runs_full_resolution_and_overlay_is_binned(window):
     assert mask.shape == window.dataset.neutron_data.shape[1:]
     np.testing.assert_array_equal(mask, blob[0])
 
-    # Overlay pushed to the slice viewer matches the binned display slice
+    # The viewer receives the whole 3-D layer on the display grid, so it can
+    # re-slice it for any plane/index without the main window recomputing.
     disp_n, _ = window._current_display_volumes()
     overlays = window.slice_viewer.mask_overlays
     assert len(overlays) == 1
-    _oname, overlay_2d, _ocolor = overlays[0]
-    axis = window.slice_viewer.current_axis
-    assert axis == 'z'
-    assert overlay_2d.shape == disp_n.shape[1:]
+    _oname, overlay_mask, _ocolor = overlays[0]
+    assert overlay_mask.ndim == 3
+    assert overlay_mask.shape == disp_n.shape
+
+    # And the slice it renders for the current view is the binned blob
+    viewer = window.slice_viewer
+    assert viewer.current_axis == 'z'
+    rendered = viewer._slice_mask_for_display(overlay_mask)
+    assert rendered.shape == disp_n.shape[1:]
     factor = window.display_bin_factor
-    assert overlay_2d[:16 // factor, :16 // factor].all()
+    assert rendered[:16 // factor, :16 // factor].all()
 
 
 def test_local_histograms_served_from_cache(window):

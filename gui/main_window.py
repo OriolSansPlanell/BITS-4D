@@ -270,9 +270,13 @@ class SliceViewerWidget(QWidget):
         self.region_grow_mask_3d = None  # For 3D region growing (v15.0)
         self.mask_overlay = None  # Matplotlib artist for mask display
         
-        # Multiple mask overlays (for selection manager)
+        # Multiple mask overlays (segmentation layers + selection manager).
+        # Masks may be 3-D (whole-volume layers, re-sliced on every redraw so
+        # the highlight follows the plane/slice) or 2-D (single-slice
+        # selections, shown only on a matching slice).
         self.mask_overlays = []  # List of (name, mask, color) tuples
         self.overlay_artists = []  # Matplotlib artists for overlays
+        self._visible_mask_pixels = 0  # Highlighted pixels on the current slice
         
         # Auto-detected features
         self.detected_features = []  # List of (y, x) coordinates
@@ -1549,19 +1553,23 @@ class SliceViewerWidget(QWidget):
         if self.region_grow_mask is not None:
             self._display_mask_overlay()
 
-    def set_mask_overlays(self, overlays):
+    def set_mask_overlays(self, overlays, redraw=True):
         """
         Set multiple mask overlays for display
 
         Args:
             overlays: List of (name, mask, color) tuples
-                     mask: 2D boolean array
+                     mask: 3-D volume mask (re-sliced for the current view)
+                           or a 2-D single-slice mask
                      color: matplotlib color (tuple or string)
+            redraw:  Draw the overlays now. Pass False when a full
+                     _update_display() follows, so they render only once.
         """
         self.mask_overlays = overlays
-        self._display_mask_overlays()
         # Enable clear-highlight whenever overlays are non-empty
         self.clear_highlight_btn.setEnabled(bool(overlays))
+        if redraw:
+            self._display_mask_overlays()
 
     def clear_mask_overlays(self):
         """Clear all mask overlays"""
@@ -1579,9 +1587,50 @@ class SliceViewerWidget(QWidget):
                 pass
         self.overlay_artists = []
     
+    def _slice_mask_for_display(self, mask):
+        """Return the 2-D view of *mask* matching the current axis and slice.
+
+        3-D masks (whole-volume segmentation layers) are sliced on demand so
+        the highlight follows slice-index and viewing-plane changes. 2-D
+        masks (single-slice selections such as region growing) are shown
+        only while the displayed slice has the same shape. Returns None when
+        the mask cannot be shown in the current view.
+        """
+        if mask is None or self.current_slice is None:
+            return None
+
+        mask = np.asarray(mask)
+
+        if mask.ndim == 3:
+            index = self.current_slice_index
+            if index is None:
+                return None
+            axis_position = {'z': 0, 'y': 1, 'x': 2}.get(self.current_axis, 0)
+            if not 0 <= index < mask.shape[axis_position]:
+                return None
+            if self.current_axis == 'z':
+                slice_2d = mask[index, :, :]
+            elif self.current_axis == 'y':
+                slice_2d = mask[:, index, :]
+            else:
+                slice_2d = mask[:, :, index]
+        elif mask.ndim == 2:
+            slice_2d = mask
+        else:
+            return None
+
+        if slice_2d.shape != self.current_slice.shape:
+            return None
+        return slice_2d
+
     def _display_mask_overlays(self):
-        """Display multiple mask overlays with different colours."""
+        """Display multiple mask overlays with different colours.
+
+        Masks are re-sliced from their stored form on every redraw, so the
+        highlight stays correct while scrolling slices or switching planes.
+        """
         self._clear_overlay_artists()
+        self._visible_mask_pixels = 0
 
         if not self.ax.images or len(self.ax.images) == 0:
             return
@@ -1592,21 +1641,27 @@ class SliceViewerWidget(QWidget):
         # Use the same extent / origin / aspect as the base image
         extent = self.ax.images[0].get_extent()
 
+        import matplotlib.colors as mcolors
+
         for name, mask, color in self.mask_overlays:
-            if mask is None or mask.shape != self.current_slice.shape:
+            slice_2d = self._slice_mask_for_display(mask)
+            if slice_2d is None:
                 continue
+            visible = int(np.count_nonzero(slice_2d))
+            if visible == 0:
+                # Nothing of this layer intersects the current slice
+                continue
+            self._visible_mask_pixels += visible
 
             # Parse colour to RGBA float
             try:
-                import matplotlib.colors as mcolors
-                rgba = mcolors.to_rgba(color, alpha=None)
-                r, g, b, _ = rgba
+                r, g, b, _ = mcolors.to_rgba(color, alpha=None)
                 a = color[3] if (isinstance(color, (tuple, list)) and len(color) > 3) else 0.5
             except Exception:
                 r, g, b, a = 1.0, 0.0, 0.0, 0.5
 
-            overlay_rgba = np.zeros((*mask.shape, 4), dtype=np.float32)
-            overlay_rgba[mask] = [r, g, b, a]
+            overlay_rgba = np.zeros((*slice_2d.shape, 4), dtype=np.float32)
+            overlay_rgba[slice_2d] = [r, g, b, a]
 
             artist = self.ax.imshow(
                 overlay_rgba,
@@ -1686,20 +1741,24 @@ class SliceViewerWidget(QWidget):
         if self.current_slice_index is None:
             self.current_slice_index = data_vol.shape[0] // 2 if self.current_axis == 'z' else data_vol.shape[1] // 2
         
-        # CRITICAL: Extract slice and segmentation mask identically
+        # Clamp the index so switching to a shorter axis cannot go out of range
+        axis_position = {'z': 0, 'y': 1, 'x': 2}[self.current_axis]
+        self.current_slice_index = int(
+            min(max(self.current_slice_index, 0),
+                data_vol.shape[axis_position] - 1)
+        )
+
         if self.current_axis == 'z':
             data_slice = data_vol[self.current_slice_index, :, :]
-            seg_mask = self.segmentation_mask[self.current_slice_index, :, :] if self.segmentation_mask is not None else None
             title = f"XY Slice (Z={self.current_slice_index}, {view_label})"
         elif self.current_axis == 'y':
             data_slice = data_vol[:, self.current_slice_index, :]
-            seg_mask = self.segmentation_mask[:, self.current_slice_index, :] if self.segmentation_mask is not None else None
             title = f"XZ Slice (Y={self.current_slice_index}, {view_label})"
         else:  # 'x'
             data_slice = data_vol[:, :, self.current_slice_index]
-            seg_mask = self.segmentation_mask[:, :, self.current_slice_index] if self.segmentation_mask is not None else None
             title = f"YZ Slice (X={self.current_slice_index}, {view_label})"
-        
+
+
         # Store current slice for region growing
         self.current_slice = data_slice
         
@@ -1730,15 +1789,22 @@ class SliceViewerWidget(QWidget):
             aspect='equal'  # Preserve aspect ratio - no distortion
         )
         
-        # Overlay segmentation if available — rendered via _display_mask_overlays()
-        # (supports multiple coloured masks; replaces legacy single red overlay)
-        if seg_mask is not None and np.sum(seg_mask) > 0:
-            num_segmented = np.sum(seg_mask)
-            total = seg_mask.size
-            pct = (num_segmented / total) * 100
-            info = f"{view_label} | Segmented: {num_segmented:,} pixels ({pct:.1f}%)"
+        # Draw multi-colour mask overlays; 3-D masks are re-sliced here so the
+        # highlight tracks the current plane and slice index.
+        self._display_mask_overlays()
+
+        # Report what is actually highlighted on this slice
+        if self._visible_mask_pixels > 0:
+            pct = 100.0 * self._visible_mask_pixels / data_slice.size
+            info = (
+                f"{view_label} | Segmented here: "
+                f"{self._visible_mask_pixels:,} pixels ({pct:.1f}%)"
+            )
         else:
-            info = f"{view_label} | Shape: {data_slice.shape} | Range: [{data_slice.min():.0f}, {data_slice.max():.0f}]"
+            info = (
+                f"{view_label} | Shape: {data_slice.shape} | "
+                f"Range: [{data_slice.min():.0f}, {data_slice.max():.0f}]"
+            )
 
         if self.display_bin_factor > 1:
             info += (
@@ -1747,9 +1813,6 @@ class SliceViewerWidget(QWidget):
             )
 
         self.info_label.setText(info)
-
-        # Draw multi-colour mask overlays (set via set_mask_overlays)
-        self._display_mask_overlays()
 
         self.fig.tight_layout()
         self.canvas.draw_idle()
@@ -1960,6 +2023,8 @@ class BiTS4DMainWindow(QMainWindow):
         self.display_data = None            # ([neutron_3d...], [xray_3d...])
         self.display_bin_factor = 1
         self._display_mask_cache = {}       # {(t, name) -> (mask_ref, binned)}
+        # Convex hulls derived from layers that have no drawn ROI shape
+        self._derived_outline_cache = {}    # {(t, name) -> (mask_ref, verts)}
         
         # Mode setting
         self.mode = '4D'  # '3D' or '4D' - determines if temporal dimension is used
@@ -3538,24 +3603,17 @@ class BiTS4DMainWindow(QMainWindow):
         self.status_bar.showMessage(f"✅ Saved selection: {name}")
     
     def _update_histogram_overlays(self):
-        """Update histogram and slice viewer to show multiple visible selections"""
-        import sys
-        
-        # Get visible selections from selection manager
+        """Show visible saved selections on the histograms and slice viewer.
+
+        The slice viewer's highlights are re-composed (rather than replaced)
+        so changing selections never erases the segmentation layers.
+        """
         visible_selections = self.selection_manager.get_visible_selections()
-        
-        print(f"Updating overlays: {len(visible_selections)} visible selections", file=sys.stderr)
-        
-        # Check if "Show All on Histogram" is enabled
         show_all = self.selection_manager.show_all_cb.isChecked()
-        
+
         if show_all and len(visible_selections) > 0:
-            # Prepare histogram overlays
             histogram_overlays = []
-            mask_overlays = []
-            
             for selection in visible_selections:
-                # Add histogram ROI overlay
                 if selection.histogram_roi is not None:
                     color = selection.color if selection.color is not None else (1, 0, 0, 0.8)
                     histogram_overlays.append((
@@ -3563,32 +3621,18 @@ class BiTS4DMainWindow(QMainWindow):
                         selection.histogram_roi,
                         color
                     ))
-                
-                # Add mask overlay
-                if selection.spatial_mask is not None:
-                    color = selection.color if selection.color is not None else (1, 0, 0, 0.5)
-                    mask_overlays.append((
-                        selection.name,
-                        selection.spatial_mask,
-                        color
-                    ))
-            
+
             # Update histograms
             for canvas in [self.dual_histogram.global_canvas, self.dual_histogram.local_canvas]:
                 canvas.set_roi_overlays(histogram_overlays)
-            
-            # Update slice viewer
-            self.slice_viewer.set_mask_overlays(mask_overlays)
-            
-            print(f"  Set {len(histogram_overlays)} histogram overlays", file=sys.stderr)
-            print(f"  Set {len(mask_overlays)} mask overlays", file=sys.stderr)
+
+            # Slice viewer: segmentation layers + the visible selections
+            self._refresh_slice_overlays()
         else:
-            # Clear overlays
+            # Clear the selection overlays, keeping segmentation highlights
             for canvas in [self.dual_histogram.global_canvas, self.dual_histogram.local_canvas]:
                 canvas.clear_roi_overlays()
-            self.slice_viewer.clear_mask_overlays()
-
-            print(f"  Cleared all overlays", file=sys.stderr)
+            self._refresh_slice_overlays()
 
     # ── RF histogram overlay ──────────────────────────────────────────────────
 
@@ -3600,10 +3644,19 @@ class BiTS4DMainWindow(QMainWindow):
         recorded shape (RF predictions, Otsu, K-means) fall back to a convex
         hull of the segmented voxel intensities — an approximation of where
         that class lives in histogram space, not a drawn selection.
+
+        Derived hulls are cached per layer: recomputing them means gathering
+        every segmented voxel's intensities from the full-resolution volume,
+        which would otherwise run on each timepoint switch.
         """
-        recorded = self.segmentation_layer_shapes.get((int(timepoint), name))
+        key = (int(timepoint), name)
+        recorded = self.segmentation_layer_shapes.get(key)
         if recorded is not None:
             return recorded
+
+        cached = self._derived_outline_cache.get(key)
+        if cached is not None and cached[0] is mask_3d:
+            return cached[1]
 
         from utils.clustering_3d import KMeans3D
         mask = np.asarray(mask_3d, dtype=bool)
@@ -3611,9 +3664,11 @@ class BiTS4DMainWindow(QMainWindow):
         x_vals = np.asarray(xray_vol)[mask].astype(np.float64)
         if len(n_vals) < 4:
             return None
-        return KMeans3D.create_convex_hull_roi_3d(
+        vertices = KMeans3D.create_convex_hull_roi_3d(
             n_vals, x_vals, percentile=98, density_aware=True
         )
+        self._derived_outline_cache[key] = (mask_3d, vertices)
+        return vertices
 
     def _update_rf_histogram_overlays(self, timepoint, neutron_vol=None, xray_vol=None):
         """
@@ -3751,44 +3806,67 @@ class BiTS4DMainWindow(QMainWindow):
             return 'Rectangle ROI'
         return 'ROI'
 
+    def _compose_slice_overlays(self, timepoint):
+        """Build the slice-viewer overlay list for *timepoint*.
+
+        Combines the two independent sources of highlights so neither can
+        erase the other:
+
+        * segmentation layers — whole 3-D masks on the display grid, which
+          the viewer re-slices on every redraw so the highlight follows the
+          slice index and the viewing plane;
+        * visible saved selections — 2-D single-slice masks, shown only
+          while "Show All on Histogram" is enabled.
+        """
+        overlays = [
+            (name, self._binned_display_mask(timepoint, name, mask_3d), color)
+            for mask_3d, color, name in self.segmentation_masks.get(timepoint, [])
+        ]
+
+        manager = getattr(self, "selection_manager", None)
+        if manager is not None and manager.show_all_cb.isChecked():
+            for selection in manager.get_visible_selections():
+                if selection.spatial_mask is not None:
+                    color = (
+                        selection.color
+                        if selection.color is not None
+                        else (1, 0, 0, 0.5)
+                    )
+                    overlays.append(
+                        (selection.name, selection.spatial_mask, color)
+                    )
+        return overlays
+
+    def _refresh_slice_overlays(self):
+        """Re-push the overlay set without re-rendering the base image."""
+        if self.dataset is None:
+            self.slice_viewer.clear_mask_overlays()
+            return
+        overlays = self._compose_slice_overlays(self.dataset.current_timepoint)
+        if overlays:
+            self.slice_viewer.set_mask_overlays(overlays)
+        else:
+            self.slice_viewer.clear_mask_overlays()
+
     def _apply_segmentation_overlays(self, timepoint, neutron_vol=None, xray_vol=None):
-        """Push all stored segmentation layers for *timepoint* to the slice viewer.
+        """Show *timepoint*'s display volumes with all of its highlights.
 
         The base image is always the *display* volume pair (median-binned for
-        large datasets); the full-resolution layer masks are scaled to the
-        same grid so overlays line up with the displayed slices. The optional
+        large datasets); full-resolution layer masks are scaled to the same
+        grid so overlays line up with the displayed slices. The optional
         volume arguments are accepted for backward compatibility but the
         display copies are what gets shown.
         """
-        layers = self.segmentation_masks.get(timepoint, [])
-
         display_neutron, display_xray = self._display_volumes_at(timepoint)
+        overlays = self._compose_slice_overlays(timepoint)
 
-        # Always refresh the base image first
+        # Register the overlays before rendering so the base-image redraw
+        # draws this timepoint's highlights (not the previous timepoint's)
+        # and the whole update paints exactly once.
+        self.slice_viewer.set_mask_overlays(overlays, redraw=False)
         self.slice_viewer.set_slice_data(
             display_neutron, display_xray, segmentation_vol=None
         )
-
-        if not layers:
-            self.slice_viewer.clear_mask_overlays()
-            return
-
-        # Build the 2-D slice overlay list for the current viewer state
-        axis  = self.slice_viewer.current_axis
-        idx   = self.slice_viewer.current_slice_index
-
-        mask_overlays = []
-        for mask_3d, color, name in layers:
-            display_mask = self._binned_display_mask(timepoint, name, mask_3d)
-            if axis == 'z':
-                slice_2d = display_mask[idx, :, :]
-            elif axis == 'y':
-                slice_2d = display_mask[:, idx, :]
-            else:
-                slice_2d = display_mask[:, :, idx]
-            mask_overlays.append((name, slice_2d, color))
-
-        self.slice_viewer.set_mask_overlays(mask_overlays)
 
     # ── Segmentation ──────────────────────────────────────────────────────────
 
@@ -3854,14 +3932,25 @@ class BiTS4DMainWindow(QMainWindow):
             )
 
     def _clear_layer_shapes(self, timepoint=None):
-        """Drop recorded outlines — all of them, or one timepoint's."""
+        """Drop cached layer outlines and display masks.
+
+        Clears everything, or just one timepoint's entries. Keeping the
+        derived-hull and binned-mask caches in step with the layers stops
+        them growing without bound over a long session.
+        """
+        caches = (
+            self.segmentation_layer_shapes,
+            self._derived_outline_cache,
+            self._display_mask_cache,
+        )
         if timepoint is None:
-            self.segmentation_layer_shapes.clear()
+            for cache in caches:
+                cache.clear()
             return
         timepoint = int(timepoint)
-        for key in [k for k in self.segmentation_layer_shapes
-                    if k[0] == timepoint]:
-            del self.segmentation_layer_shapes[key]
+        for cache in caches:
+            for key in [k for k in cache if k[0] == timepoint]:
+                del cache[key]
 
     def _segment_current_volume(self):
         """Segment current volume with progress feedback.
@@ -4108,78 +4197,10 @@ class BiTS4DMainWindow(QMainWindow):
             f"Otsu T={current_t}: {len(classes)} classes, {n_voxels_total:,} voxels segmented"
         )
 
-    @pyqtSlot()
-    def _segment_all_volumes(self):
-        """Segment all volumes with progress feedback"""
-        if not self.dataset:
-            return
-        
-        roi_manager = self.dual_histogram.get_roi_manager()
-        if not roi_manager.has_roi():
-            QMessageBox.warning(self, "No ROI", "Please define an ROI first")
-            return
-        
-        # Confirm action
-        reply = QMessageBox.question(
-            self,
-            "Confirm Batch Segmentation",
-            f"Segment all {self.dataset.num_timepoints} timepoints?\n"
-            f"This may take several minutes.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if reply != QMessageBox.Yes:
-            return
-        
-        def segment_operation(progress_callback):
-            return self.segmentation_engine.segment_all_volumes(
-                self.dataset.neutron_data,
-                self.dataset.xray_data,
-                roi_manager,
-                progress_callback=progress_callback
-            )
-        
-        mask_4d = run_with_progress(
-            self,
-            "Batch Segmentation",
-            f"Segmenting {self.dataset.num_timepoints} timepoints...",
-            segment_operation
-        )
-
-        if mask_4d is not None:
-            roi_manager = self.dual_histogram.get_roi_manager()
-            color    = self._next_roi_color(roi_manager, 0)
-            roi_name = self._current_roi_name(roi_manager)
-
-            for t in range(self.dataset.num_timepoints):
-                if t not in self.segmentation_masks:
-                    self.segmentation_masks[t] = []
-                self.segmentation_masks[t].append((mask_4d[t], color, roi_name))
-            print(f"Stored segmentation layers for all {self.dataset.num_timepoints} timepoints", file=sys.stderr)
-
-            # Get temporal stats
-            stats = self.segmentation_engine.get_temporal_statistics(
-                mask_4d,
-                self.dataset.neutron_data,
-                self.dataset.xray_data
-            )
-
-            QMessageBox.information(
-                self,
-                "Segmentation Complete",
-                f"Batch segmentation complete!\n\n"
-                f"Total segmented voxels: {stats['total_segmented_voxels']:,}\n"
-                f"Mean volume per timepoint: {stats['mean_volume']:.0f}"
-            )
-
-            self.status_bar.showMessage(
-                f"Batch complete: {self.dataset.num_timepoints} timepoints segmented"
-            )
-
-            self.export_current_btn.setEnabled(True)
-            self.export_all_btn.setEnabled(True)
-
-            self._update_current_timepoint(self.dataset.current_timepoint)
+    # NOTE: _segment_all_volumes lives in gui/runtime_fixes.py, which
+    # installs the canonical implementation onto this class at import
+    # time (see gui/__init__.py). It segments every ROI shown on the
+    # histogram across all timepoints and records their outlines.
 
     # ─────────────────────────────────────────────────────────
     #  Random Forest slots

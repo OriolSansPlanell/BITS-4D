@@ -1,5 +1,51 @@
 # Bug-fix and cleanup notes
 
+## Slice highlight did not follow slices, planes or timepoints (latest)
+
+**Symptom:** after segmenting, the highlight in the slice viewer was wrong
+or absent when scrolling through slices, switching viewing plane, or after
+"Segment All Timepoints".
+
+**Root cause:** `SliceViewerWidget` stored the *2-D slices* of the masks
+that happened to be current when segmentation ran. Every later redraw
+re-used those stale 2-D arrays: scrolling within a plane painted a previous
+slice's voxels (the shapes still matched, so nothing complained), and
+switching plane made `mask.shape != current_slice.shape`, silently skipping
+the overlay entirely.
+
+**Fix:** the viewer now holds the **3-D masks** and re-slices them on every
+redraw (`_slice_mask_for_display`), so one segmentation covers all slices
+and all planes, for the current timepoint and for every timepoint after a
+batch run. 2-D single-slice masks (region growing, saved selections) are
+still supported and shown only on a matching slice. The info label now
+reports the voxels actually highlighted on the displayed slice, replacing a
+counter that read a legacy attribute which was always `None`.
+
+## Selection changes erased the segmentation highlight
+
+`_update_histogram_overlays` (selection manager) replaced the viewer's whole
+overlay list, so toggling "Show All on Histogram" or editing selections
+wiped the segmentation layers until the next timepoint change. Overlays from
+the two sources are now **composed** (`_compose_slice_overlays`) instead of
+overwriting one another.
+
+## Dead duplicate batch-segmentation implementation removed
+
+`main_window._segment_all_volumes` (73 lines) was unreachable —
+`gui/runtime_fixes.py` replaces it on the class at import time. Two
+divergent implementations of the same action is a standing bug source, so
+the dead one was removed and replaced with a pointer to the live one.
+
+## Performance
+
+- Convex hulls derived for layers without a drawn ROI (RF, Otsu, K-means)
+  are cached per layer; they previously re-gathered every segmented voxel's
+  intensities from the full-resolution volume on each timepoint switch.
+- The binned-display-mask and derived-hull caches are now cleared alongside
+  the layers they describe, so they cannot grow without bound.
+- A timepoint switch paints once instead of rendering overlays twice.
+
+
 ## K-means dtype crash on float32 volumes (latest)
 
 **Symptom:** 3-D Auto-Detect crashed in `KMeans3D.cluster_volume` with

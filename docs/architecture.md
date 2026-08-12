@@ -129,6 +129,25 @@ Two coordinate spaces follow from this, and the split is strict:
 local histograms; the GUI exposes it under *Analytics → Histogram Evolution
 vs First Timepoint*.
 
+## Slice-viewer overlays
+
+Segmentation layers are **3-D masks**, and the viewer keeps them that way.
+`SliceViewerWidget.mask_overlays` holds `(name, mask, color)` entries whose
+mask is either a 3-D volume (re-sliced by `_slice_mask_for_display` on every
+redraw, so the highlight follows the slice index and the viewing plane) or a
+2-D single-slice mask (region growing, saved selections — shown only while
+the displayed slice matches). Never store a pre-sliced 2-D view of a 3-D
+layer: that was the cause of highlights going stale on scroll and vanishing
+on plane changes.
+
+Two independent sources feed the overlay list — segmentation layers and
+visible saved selections — so they are merged by
+`BiTS4DMainWindow._compose_slice_overlays()`. Anything updating one source
+must go through that composer (`_refresh_slice_overlays()` for an
+overlay-only update, `_apply_segmentation_overlays()` when the base image
+changes too) rather than calling `set_mask_overlays()` with its own list,
+which would erase the other source.
+
 ## Execution model
 
 Long operations (loading, histogram accumulation, segmentation, RF
