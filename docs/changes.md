@@ -1,5 +1,42 @@
 # Bug-fix and cleanup notes
 
+## Selection panel and previous-timepoint marginals (latest)
+
+**Selection panel.** The named-class list under the histograms became a
+proper management panel: each row has a visibility checkbox, and the
+buttons are *Edit*, *Remove*, *Clear All*, *Show All*, *Hide All* and
+*Only This*.
+
+- **Visibility governs both display and segmentation.** A hidden class is
+  neither drawn on the histogram nor segmented, so what is shown always
+  equals what is segmented — the invariant the whole selection pipeline
+  rests on. `has_roi()`, `is_inside_roi()`, `get_multi_class_labels()`,
+  `get_named_roi_overlays()` and `_enumerate_roi_specs()` all filter on it.
+  *Only This* therefore isolates one class to work with in one click.
+- **Edit** moves a class back into the active ROI slot
+  (`ROIManager.take_named_roi`) so it can be reshaped, and removes it from
+  the list so it is never counted twice. Saving it again restores its
+  original name, class id and colour.
+- Visibility is persisted with the ROIs; files written before this change
+  have no `visible` key and default to visible.
+
+A crash was found and fixed while testing the panel: toggling a checkbox
+rebuilt the list from inside that item's own `itemChanged` handler, which
+deletes the item currently emitting the signal — a use-after-free that
+aborted the process. The row is now restyled in place. (A missing
+`_refresh_named_roi_overlays` after a refactor also surfaced this way:
+an `AttributeError` raised inside a Qt slot aborts rather than propagating,
+so both bugs presented as a hard crash.)
+
+**Marginal change vs previous timepoint.** *Analytics → Histogram Time
+Analysis* gains "Marginal Change vs Previous Timepoint", alongside the
+existing vs-T0 version. `compute_marginal_changes()` takes the same
+`reference` argument as the joint-histogram figures; in previous mode T0 is
+blank (no predecessor) and each later column shows only that step's change,
+so a band that moves once stands out instead of persisting in every later
+column. Bins empty in the denominator stay blank rather than saturating the
+colour scale.
+
 ## K-means highlight showed the previous plane (latest)
 
 **Symptom:** after K-means segmentation, changing the visualization plane

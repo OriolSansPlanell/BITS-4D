@@ -70,23 +70,27 @@ class ROIManager:
         self.roi_type = 'rectangle'
 
     def has_roi(self) -> bool:
-        """True if any ROI is defined (single or named)."""
-        return self.roi_type is not None or len(self.named_rois) > 0
+        """True if any ROI is currently in play (active or a visible class).
+
+        Hidden classes do not count: they are neither drawn nor segmented,
+        so with everything hidden and no active ROI there is nothing to do.
+        """
+        return self.roi_type is not None or len(self.get_visible_named_rois()) > 0
 
     def is_inside_roi(self, neutron_values: np.ndarray,
                       xray_values: np.ndarray) -> np.ndarray:
         """
-        Return a boolean mask for points inside *any* defined ROI.
+        Return a boolean mask for points inside *any* active ROI.
 
-        The mask is the union of every named class ROI and the active
-        ROI (when one is drawn), so it always matches what is shown on
-        the histogram canvases.
+        The mask is the union of every *visible* named class ROI and the
+        active ROI (when one is drawn), so it always matches what is shown
+        on the histogram canvases.
         """
         if not self.has_roi():
             raise ValueError("No ROI defined")
 
         result = np.zeros(neutron_values.shape, dtype=bool)
-        for roi in self.named_rois:
+        for roi in self.get_visible_named_rois():
             result |= self._mask_for_named_roi(roi, neutron_values, xray_values)
         if self.roi_type == 'polygon':
             result |= self._polygon_mask(
@@ -189,6 +193,7 @@ class ROIManager:
             'class_id': class_id,
             'roi_type': self.roi_type,
             'color': color,
+            'visible': True,
         }
         if self.roi_type == 'polygon':
             entry['points'] = self.polygon_points.copy()
@@ -212,8 +217,39 @@ class ROIManager:
         return len(self.named_rois) > 0
 
     def get_named_rois(self) -> List[dict]:
-        """Return a copy of the named ROI list."""
+        """Return a copy of the named ROI list (including hidden ones)."""
         return list(self.named_rois)
+
+    def get_visible_named_rois(self) -> List[dict]:
+        """Named ROIs that are currently shown and segmented."""
+        return [roi for roi in self.named_rois if roi.get('visible', True)]
+
+    def set_named_roi_visible(self, index: int, visible: bool) -> None:
+        """Show/hide one class.
+
+        Hidden classes are not drawn on the histogram and not segmented, so
+        the display and the segmentation result stay in agreement.
+        """
+        if 0 <= index < len(self.named_rois):
+            self.named_rois[index]['visible'] = bool(visible)
+
+    def take_named_roi(self, index: int) -> dict:
+        """Move a stored class back into the active ROI slot for editing.
+
+        The entry is removed from the class list and becomes the active ROI,
+        so it is never counted twice. The returned dict still holds its
+        ``name``/``class_id``/``color``, which lets the caller restore them
+        when saving it back as a class.
+        """
+        if not 0 <= index < len(self.named_rois):
+            raise IndexError(f"No named ROI at index {index}")
+
+        entry = self.named_rois.pop(index)
+        if entry['roi_type'] == 'polygon':
+            self.set_polygon_roi(np.asarray(entry['points']))
+        else:
+            self.set_rectangle_roi(*entry['rectangle'])
+        return entry
 
     def _mask_for_named_roi(self, roi: dict,
                              x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -247,13 +283,13 @@ class ROIManager:
         """
         labels = np.zeros(neutron_vol.shape, dtype=np.int32)
 
-        for roi in self.named_rois:
+        visible = self.get_visible_named_rois()
+        for roi in visible:
             mask = self._mask_for_named_roi(roi, neutron_vol, xray_vol)
             labels[mask] = roi['class_id']
         if self.roi_type is not None:
             active_class = (
-                max(r['class_id'] for r in self.named_rois) + 1
-                if self.named_rois else 1
+                max(r['class_id'] for r in visible) + 1 if visible else 1
             )
             labels[self._mask_for_active_roi(neutron_vol, xray_vol)] = active_class
 
@@ -264,10 +300,11 @@ class ROIManager:
         Return overlays list in the format expected by HistogramCanvas:
         [(name, vertices_Nx2, color), ...]
 
+        Only visible classes are returned, matching what is segmented.
         Rectangles are converted to 4-vertex polygons for uniform drawing.
         """
         overlays = []
-        for roi in self.named_rois:
+        for roi in self.get_visible_named_rois():
             color = roi.get('color', '#ff0000')
             label = f"Class {roi['class_id']}: {roi['name']}"
             if roi['roi_type'] == 'polygon':

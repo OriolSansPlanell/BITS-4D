@@ -18,6 +18,10 @@ back to voxels.
 - **Histogram-space ROIs** — rectangle and polygon tools, draggable-vertex
   editing, save/load to JSON, and named multi-class ROIs for multi-material
   segmentation.
+- **Selection panel** — manage every selection drawn on the histogram: show
+  or hide each class (hidden classes are excluded from segmentation too, so
+  you can work with one at a time), pull one back for reshaping with *Edit*,
+  rename, remove, or isolate with *Only This*.
 - **Spatial → histogram selection** — draw a rectangle or grow a region
   (2-D or full 3-D, univariate or bivariate) on the slice viewer and convert
   it into a histogram ROI automatically.
@@ -35,11 +39,11 @@ back to voxels.
   segmentation still running at full resolution), so time scrolling and
   slice browsing stay smooth on multi-gigabyte series.
 - **Histogram time analysis** — *Analytics → Histogram Time Analysis* saves
-  three complementary images: **evolution** (each timepoint vs T0, showing
-  cumulative drift), **incremental change** (each timepoint vs the previous
-  one, showing *when* events happen), and **marginal evolution** (each
-  modality's 1-D histogram against time, separating a neutron shift from an
-  X-ray shift).
+  four complementary images: joint-histogram **evolution** (each timepoint
+  vs T0, cumulative drift) and **incremental change** (vs the previous
+  timepoint, showing *when* events happen), plus the same pair for the
+  **marginals** (each modality's 1-D histogram against time, separating a
+  neutron shift from an X-ray shift).
 
 ## Installation
 
