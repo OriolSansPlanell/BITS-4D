@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QButtonGroup, QDoubleSpinBox, QListWidget, QListWidgetItem,
     QInputDialog, QMessageBox, QGroupBox
 )
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -338,15 +338,21 @@ class DualHistogramWidget(QWidget):
     """
     
     roi_updated = pyqtSignal()
-    
+    # Emitted with the class name when a saved class is pulled back for editing
+    editing_class_changed = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.roi_manager = ROIManager()
-        
+
         # Editable ROI handlers (will be created after canvases)
         self.global_editable_roi = None
         self.local_editable_roi = None
-        
+
+        # Identity of the class currently pulled back into the active ROI, so
+        # saving it again restores its name, class id and colour.
+        self._editing_class = None
+
         self.init_ui()
     
     def init_ui(self):
@@ -483,37 +489,87 @@ class DualHistogramWidget(QWidget):
 
         layout.addLayout(controls_layout)
 
-        # ── Named / multi-class ROI list ──────────────────────────────────────
-        roi_list_group = QGroupBox("Named Class ROIs  (for multi-class RF training)")
+        # ── Selection panel: manage the histogram selections ──────────────────
+        roi_list_group = QGroupBox(
+            "Histogram Selections  (classes for multi-class RF training)"
+        )
         roi_list_layout = QVBoxLayout()
         roi_list_layout.setContentsMargins(4, 4, 4, 4)
         roi_list_layout.setSpacing(3)
 
         self.roi_list_widget = QListWidget()
-        self.roi_list_widget.setMaximumHeight(90)
+        self.roi_list_widget.setMinimumHeight(110)
         self.roi_list_widget.setToolTip(
-            "Each row is a saved class ROI.\n"
-            "Double-click a row to rename it.\n"
-            "Select a row and click 'Remove Selected' to delete it."
+            "Every saved selection (class) drawn on the histogram.\n\n"
+            "• Untick a row to hide it — hidden selections are not drawn\n"
+            "  and not segmented.\n"
+            "• 'Edit' moves a selection back to the active ROI so you can\n"
+            "  reshape it, then save it as a class again.\n"
+            "• Double-click a row to rename it.\n"
+            "• 'Remove' deletes the highlighted selection."
         )
         self.roi_list_widget.itemDoubleClicked.connect(self._rename_roi_item)
+        self.roi_list_widget.itemChanged.connect(self._on_roi_item_changed)
+        self.roi_list_widget.currentRowChanged.connect(
+            self._update_selection_buttons
+        )
         roi_list_layout.addWidget(self.roi_list_widget)
 
         roi_list_btns = QHBoxLayout()
-        self.remove_class_btn = QPushButton("🗑 Remove Selected")
+        self.edit_class_btn = QPushButton("✏️ Edit")
+        self.edit_class_btn.setEnabled(False)
+        self.edit_class_btn.setToolTip(
+            "Work with this selection: it becomes the active ROI so you can\n"
+            "reshape or re-segment it. Save it as a class again when done."
+        )
+        self.edit_class_btn.clicked.connect(self._edit_selected_class)
+        roi_list_btns.addWidget(self.edit_class_btn)
+
+        self.remove_class_btn = QPushButton("🗑 Remove")
         self.remove_class_btn.setEnabled(False)
+        self.remove_class_btn.setToolTip("Delete the highlighted selection.")
         self.remove_class_btn.clicked.connect(self._remove_selected_class)
         roi_list_btns.addWidget(self.remove_class_btn)
 
-        self.clear_all_classes_btn = QPushButton("🗑 Clear All Classes")
+        self.clear_all_classes_btn = QPushButton("🗑 Clear All")
         self.clear_all_classes_btn.setEnabled(False)
+        self.clear_all_classes_btn.setToolTip("Delete every saved selection.")
         self.clear_all_classes_btn.clicked.connect(self._clear_all_classes)
         roi_list_btns.addWidget(self.clear_all_classes_btn)
         roi_list_layout.addLayout(roi_list_btns)
 
+        vis_btns = QHBoxLayout()
+        self.show_all_classes_btn = QPushButton("👁 Show All")
+        self.show_all_classes_btn.setEnabled(False)
+        self.show_all_classes_btn.clicked.connect(
+            lambda: self._set_all_classes_visible(True)
+        )
+        vis_btns.addWidget(self.show_all_classes_btn)
+
+        self.hide_all_classes_btn = QPushButton("🚫 Hide All")
+        self.hide_all_classes_btn.setEnabled(False)
+        self.hide_all_classes_btn.setToolTip(
+            "Hide every selection. Hidden selections are excluded from\n"
+            "segmentation, so you can work with one class at a time."
+        )
+        self.hide_all_classes_btn.clicked.connect(
+            lambda: self._set_all_classes_visible(False)
+        )
+        vis_btns.addWidget(self.hide_all_classes_btn)
+
+        self.only_selected_btn = QPushButton("🎯 Only This")
+        self.only_selected_btn.setEnabled(False)
+        self.only_selected_btn.setToolTip(
+            "Show only the highlighted selection and hide the rest, so\n"
+            "segmentation works with that one alone."
+        )
+        self.only_selected_btn.clicked.connect(self._isolate_selected_class)
+        vis_btns.addWidget(self.only_selected_btn)
+        roi_list_layout.addLayout(vis_btns)
+
         roi_list_group.setLayout(roi_list_layout)
         layout.addWidget(roi_list_group)
-        # ── End named ROI list ────────────────────────────────────────────────
+        # ── End selection panel ───────────────────────────────────────────────
 
         self.setLayout(layout)
     
@@ -569,8 +625,12 @@ class DualHistogramWidget(QWidget):
                                 "Draw and finish an ROI before saving it as a class.")
             return
 
-        n_existing = len(self.roi_manager.named_rois)
-        default_name = f"Class {n_existing + 1}"
+        # A class pulled back with 'Edit' keeps its identity by default
+        editing = self._editing_class
+        if editing is not None:
+            default_name = editing['name']
+        else:
+            default_name = f"Class {len(self.roi_manager.named_rois) + 1}"
 
         name, ok = QInputDialog.getText(
             self, "Name this class",
@@ -581,53 +641,164 @@ class DualHistogramWidget(QWidget):
             return
         name = name.strip()
 
-        class_id = self.roi_manager.add_named_roi(name)
+        if editing is not None:
+            self.roi_manager.add_named_roi(
+                name, class_id=editing['class_id'], color=editing['color']
+            )
+            self._editing_class = None
+        else:
+            self.roi_manager.add_named_roi(name)
+
         # Clear the active ROI so the canvas is ready for the next one
         self.roi_manager.clear_roi()
         self.save_class_btn.setEnabled(False)
 
         self._update_roi_list()
-        self._refresh_named_roi_overlays()
-        self.global_canvas.update_plot()
-        self.local_canvas.update_plot()
-        self.roi_updated.emit()
+        self._apply_roi_change()
 
     def _update_roi_list(self):
         """Rebuild the QListWidget from roi_manager.named_rois."""
+        # Repopulating fires itemChanged for every row; ignore those so the
+        # rebuild cannot be mistaken for the user toggling visibility.
+        self.roi_list_widget.blockSignals(True)
         self.roi_list_widget.clear()
         for roi in self.roi_manager.named_rois:
             label = (f"Class {roi['class_id']}  |  {roi['name']}  "
                      f"[{roi['roi_type']}]")
             item = QListWidgetItem(label)
-            try:
-                qc = QColor(roi['color'])
-                qc.setAlpha(60)
-                item.setBackground(qc)
-            except Exception:
-                pass
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            self._style_roi_item(item, roi)
             self.roi_list_widget.addItem(item)
+        self.roi_list_widget.blockSignals(False)
 
-        has_any = len(self.roi_manager.named_rois) > 0
-        self.remove_class_btn.setEnabled(has_any)
+        self._update_selection_buttons()
+
+    @staticmethod
+    def _style_roi_item(item, roi):
+        """Set one row's check state and colour from its ROI entry."""
+        visible = roi.get('visible', True)
+        item.setCheckState(Qt.Checked if visible else Qt.Unchecked)
+        try:
+            color = QColor(roi['color'])
+            color.setAlpha(60 if visible else 20)
+            item.setBackground(color)
+        except Exception:
+            pass
+
+    def _update_selection_buttons(self, *_args):
+        """Enable the panel's buttons according to the current selection."""
+        count = len(self.roi_manager.named_rois)
+        has_any = count > 0
+        has_current = 0 <= self.roi_list_widget.currentRow() < count
+
         self.clear_all_classes_btn.setEnabled(has_any)
+        self.show_all_classes_btn.setEnabled(has_any)
+        self.hide_all_classes_btn.setEnabled(has_any)
+        self.remove_class_btn.setEnabled(has_current)
+        self.edit_class_btn.setEnabled(has_current)
+        self.only_selected_btn.setEnabled(has_current)
 
     def _refresh_named_roi_overlays(self):
-        """Push current named ROIs to both canvases as coloured overlays."""
+        """Push the visible class ROIs to both canvases as coloured overlays."""
         overlays = self.roi_manager.get_named_roi_overlays()
         self.global_canvas.set_roi_overlays(overlays)
         self.local_canvas.set_roi_overlays(overlays)
 
-    def _remove_selected_class(self):
-        """Remove the highlighted class ROI from the named list."""
-        row = self.roi_list_widget.currentRow()
-        if row < 0:
-            return
-        self.roi_manager.remove_named_roi(row)
-        self._update_roi_list()
+    def _apply_roi_change(self):
+        """Refresh overlays, canvases and listeners after an ROI edit."""
         self._refresh_named_roi_overlays()
         self.global_canvas.update_plot()
         self.local_canvas.update_plot()
         self.roi_updated.emit()
+
+    def _on_roi_item_changed(self, item):
+        """Checkbox toggled: show/hide that class.
+
+        Restyles the row in place. Rebuilding the list here would delete the
+        very item whose signal is being handled, which crashes Qt.
+        """
+        row = self.roi_list_widget.row(item)
+        if not 0 <= row < len(self.roi_manager.named_rois):
+            return
+        visible = item.checkState() == Qt.Checked
+        if self.roi_manager.named_rois[row].get('visible', True) == visible:
+            return
+
+        self.roi_manager.set_named_roi_visible(row, visible)
+        self.roi_list_widget.blockSignals(True)
+        self._style_roi_item(item, self.roi_manager.named_rois[row])
+        self.roi_list_widget.blockSignals(False)
+        self._apply_roi_change()
+
+    def _set_all_classes_visible(self, visible: bool):
+        """Show or hide every saved selection at once."""
+        for index in range(len(self.roi_manager.named_rois)):
+            self.roi_manager.set_named_roi_visible(index, visible)
+        self._update_roi_list()
+        self._apply_roi_change()
+
+    def _isolate_selected_class(self):
+        """Show only the highlighted selection, hiding the others."""
+        row = self.roi_list_widget.currentRow()
+        if not 0 <= row < len(self.roi_manager.named_rois):
+            return
+        for index in range(len(self.roi_manager.named_rois)):
+            self.roi_manager.set_named_roi_visible(index, index == row)
+        self._update_roi_list()
+        self.roi_list_widget.setCurrentRow(row)
+        self._apply_roi_change()
+
+    def _edit_selected_class(self):
+        """Move the highlighted class back into the active ROI for editing."""
+        row = self.roi_list_widget.currentRow()
+        if not 0 <= row < len(self.roi_manager.named_rois):
+            return
+
+        if self.roi_manager.roi_type is not None:
+            reply = QMessageBox.question(
+                self, "Replace Active ROI",
+                "There is already an active ROI being drawn.\n\n"
+                "Editing this class will discard it. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        entry = self.roi_manager.take_named_roi(row)
+        # Remember its identity so saving it again restores name/class/colour
+        self._editing_class = {
+            'name': entry['name'],
+            'class_id': entry['class_id'],
+            'color': entry.get('color'),
+        }
+
+        if self.editable_roi_cb.isChecked():
+            self.global_editable_roi.draw_editable_roi()
+            self.local_editable_roi.draw_editable_roi()
+
+        self.save_class_btn.setEnabled(True)
+        self._update_roi_list()
+        self._apply_roi_change()
+        self.editing_class_changed.emit(entry['name'])
+
+    def _remove_selected_class(self):
+        """Remove the highlighted class ROI from the named list."""
+        row = self.roi_list_widget.currentRow()
+        if not 0 <= row < len(self.roi_manager.named_rois):
+            return
+        name = self.roi_manager.named_rois[row]['name']
+        reply = QMessageBox.question(
+            self, "Remove Selection",
+            f"Remove '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.roi_manager.remove_named_roi(row)
+        self._update_roi_list()
+        self._apply_roi_change()
 
     def _clear_all_classes(self):
         """Remove all named class ROIs after confirmation."""

@@ -86,10 +86,24 @@ locks this property in; keep it green when touching any of these modules.
 - an **active ROI** (`roi_type`, `polygon_points` / `rectangle`) — the shape
   currently drawn/edited on the canvases, and
 - a list of **named class ROIs** (`named_rois`) — saved classes for
-  multi-material workflows.
+  multi-material workflows, each with a `visible` flag.
 
-`is_inside_roi()` returns the union of *all* of them, and the GUI's segment
-actions enumerate named ROIs **plus** the active one
+**Visibility is not just a display flag**: a hidden class is excluded from
+the overlays *and* from segmentation (`has_roi`, `is_inside_roi`,
+`get_multi_class_labels`, `get_named_roi_overlays`,
+`_enumerate_roi_specs`). Keeping those in step is what preserves the
+invariant that the selection shown on the histogram is the selection that
+gets segmented — any new consumer of `named_rois` should filter through
+`get_visible_named_rois()`.
+
+`take_named_roi(index)` moves a class back into the active slot for
+reshaping and removes it from the list, so a class being edited is never
+counted twice; the returned entry carries the name/class_id/colour needed
+to restore its identity when it is saved again.
+
+`is_inside_roi()` returns the union of the visible classes and the active
+ROI, and the GUI's segment actions enumerate visible classes **plus** the
+active one
 (`BiTS4DMainWindow._enumerate_roi_specs`), so the segmentation result always
 matches the selection shown on screen. Polygon containment uses a
 bounding-box prefilter before `matplotlib.path.Path.contains_points`, which

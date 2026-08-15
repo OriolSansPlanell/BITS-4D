@@ -179,23 +179,67 @@ def compute_marginals(histograms: Sequence) -> tuple:
     return np.asarray(neutron), np.asarray(xray)
 
 
+def compute_marginal_changes(
+    marginals: np.ndarray,
+    reference: str = REFERENCE_FIRST,
+) -> np.ndarray:
+    """log2 change of a marginal stack, per timepoint.
+
+    With ``reference="first"`` every row is compared with T0, giving
+    cumulative drift and a first row of zeros. With ``reference="previous"``
+    each row is compared with the row before it, giving the per-step change;
+    the first row is NaN because it has no predecessor.
+
+    Bins that are empty in the denominator become NaN rather than infinity,
+    so they are drawn blank instead of saturating the colour scale.
+    """
+    marginals = np.asarray(marginals, dtype=np.float64)
+    if reference == REFERENCE_FIRST:
+        denominator = np.broadcast_to(marginals[0], marginals.shape)
+        numerator = marginals
+    elif reference == REFERENCE_PREVIOUS:
+        denominator = marginals[:-1]
+        numerator = marginals[1:]
+    else:
+        raise ValueError(
+            f"reference must be {REFERENCE_FIRST!r} or {REFERENCE_PREVIOUS!r}"
+        )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        change = np.log2(numerator / denominator)
+    change = np.where(np.isfinite(change), change, np.nan)
+
+    if reference == REFERENCE_PREVIOUS:
+        # Keep one row per timepoint so the time axis still lines up; T0 has
+        # no predecessor and stays blank.
+        leading = np.full((1, marginals.shape[1]), np.nan)
+        change = np.vstack([leading, change])
+    return change
+
+
 def save_marginal_evolution_image(
     histograms: Sequence,
     output_path: str,
     dpi: int = 150,
+    reference_mode: str = REFERENCE_FIRST,
 ) -> str:
     """Save marginal kymographs: each modality's 1-D histogram versus time.
 
     Two panels (neutron, X-ray) with time on the x-axis and intensity on the
-    y-axis, coloured by ``log2(m_t / m_0)`` — the change in each intensity
-    band relative to the first timepoint. Red bands grew, blue bands shrank.
-    Bins empty at T0 are left blank rather than allowed to saturate the
-    scale. The colour range is the 99th percentile of |change|, so a few
-    extreme bins do not flatten the rest.
+    y-axis, coloured by the log2 change of each intensity band. Red bands
+    grew, blue bands shrank.
+
+    ``reference_mode="first"`` compares every timepoint with T0 (cumulative
+    drift); ``"previous"`` compares each timepoint with the one before it, so
+    the steps where a band actually moves stand out. Bins empty in the
+    denominator are left blank rather than saturating the scale, and the
+    colour range is the 99th percentile of |change| so a few extreme bins do
+    not flatten the rest.
     """
     neutron_marginals, xray_marginals = compute_marginals(histograms)
     reference = histograms[0]
     num_timepoints = len(histograms)
+    incremental = reference_mode == REFERENCE_PREVIOUS
 
     fig = Figure(figsize=(13, 4.8), dpi=dpi)
     FigureCanvasAgg(fig)
@@ -206,9 +250,7 @@ def save_marginal_evolution_image(
         (axes[1], xray_marginals, reference.y_centers, "X-ray Intensity"),
     )
     for ax, marginals, centers, label in panels:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            change = np.log2(marginals / marginals[0])
-        change[~np.isfinite(change)] = np.nan
+        change = compute_marginal_changes(marginals, reference_mode)
 
         finite = np.abs(change[np.isfinite(change)])
         limit = float(np.percentile(finite, 99)) if finite.size else 0.0
@@ -222,10 +264,15 @@ def save_marginal_evolution_image(
         )
         ax.set_xlabel("Timepoint")
         ax.set_ylabel(label)
-        ax.set_title(f"{label} marginal — log2 vs T0")
+        ax.set_title(
+            f"{label} marginal — log2 vs previous" if incremental
+            else f"{label} marginal — log2 vs T0"
+        )
         fig.colorbar(image, ax=ax, label="log2 population change")
 
     fig.suptitle(
+        "Marginal change per step (each timepoint vs the previous)"
+        if incremental else
         "Marginal evolution of neutron and X-ray intensities over time",
         fontsize=14,
     )

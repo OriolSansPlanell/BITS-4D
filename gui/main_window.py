@@ -2630,17 +2630,30 @@ class BiTS4DMainWindow(QMainWindow):
         hist_menu.addAction(hist_increment_action)
 
         hist_marginal_action = QAction(
-            "Marginal Evolution (Neutron / X-ray)...", self
+            "Marginal Evolution vs First Timepoint...", self
         )
         hist_marginal_action.setToolTip(
             "Save marginal kymographs: each modality's 1-D histogram against\n"
-            "time. Separates a shift in neutron from a shift in X-ray, which\n"
-            "the joint histogram can hide."
+            "time, compared with T0. Separates a shift in neutron from a\n"
+            "shift in X-ray, which the joint histogram can hide."
         )
         hist_marginal_action.triggered.connect(
             self._on_export_marginal_evolution
         )
         hist_menu.addAction(hist_marginal_action)
+
+        hist_marginal_increment_action = QAction(
+            "Marginal Change vs Previous Timepoint...", self
+        )
+        hist_marginal_increment_action.setToolTip(
+            "Same marginal kymographs, but each timepoint is compared with\n"
+            "the one before it — shows the steps where an intensity band\n"
+            "actually moves rather than the drift accumulated since T0."
+        )
+        hist_marginal_increment_action.triggered.connect(
+            self._on_export_marginal_increment
+        )
+        hist_menu.addAction(hist_marginal_increment_action)
 
         analytics_menu.addSeparator()
         
@@ -3842,11 +3855,11 @@ class BiTS4DMainWindow(QMainWindow):
         """Return an RGBA colour for the next segmentation layer.
 
         Priority:
-          1. The last named ROI's colour (if named ROIs exist).
+          1. The last visible named ROI's colour (if any exist).
           2. Cycle through the default palette.
         """
-        if roi_manager.has_named_rois():
-            named = roi_manager.get_named_rois()
+        named = roi_manager.get_visible_named_rois()
+        if named:
             hex_color = named[-1].get('color', '#e6194b')
             try:
                 import matplotlib.colors as mcolors
@@ -3858,8 +3871,8 @@ class BiTS4DMainWindow(QMainWindow):
 
     def _current_roi_name(self, roi_manager) -> str:
         """Return a human-readable label for the current active ROI."""
-        if roi_manager.has_named_rois():
-            named = roi_manager.get_named_rois()
+        named = roi_manager.get_visible_named_rois()
+        if named:
             return named[-1].get('name', 'ROI')
         if roi_manager.roi_type == 'polygon':
             return 'Polygon ROI'
@@ -3947,12 +3960,13 @@ class BiTS4DMainWindow(QMainWindow):
     def _enumerate_roi_specs(roi_manager):
         """Return every ROI to segment as a list of uniform spec dicts.
 
-        Includes all named class ROIs plus the active (unsaved) ROI so that
-        segmentation always covers exactly the selection displayed on the
-        histogram canvases.
+        Includes every *visible* named class ROI plus the active (unsaved)
+        ROI, so segmentation always covers exactly the selection displayed on
+        the histogram canvases. Classes hidden in the selection panel are
+        neither drawn nor segmented.
         """
         specs = []
-        for roi in roi_manager.get_named_rois():
+        for roi in roi_manager.get_visible_named_rois():
             spec = {
                 'name': roi['name'],
                 'roi_type': roi['roi_type'],
@@ -5511,16 +5525,37 @@ class BiTS4DMainWindow(QMainWindow):
         )
 
     def _on_export_marginal_evolution(self):
-        """Save marginal kymographs of each modality against time."""
-        from utils.histogram_evolution import save_marginal_evolution_image
+        """Save marginal kymographs of each modality against T0."""
+        from utils.histogram_evolution import (
+            REFERENCE_FIRST, save_marginal_evolution_image,
+        )
 
         self._run_histogram_time_analysis(
             "Marginal Evolution",
             "Save Marginal Evolution Image",
-            save_marginal_evolution_image,
+            lambda histograms, path: save_marginal_evolution_image(
+                histograms, path, reference_mode=REFERENCE_FIRST
+            ),
             "Each panel stacks one modality's 1-D histogram against time "
             "(log2 vs T0). Red intensity bands grew, blue bands shrank — "
             "this separates a shift in neutron from a shift in X-ray.",
+        )
+
+    def _on_export_marginal_increment(self):
+        """Save marginal kymographs comparing each timepoint with the previous."""
+        from utils.histogram_evolution import (
+            REFERENCE_PREVIOUS, save_marginal_evolution_image,
+        )
+
+        self._run_histogram_time_analysis(
+            "Incremental Marginal Change",
+            "Save Incremental Marginal Change Image",
+            lambda histograms, path: save_marginal_evolution_image(
+                histograms, path, reference_mode=REFERENCE_PREVIOUS
+            ),
+            "Each column compares a timepoint with the one before it, so the "
+            "steps where an intensity band actually moves stand out. T0 is "
+            "blank because it has no predecessor.",
         )
 
     def _on_morphological_analysis(self):

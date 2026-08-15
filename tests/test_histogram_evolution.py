@@ -8,6 +8,7 @@ from utils.histogram_evolution import (
     REFERENCE_FIRST,
     REFERENCE_PREVIOUS,
     compute_log_differences,
+    compute_marginal_changes,
     compute_marginals,
     save_histogram_evolution_image,
     save_marginal_evolution_image,
@@ -126,6 +127,51 @@ def test_marginals_normalize_away_differing_voxel_counts():
     )
     np.testing.assert_allclose(neutron_marginals[0], neutron_marginals[1])
     np.testing.assert_allclose(xray_marginals[0], xray_marginals[1])
+
+
+def test_marginal_changes_vs_first_are_cumulative():
+    marginals = np.array([[0.25, 0.75], [0.5, 0.5], [0.5, 0.5]])
+    change = compute_marginal_changes(marginals, REFERENCE_FIRST)
+    assert change.shape == marginals.shape
+    np.testing.assert_allclose(change[0], 0.0)          # T0 vs itself
+    # T1 and T2 are identical, so both keep the same cumulative change
+    np.testing.assert_allclose(change[1], change[2])
+    np.testing.assert_allclose(change[1], [1.0, np.log2(0.5 / 0.75)])
+
+
+def test_marginal_changes_vs_previous_isolate_each_step():
+    marginals = np.array([[0.25, 0.75], [0.5, 0.5], [0.5, 0.5]])
+    change = compute_marginal_changes(marginals, REFERENCE_PREVIOUS)
+    assert change.shape == marginals.shape
+    assert np.all(np.isnan(change[0])), "T0 has no predecessor"
+    np.testing.assert_allclose(change[1], [1.0, np.log2(0.5 / 0.75)])
+    # Nothing changed between T1 and T2, so that step is flat
+    np.testing.assert_allclose(change[2], 0.0)
+
+
+def test_marginal_changes_blank_empty_reference_bins():
+    marginals = np.array([[0.0, 1.0], [0.5, 0.5]])
+    change = compute_marginal_changes(marginals, REFERENCE_PREVIOUS)
+    assert np.isnan(change[1, 0]), "growth from an empty bin must be blank"
+    assert np.isfinite(change[1, 1])
+
+
+def test_marginal_changes_reject_unknown_reference():
+    with pytest.raises(ValueError):
+        compute_marginal_changes(np.ones((2, 2)), "elsewhere")
+
+
+def test_incremental_marginal_image_is_written(tmp_path):
+    rng = np.random.default_rng(5)
+    neutron = rng.uniform(0, 100, size=(4, 2, 8, 8))
+    xray = rng.uniform(0, 100, size=neutron.shape)
+    output = tmp_path / "marginals_prev.png"
+    saved = save_marginal_evolution_image(
+        _histograms_for(neutron, xray), str(output),
+        reference_mode=REFERENCE_PREVIOUS,
+    )
+    assert saved == str(output)
+    assert output.stat().st_size > 1000
 
 
 def test_marginal_image_file_is_written(tmp_path):
