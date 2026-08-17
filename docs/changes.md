@@ -1,5 +1,44 @@
 # Bug-fix and cleanup notes
 
+## Edited ROIs rewrote what had already been segmented (latest)
+
+**Symptom:** after editing a histogram region, the segmented volume no
+longer matched the selection, and training the Random Forest showed the
+region as "modified" with parts of the ROI apparently unselected.
+
+**Root cause:** the outline recorded for a segmented layer was the *same
+NumPy array object* as the live ROI (`np.asarray` returns the input
+unchanged for a float64 array, and `EditableROIHandler` mutated
+`polygon_points` in place while dragging). Editing a vertex therefore
+rewrote the record of an already-segmented layer retroactively: the
+histogram drew the *edited* shape while the mask — and the RF labels built
+from it — came from the *original* shape. The two genuinely disagreed.
+
+**Fix:** ROI geometry is now snapshotted at every boundary where it is
+stored or handed off.
+
+- `EditableROIHandler` replaces the point array instead of mutating it, so
+  snapshots taken earlier stay valid.
+- `ROIManager.set_polygon_roi` stores an independent float copy, and the new
+  `get_active_vertices()` returns a fresh outline.
+- `_record_layer_shape`, `_roi_spec_vertices` and `_enumerate_roi_specs`
+  copy, so a worker thread segmenting in the background cannot see the ROI
+  change under it.
+
+A layer's overlay therefore keeps showing the ROI that produced its mask.
+Editing the active ROI after segmenting no longer alters the stored layer —
+re-run "Segment Current" to apply the new shape.
+
+## Unsaved selections now appear in the selection panel
+
+Only saved classes were listed, so a region being drawn was invisible in
+the panel. The active ROI is now shown as an italic "✎ (unsaved selection)"
+row after the saved classes. It has no class id or visibility checkbox
+until it is saved; *Remove* discards it (leaving classes untouched), *Only
+This* hides every saved class so it is segmented alone, and double-clicking
+it saves it as a class.
+
+
 ## Selection panel and previous-timepoint marginals (latest)
 
 **Selection panel.** The named-class list under the histograms became a

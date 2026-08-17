@@ -101,6 +101,16 @@ reshaping and removes it from the list, so a class being edited is never
 counted twice; the returned entry carries the name/class_id/colour needed
 to restore its identity when it is saved again.
 
+**Snapshot ROI geometry whenever it is stored or handed off.** Segmentation
+layers, saved classes and worker-thread specs all keep a record of the ROI
+that produced them, and an ROI can be edited afterwards. Use
+`get_active_vertices()` (or an explicit `np.array(..., dtype=float)`) rather
+than `np.asarray`, which returns the *same object* for a float64 array and
+silently aliases the live ROI — that aliasing made an edit rewrite the
+record of an already-segmented layer, so the histogram and the mask
+disagreed. For the same reason `EditableROIHandler` replaces the point array
+on each drag instead of mutating it in place.
+
 `is_inside_roi()` returns the union of the visible classes and the active
 ROI, and the GUI's segment actions enumerate visible classes **plus** the
 active one

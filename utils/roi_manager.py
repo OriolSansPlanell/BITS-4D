@@ -59,8 +59,26 @@ class ROIManager:
     def set_polygon_roi(self, points: np.ndarray) -> None:
         if len(points) < 3:
             raise ValueError("Polygon must have at least 3 points")
-        self.polygon_points = np.array(points)
+        # Always store an independent float copy so the caller's array cannot
+        # be mutated through this ROI (or vice versa).
+        self.polygon_points = np.array(points, dtype=float)
         self.roi_type = 'polygon'
+
+    def get_active_vertices(self) -> Optional[np.ndarray]:
+        """Snapshot of the active ROI's outline, or None if there is none.
+
+        Returns a fresh array: callers keep these as a record of what was
+        segmented, so later edits to the ROI must not alter them.
+        """
+        if self.roi_type == 'polygon':
+            return np.array(self.polygon_points, dtype=float)
+        if self.roi_type == 'rectangle':
+            x_min, y_min, x_max, y_max = self.rectangle
+            return np.array(
+                [[x_min, y_min], [x_max, y_min],
+                 [x_max, y_max], [x_min, y_max]], dtype=float
+            )
+        return None
 
     def set_rectangle_roi(self, x_min: float, y_min: float,
                           x_max: float, y_max: float) -> None:
