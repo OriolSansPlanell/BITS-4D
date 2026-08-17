@@ -107,6 +107,21 @@ invariant that the selection shown on the histogram is the selection that
 gets segmented — any new consumer of `named_rois` should filter through
 `get_visible_named_rois()`.
 
+The same applies to the **segmentation layers already computed** from a
+class. A layer carries the name of the ROI that produced it, which is how
+`BiTS4DMainWindow._visible_layers(timepoint)` matches it back to that class's
+tick. Read layers through that helper — not `segmentation_masks` directly —
+wherever they are displayed or trained on, or unticking a class will leave
+its old segmentation on screen. The masks are kept rather than deleted, so
+re-ticking restores the layer instantly.
+
+Removing a class is the destructive case, and the panel does not own the
+layers, so the two sides are wired explicitly:
+`DualHistogramWidget.layer_count_provider` (set by the window) reports how
+many layers a class produced, and `class_removed(name, discard)` carries the
+user's answer back. The panel asks only when layers exist, and never decides
+by itself whether to throw them away.
+
 `take_named_roi(index)` moves a class back into the active slot for
 reshaping and removes it from the list, so a class being edited is never
 counted twice; the returned entry carries the name/class_id/colour needed

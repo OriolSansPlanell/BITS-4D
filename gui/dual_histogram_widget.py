@@ -375,10 +375,17 @@ class DualHistogramWidget(QWidget):
     roi_updated = pyqtSignal()
     # Emitted with the class name when a saved class is pulled back for editing
     editing_class_changed = pyqtSignal(str)
+    # Emitted as (class name, discard_segmentation) when a class is removed
+    class_removed = pyqtSignal(str, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.roi_manager = ROIManager()
+
+        # Set by the main window: given a class name, returns how many
+        # segmentation layers were computed from it. Without it the panel
+        # simply does not offer to discard anything.
+        self.layer_count_provider = None
 
         # Editable ROI handlers (will be created after canvases)
         self.global_editable_roi = None
@@ -886,28 +893,91 @@ class DualHistogramWidget(QWidget):
         if not 0 <= row < self._named_count():
             return
         name = self.roi_manager.named_rois[row]['name']
-        reply = QMessageBox.question(
-            self, "Remove Selection",
-            f"Remove '{name}'?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if reply != QMessageBox.Yes:
-            return
+
+        layer_count = 0
+        if callable(self.layer_count_provider):
+            try:
+                layer_count = int(self.layer_count_provider(name))
+            except Exception:
+                layer_count = 0
+
+        if layer_count:
+            # Removing the class would otherwise leave its already-computed
+            # segmentation behind with nothing in the panel controlling it,
+            # so ask rather than decide silently either way.
+            reply = QMessageBox.question(
+                self, "Remove Selection",
+                f"Remove '{name}'?\n\n"
+                f"{layer_count} segmentation layer(s) were computed from it.\n\n"
+                "• Yes — remove the class and discard its segmentation\n"
+                "• No — remove the class but keep its segmentation\n"
+                "• Cancel — keep everything",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            discard = reply == QMessageBox.Yes
+        else:
+            reply = QMessageBox.question(
+                self, "Remove Selection",
+                f"Remove '{name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            discard = False
+
         self.roi_manager.remove_named_roi(row)
+        # Announce before refreshing so the single redraw below already
+        # reflects any discarded layers.
+        self.class_removed.emit(name, discard)
         self._update_roi_list()
         self._apply_roi_change()
 
     def _clear_all_classes(self):
         """Remove all named class ROIs after confirmation."""
-        reply = QMessageBox.question(
-            self, "Clear All Classes",
-            "Remove all saved class ROIs?\nThis cannot be undone.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
+        names = [roi['name'] for roi in self.roi_manager.named_rois]
+        if not names:
             return
+
+        layer_count = 0
+        if callable(self.layer_count_provider):
+            try:
+                layer_count = sum(
+                    int(self.layer_count_provider(name)) for name in names
+                )
+            except Exception:
+                layer_count = 0
+
+        if layer_count:
+            reply = QMessageBox.question(
+                self, "Clear All Classes",
+                f"Remove all {len(names)} saved class ROIs?\n\n"
+                f"{layer_count} segmentation layer(s) were computed from them.\n\n"
+                "• Yes — remove the classes and discard their segmentation\n"
+                "• No — remove the classes but keep their segmentation\n"
+                "• Cancel — keep everything",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            discard = reply == QMessageBox.Yes
+        else:
+            reply = QMessageBox.question(
+                self, "Clear All Classes",
+                "Remove all saved class ROIs?\nThis cannot be undone.",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+            discard = False
+
         self.roi_manager.clear_named_rois()
+        for name in names:
+            self.class_removed.emit(name, discard)
         self._update_roi_list()
         self._apply_roi_change()
 
