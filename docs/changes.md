@@ -1,5 +1,26 @@
 # Bug-fix and cleanup notes
 
+## Removing a class asks about its segmentation (latest)
+
+Unticking a class hides the segmentation computed from it, but *removing*
+the class left that layer behind with nothing in the panel controlling it.
+Rather than pick an outcome silently, **Remove** (and **Clear All**) now ask
+when layers exist:
+
+* **Yes** — remove the class and discard its segmentation,
+* **No** — remove the class but keep its segmentation as an ordinary layer,
+* **Cancel** — keep everything.
+
+A class with no segmentation still gets the plain confirmation, so the extra
+question only appears when there is something to lose.
+
+The panel owns the ROIs and the main window owns the layers, so they are
+wired together explicitly: `DualHistogramWidget.layer_count_provider` reports
+how many layers a class produced (the panel offers nothing to discard
+without it), and `class_removed(name, discard)` tells the window what the
+user chose. Discarding also clears that layer's recorded outline and its
+binned-mask and derived-hull cache entries.
+
 ## Unticking a class left its segmentation on screen (latest)
 
 **Symptom:** segment an ROI, untick it in the selection panel, segment a

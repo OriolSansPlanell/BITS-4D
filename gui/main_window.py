@@ -2092,6 +2092,10 @@ class BiTS4DMainWindow(QMainWindow):
         hist_layout = QVBoxLayout()
         self.dual_histogram = DualHistogramWidget()
         self.dual_histogram.roi_updated.connect(self._on_roi_updated)
+        # The panel owns the ROIs, this window owns the segmentation layers,
+        # so removing a class has to ask here what it would throw away.
+        self.dual_histogram.layer_count_provider = self._count_layers_for_class
+        self.dual_histogram.class_removed.connect(self._on_class_removed)
         hist_layout.addWidget(self.dual_histogram)
 
         seg_btns = QHBoxLayout()
@@ -3927,6 +3931,44 @@ class BiTS4DMainWindow(QMainWindow):
             for roi in dual_histogram.get_roi_manager().named_rois
             if not roi.get('visible', True)
         }
+
+    def _count_layers_for_class(self, name):
+        """How many stored segmentation layers came from class *name*."""
+        return sum(
+            1
+            for layers in self.segmentation_masks.values()
+            for layer in layers
+            if layer[2] == name
+        )
+
+    @pyqtSlot(str, bool)
+    def _on_class_removed(self, name, discard_segmentation):
+        """A class was removed from the selection panel.
+
+        Its segmentation layers are only deleted when the user chose to
+        discard them; otherwise they stay as ordinary layers (now with no
+        class controlling their visibility).
+        """
+        if not discard_segmentation:
+            return
+
+        removed = 0
+        for timepoint in list(self.segmentation_masks):
+            layers = self.segmentation_masks[timepoint]
+            kept = [layer for layer in layers if layer[2] != name]
+            if len(kept) == len(layers):
+                continue
+            removed += len(layers) - len(kept)
+            self.segmentation_masks[timepoint] = kept
+            for cache in (self.segmentation_layer_shapes,
+                          self._derived_outline_cache,
+                          self._display_mask_cache):
+                cache.pop((int(timepoint), name), None)
+
+        if removed:
+            self.status_bar.showMessage(
+                f"Removed '{name}' and discarded {removed} segmentation layer(s)"
+            )
 
     def _visible_layers(self, timepoint):
         """Segmentation layers for *timepoint* whose class is not hidden.

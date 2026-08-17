@@ -115,6 +115,13 @@ wherever they are displayed or trained on, or unticking a class will leave
 its old segmentation on screen. The masks are kept rather than deleted, so
 re-ticking restores the layer instantly.
 
+Removing a class is the destructive case, and the panel does not own the
+layers, so the two sides are wired explicitly:
+`DualHistogramWidget.layer_count_provider` (set by the window) reports how
+many layers a class produced, and `class_removed(name, discard)` carries the
+user's answer back. The panel asks only when layers exist, and never decides
+by itself whether to throw them away.
+
 `take_named_roi(index)` moves a class back into the active slot for
 reshaping and removes it from the list, so a class being edited is never
 counted twice; the returned entry carries the name/class_id/colour needed
