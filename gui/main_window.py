@@ -3791,19 +3791,31 @@ class BiTS4DMainWindow(QMainWindow):
         except ImportError:
             return
 
-        overlays = []
+        # This method owns the histogram overlay list while a dataset is
+        # loaded, so it must include the saved class ROIs as well — otherwise
+        # it would wipe the outlines the selection panel just drew.
+        roi_manager = self.dual_histogram.get_roi_manager()
+        overlays = list(roi_manager.get_named_roi_overlays())
+        # Layers created from one of those classes repeat its exact shape, so
+        # only add an outline for layers that show something new (RF, Otsu,
+        # K-means, or the unsaved active ROI).
+        class_names = {roi['name'] for roi in roi_manager.get_visible_named_rois()}
 
         # ── Layer 1: original segmentation hulls (dashed, used as training) ───
         # Use the training reference timepoint's masks for comparison context
         # (also shown on the current timepoint for reference)
+        # Layers of unticked classes are left out here too, so hiding a class
+        # removes its outline from the histogram as well as its highlight.
         ref_t    = self.rf_ref_spin.value() if hasattr(self, 'rf_ref_spin') else 0
-        ref_masks = self.segmentation_masks.get(ref_t, [])
+        ref_masks = self._visible_layers(ref_t)
         if ref_masks and ref_t != timepoint:
             # Show as a visual reference using the ref timepoint volumes
             try:
                 import matplotlib.colors as mcolors
                 ref_n, ref_x = self.dataset.get_volume_at_time(ref_t)
                 for mask_3d, color, name in ref_masks:
+                    if name in class_names:
+                        continue    # already drawn as a class ROI
                     try:
                         verts = self._layer_outline(
                             ref_t, name, mask_3d, ref_n, ref_x
@@ -3820,8 +3832,10 @@ class BiTS4DMainWindow(QMainWindow):
                 pass
 
         # Current timepoint segmentation masks (solid outline for "manual here")
-        cur_masks = self.segmentation_masks.get(timepoint, [])
+        cur_masks = self._visible_layers(timepoint)
         for mask_3d, color, name in cur_masks:
+            if name in class_names:
+                continue    # already drawn as a class ROI
             try:
                 verts = self._layer_outline(
                     timepoint, name, mask_3d, neutron_vol, xray_vol
@@ -3899,6 +3913,34 @@ class BiTS4DMainWindow(QMainWindow):
             return 'Rectangle ROI'
         return 'ROI'
 
+    def _hidden_class_names(self):
+        """Names of the classes currently unticked in the selection panel.
+
+        A layer keeps the name of the ROI that produced it, so this is what
+        links a hidden class to the segmentation it already created.
+        """
+        dual_histogram = getattr(self, "dual_histogram", None)
+        if dual_histogram is None:
+            return set()
+        return {
+            roi['name']
+            for roi in dual_histogram.get_roi_manager().named_rois
+            if not roi.get('visible', True)
+        }
+
+    def _visible_layers(self, timepoint):
+        """Segmentation layers for *timepoint* whose class is not hidden.
+
+        Unticking a class hides the segmentation it produced as well as its
+        ROI; the mask stays stored, so ticking the class back on brings the
+        layer straight back.
+        """
+        hidden = self._hidden_class_names()
+        return [
+            layer for layer in self.segmentation_masks.get(timepoint, [])
+            if layer[2] not in hidden
+        ]
+
     def _compose_slice_overlays(self, timepoint):
         """Build the slice-viewer overlay list for *timepoint*.
 
@@ -3910,10 +3952,13 @@ class BiTS4DMainWindow(QMainWindow):
           slice index and the viewing plane;
         * visible saved selections — 2-D single-slice masks, shown only
           while "Show All on Histogram" is enabled.
+
+        Layers belonging to an unticked class are left out, so hiding a
+        class hides its segmentation too.
         """
         overlays = [
             (name, self._binned_display_mask(timepoint, name, mask_3d), color)
-            for mask_3d, color, name in self.segmentation_masks.get(timepoint, [])
+            for mask_3d, color, name in self._visible_layers(timepoint)
         ]
 
         manager = getattr(self, "selection_manager", None)
@@ -4343,12 +4388,22 @@ class BiTS4DMainWindow(QMainWindow):
             self.dataset.xray_data[ref_t],
         )
 
-        # ── Validate: need at least one segmentation layer for ref_t ──────────
-        layers = self.segmentation_masks.get(ref_t, [])
+        # ── Validate: need at least one visible segmentation layer for ref_t ──
+        # Classes unticked in the selection panel are not part of the current
+        # segmentation, so the RF must not be trained on them either.
+        layers = self._visible_layers(ref_t)
+        hidden_count = len(self.segmentation_masks.get(ref_t, [])) - len(layers)
         if not layers:
+            stored = len(self.segmentation_masks.get(ref_t, []))
+            extra = (
+                f"\n\n{stored} layer(s) exist for this timepoint but their "
+                "classes are unticked in the selection panel — tick them to "
+                "train on them."
+                if stored else ""
+            )
             QMessageBox.warning(
                 self, "No Segmentation for Reference Timepoint",
-                f"No segmentation masks found for timepoint {ref_t}.\n\n"
+                f"No segmentation masks available for timepoint {ref_t}.{extra}\n\n"
                 "Workflow:\n"
                 "  1. Draw ROIs on the histogram\n"
                 "  2. Click '✂ Segment Current' to create the 3-D masks\n"
@@ -4412,6 +4467,8 @@ class BiTS4DMainWindow(QMainWindow):
 
         acc_pct     = stats.get("training_accuracy", 0) * 100
         layer_names = ", ".join(lyr[2] for lyr in layers)
+        if hidden_count:
+            layer_names += f"  ({hidden_count} hidden class(es) excluded)"
 
         self.rf_status_label.setText(
             f"Status: trained ✓  |  {len(layers)} class(es)  |  "

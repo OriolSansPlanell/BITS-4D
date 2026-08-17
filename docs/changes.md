@@ -1,5 +1,38 @@
 # Bug-fix and cleanup notes
 
+## Unticking a class left its segmentation on screen (latest)
+
+**Symptom:** segment an ROI, untick it in the selection panel, segment a
+second ROI — the first region was still highlighted.
+
+**Root cause:** the tick governed the *ROI* (whether it is drawn and whether
+future segmentation covers it) but not the *layer* already computed from it.
+Segmentation layers live in `segmentation_masks[timepoint]` and were all
+displayed unconditionally, so the first ROI's mask stayed visible. Segmenting
+again kept it too, since the layer-replacement step only drops layers whose
+name is being re-created.
+
+**Fix:** layers are matched to the class that produced them (they carry its
+name) and filtered by its tick — `_visible_layers()` is now the single way
+layers are read for display and training:
+
+- the slice-viewer highlights,
+- the histogram layer outlines,
+- and Random Forest training, which no longer trains on a class the user
+  cannot see. The completion dialog reports how many hidden classes were
+  excluded, and the "no segmentation" warning says when layers exist but are
+  all unticked.
+
+Masks are **kept**, not deleted, so ticking the class back on restores its
+layer immediately. Toggling a tick now refreshes the viewer and histogram at
+once rather than waiting for the next timepoint change.
+
+**Also fixed:** the histogram canvases had the same "two writers, one list"
+problem the slice viewer had — `_refresh_named_roi_overlays` (class ROIs) and
+`_update_rf_histogram_overlays` (layer hulls) overwrote each other. The
+latter now composes both, and skips a hull for any layer that repeats a class
+ROI's shape so a segmented class is not outlined twice.
+
 ## 3-D region grow built its ROI from a single slice (latest)
 
 **Symptom:** growing a region through the volume produced a histogram ROI

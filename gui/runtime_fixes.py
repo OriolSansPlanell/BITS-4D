@@ -34,6 +34,13 @@ def _apply_correctness_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> N
         if not has_roi and self.dataset is not None:
             self.slice_viewer._clear_highlight()
 
+        # Ticking a class on or off changes which segmentation layers apply,
+        # so refresh the highlights and histogram outlines straight away
+        # instead of waiting for the next timepoint change.
+        if self.dataset is not None:
+            self._refresh_slice_overlays()
+            self._update_rf_histogram_overlays(self.dataset.current_timepoint)
+
         self.segment_current_btn.setEnabled(has_roi)
         self.segment_all_btn.setEnabled(has_roi and self.mode == "4D")
         self.selection_manager.enable_save_button(has_roi)
