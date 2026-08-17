@@ -237,11 +237,16 @@ class EditableROIHandler:
         if event.inaxes != self.ax or event.xdata is None:
             return
         
-        # Update vertex position
+        # Update vertex position.
+        # Replace the whole array instead of mutating it in place: snapshots
+        # taken earlier (e.g. the outline recorded for an already-segmented
+        # layer) hold a reference to it, and an in-place edit would rewrite
+        # them retroactively, so the displayed region would no longer match
+        # the voxels that were actually segmented.
         if self.roi_manager.roi_type == 'polygon':
-            self.roi_manager.polygon_points[self.dragging_vertex] = [
-                event.xdata, event.ydata
-            ]
+            points = np.array(self.roi_manager.polygon_points, dtype=float)
+            points[self.dragging_vertex] = [event.xdata, event.ydata]
+            self.roi_manager.set_polygon_roi(points)
         elif self.roi_manager.roi_type == 'rectangle':
             # Update rectangle by moving corner
             self._update_rectangle_corner(self.dragging_vertex, event.xdata, event.ydata)

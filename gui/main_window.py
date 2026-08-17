@@ -3972,10 +3972,13 @@ class BiTS4DMainWindow(QMainWindow):
                 'roi_type': roi['roi_type'],
                 'color': roi.get('color', '#e6194b'),
             }
+            # Copy the geometry: segmentation may run on a worker thread while
+            # the user keeps editing, and these specs must describe the ROI as
+            # it was when the action started.
             if roi['roi_type'] == 'polygon':
-                spec['points'] = roi['points']
+                spec['points'] = np.array(roi['points'], dtype=float)
             else:
-                spec['rectangle'] = roi['rectangle']
+                spec['rectangle'] = tuple(roi['rectangle'])
             specs.append(spec)
 
         if roi_manager.roi_type is not None:
@@ -3985,9 +3988,11 @@ class BiTS4DMainWindow(QMainWindow):
                 'color': config.ROI_COLOR,
             }
             if roi_manager.roi_type == 'polygon':
-                spec['points'] = roi_manager.polygon_points
+                spec['points'] = np.array(
+                    roi_manager.polygon_points, dtype=float
+                )
             else:
-                spec['rectangle'] = roi_manager.rectangle
+                spec['rectangle'] = tuple(roi_manager.rectangle)
             specs.append(spec)
         return specs
 
@@ -3995,27 +4000,24 @@ class BiTS4DMainWindow(QMainWindow):
     def _roi_spec_vertices(spec):
         """Histogram-space outline (Nx2 vertices) for one ROI spec dict."""
         if spec['roi_type'] == 'polygon':
-            return np.asarray(spec['points'], dtype=float)
+            return np.array(spec['points'], dtype=float)
         x1, y1, x2, y2 = spec['rectangle']
         return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=float)
 
     @staticmethod
     def _active_roi_vertices(roi_manager):
         """Outline of the active ROI, or None when no active ROI exists."""
-        if roi_manager.roi_type == 'polygon':
-            return np.asarray(roi_manager.polygon_points, dtype=float)
-        if roi_manager.roi_type == 'rectangle':
-            x1, y1, x2, y2 = roi_manager.rectangle
-            return np.array(
-                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=float
-            )
-        return None
+        return roi_manager.get_active_vertices()
 
     def _record_layer_shape(self, timepoint, name, vertices):
-        """Remember the exact histogram outline a layer was created from."""
+        """Remember the exact histogram outline a layer was created from.
+
+        Stores an independent copy: this is the record of what was actually
+        segmented, so later edits to the ROI must never rewrite it.
+        """
         if vertices is not None:
             self.segmentation_layer_shapes[(int(timepoint), name)] = (
-                np.asarray(vertices, dtype=float)
+                np.array(vertices, dtype=float)
             )
 
     def _clear_layer_shapes(self, timepoint=None):

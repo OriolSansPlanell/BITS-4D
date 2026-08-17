@@ -150,6 +150,78 @@ def widget(qapp):
     return w
 
 
+def test_unsaved_selection_is_listed(widget):
+    """A drawn-but-unsaved ROI must appear in the panel, not stay invisible
+    until it is saved."""
+    assert widget.roi_list_widget.count() == 2      # two saved classes
+
+    widget.roi_manager.set_rectangle_roi(200, 200, 210, 210)
+    widget._on_roi_updated()
+
+    assert widget.roi_list_widget.count() == 3
+    active_row = widget.roi_list_widget.item(2)
+    assert "unsaved" in active_row.text()
+    assert "rectangle" in active_row.text()
+    # It carries no visibility checkbox until it becomes a class
+    assert not (active_row.flags() & Qt.ItemIsUserCheckable)
+    assert widget._is_active_row(2)
+
+
+def test_unsaved_row_disappears_when_the_roi_is_cleared(widget):
+    widget.roi_manager.set_rectangle_roi(200, 200, 210, 210)
+    widget._on_roi_updated()
+    assert widget.roi_list_widget.count() == 3
+
+    widget.clear_roi()
+    assert widget.roi_list_widget.count() == 2
+
+
+def test_saving_the_unsaved_selection_turns_it_into_a_class(widget, monkeypatch):
+    widget.roi_manager.set_rectangle_roi(200, 200, 210, 210)
+    widget._on_roi_updated()
+    monkeypatch.setattr(
+        "PyQt5.QtWidgets.QInputDialog.getText",
+        staticmethod(lambda *a, **k: ("Kept", True)),
+    )
+    widget._save_current_as_class()
+
+    names = [r['name'] for r in widget.roi_manager.named_rois]
+    assert names == ["A", "B", "Kept"]
+    # Three classes, and the unsaved row is gone
+    assert widget.roi_list_widget.count() == 3
+    assert not widget._is_active_row(2)
+
+
+def test_remove_on_the_unsaved_row_discards_only_that_roi(widget):
+    widget.roi_manager.set_rectangle_roi(200, 200, 210, 210)
+    widget._on_roi_updated()
+    widget.roi_list_widget.setCurrentRow(2)
+    widget._remove_selected_class()
+
+    assert widget.roi_manager.roi_type is None
+    assert len(widget.roi_manager.named_rois) == 2   # classes untouched
+    assert widget.roi_list_widget.count() == 2
+
+
+def test_only_this_on_the_unsaved_row_hides_the_saved_classes(widget):
+    widget.roi_manager.set_rectangle_roi(200, 200, 210, 210)
+    widget._on_roi_updated()
+    widget.roi_list_widget.setCurrentRow(2)
+    widget._isolate_selected_class()
+
+    assert widget.roi_manager.get_visible_named_rois() == []
+    assert widget.roi_manager.roi_type == 'rectangle'
+
+
+def test_edit_is_unavailable_on_the_unsaved_row(widget):
+    widget.roi_manager.set_rectangle_roi(200, 200, 210, 210)
+    widget._on_roi_updated()
+    widget.roi_list_widget.setCurrentRow(2)
+    assert not widget.edit_class_btn.isEnabled()   # it is already active
+    assert widget.remove_class_btn.isEnabled()
+    assert widget.save_class_btn.isEnabled()
+
+
 def test_panel_lists_every_class_with_a_checkbox(widget):
     assert widget.roi_list_widget.count() == 2
     for row in range(2):

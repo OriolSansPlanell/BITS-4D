@@ -611,10 +611,8 @@ class DualHistogramWidget(QWidget):
             self.editable_roi_cb.setChecked(False)
         self.roi_manager.clear_roi()
         self.save_class_btn.setEnabled(False)
-        self._refresh_named_roi_overlays()
-        self.global_canvas.update_plot()
-        self.local_canvas.update_plot()
-        self.roi_updated.emit()
+        self._update_roi_list()
+        self._apply_roi_change()
 
     # ── Named / multi-class ROI management ───────────────────────────────────
 
@@ -660,6 +658,8 @@ class DualHistogramWidget(QWidget):
         """Rebuild the QListWidget from roi_manager.named_rois."""
         # Repopulating fires itemChanged for every row; ignore those so the
         # rebuild cannot be mistaken for the user toggling visibility.
+        previous_row = self.roi_list_widget.currentRow()
+
         self.roi_list_widget.blockSignals(True)
         self.roi_list_widget.clear()
         for roi in self.roi_manager.named_rois:
@@ -669,9 +669,39 @@ class DualHistogramWidget(QWidget):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             self._style_roi_item(item, roi)
             self.roi_list_widget.addItem(item)
+
+        # The ROI currently drawn but not yet saved is listed too, so every
+        # selection is visible in one place. It has no class id or visibility
+        # toggle until it is saved.
+        if self.roi_manager.roi_type is not None:
+            item = QListWidgetItem(
+                f"✎ (unsaved selection)  [{self.roi_manager.roi_type}]"
+            )
+            item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
+            font = item.font()
+            font.setItalic(True)
+            item.setFont(font)
+            item.setToolTip(
+                "The selection you are drawing or editing.\n"
+                "Click 'Save as Class' (or double-click this row) to keep it\n"
+                "as a named class for Random Forest training."
+            )
+            self.roi_list_widget.addItem(item)
+
         self.roi_list_widget.blockSignals(False)
 
+        if 0 <= previous_row < self.roi_list_widget.count():
+            self.roi_list_widget.setCurrentRow(previous_row)
         self._update_selection_buttons()
+
+    def _named_count(self) -> int:
+        """Number of saved class rows (the unsaved row, if any, comes after)."""
+        return len(self.roi_manager.named_rois)
+
+    def _is_active_row(self, row: int) -> bool:
+        """True when *row* is the unsaved active-selection row."""
+        return (self.roi_manager.roi_type is not None
+                and row == self._named_count())
 
     @staticmethod
     def _style_roi_item(item, roi):
@@ -687,16 +717,20 @@ class DualHistogramWidget(QWidget):
 
     def _update_selection_buttons(self, *_args):
         """Enable the panel's buttons according to the current selection."""
-        count = len(self.roi_manager.named_rois)
-        has_any = count > 0
-        has_current = 0 <= self.roi_list_widget.currentRow() < count
+        named = self._named_count()
+        row = self.roi_list_widget.currentRow()
+        on_named = 0 <= row < named
+        on_active = self._is_active_row(row)
 
-        self.clear_all_classes_btn.setEnabled(has_any)
-        self.show_all_classes_btn.setEnabled(has_any)
-        self.hide_all_classes_btn.setEnabled(has_any)
-        self.remove_class_btn.setEnabled(has_current)
-        self.edit_class_btn.setEnabled(has_current)
-        self.only_selected_btn.setEnabled(has_current)
+        self.clear_all_classes_btn.setEnabled(named > 0)
+        self.show_all_classes_btn.setEnabled(named > 0)
+        self.hide_all_classes_btn.setEnabled(named > 0)
+        # Remove works on a saved class or on the unsaved selection
+        self.remove_class_btn.setEnabled(on_named or on_active)
+        # The unsaved selection is already the one being edited
+        self.edit_class_btn.setEnabled(on_named)
+        self.only_selected_btn.setEnabled(on_named or on_active)
+        self.save_class_btn.setEnabled(self.roi_manager.roi_type is not None)
 
     def _refresh_named_roi_overlays(self):
         """Push the visible class ROIs to both canvases as coloured overlays."""
@@ -718,7 +752,8 @@ class DualHistogramWidget(QWidget):
         very item whose signal is being handled, which crashes Qt.
         """
         row = self.roi_list_widget.row(item)
-        if not 0 <= row < len(self.roi_manager.named_rois):
+        # The unsaved-selection row has no checkbox
+        if not 0 <= row < self._named_count():
             return
         visible = item.checkState() == Qt.Checked
         if self.roi_manager.named_rois[row].get('visible', True) == visible:
@@ -738,11 +773,19 @@ class DualHistogramWidget(QWidget):
         self._apply_roi_change()
 
     def _isolate_selected_class(self):
-        """Show only the highlighted selection, hiding the others."""
+        """Show only the highlighted selection, hiding the others.
+
+        On the unsaved row this hides every saved class, leaving the ROI
+        being drawn as the only thing displayed and segmented.
+        """
         row = self.roi_list_widget.currentRow()
-        if not 0 <= row < len(self.roi_manager.named_rois):
+        if self._is_active_row(row):
+            self._set_all_classes_visible(False)
+            self.roi_list_widget.setCurrentRow(row)
             return
-        for index in range(len(self.roi_manager.named_rois)):
+        if not 0 <= row < self._named_count():
+            return
+        for index in range(self._named_count()):
             self.roi_manager.set_named_roi_visible(index, index == row)
         self._update_roi_list()
         self.roi_list_widget.setCurrentRow(row)
@@ -751,7 +794,7 @@ class DualHistogramWidget(QWidget):
     def _edit_selected_class(self):
         """Move the highlighted class back into the active ROI for editing."""
         row = self.roi_list_widget.currentRow()
-        if not 0 <= row < len(self.roi_manager.named_rois):
+        if not 0 <= row < self._named_count():
             return
 
         if self.roi_manager.roi_type is not None:
@@ -783,9 +826,15 @@ class DualHistogramWidget(QWidget):
         self.editing_class_changed.emit(entry['name'])
 
     def _remove_selected_class(self):
-        """Remove the highlighted class ROI from the named list."""
+        """Remove the highlighted selection — a saved class or the unsaved one."""
         row = self.roi_list_widget.currentRow()
-        if not 0 <= row < len(self.roi_manager.named_rois):
+
+        if self._is_active_row(row):
+            # Discard the ROI being drawn; saved classes are untouched
+            self.clear_roi()
+            return
+
+        if not 0 <= row < self._named_count():
             return
         name = self.roi_manager.named_rois[row]['name']
         reply = QMessageBox.question(
@@ -811,15 +860,18 @@ class DualHistogramWidget(QWidget):
             return
         self.roi_manager.clear_named_rois()
         self._update_roi_list()
-        self._refresh_named_roi_overlays()
-        self.global_canvas.update_plot()
-        self.local_canvas.update_plot()
-        self.roi_updated.emit()
+        self._apply_roi_change()
 
     def _rename_roi_item(self, item):
-        """Double-click a list row to rename that class."""
+        """Double-click a row: rename a class, or save the unsaved selection."""
         row = self.roi_list_widget.row(item)
-        if row < 0 or row >= len(self.roi_manager.named_rois):
+
+        if self._is_active_row(row):
+            # Double-clicking the unsaved row is the natural way to keep it
+            self._save_current_as_class()
+            return
+
+        if not 0 <= row < self._named_count():
             return
         current_name = self.roi_manager.named_rois[row]['name']
         new_name, ok = QInputDialog.getText(
@@ -828,14 +880,14 @@ class DualHistogramWidget(QWidget):
         if ok and new_name.strip():
             self.roi_manager.named_rois[row]['name'] = new_name.strip()
             self._update_roi_list()
-            self._refresh_named_roi_overlays()
-            self.global_canvas.update_plot()
-            self.local_canvas.update_plot()
+            self._apply_roi_change()
 
     # ── Sync / update ─────────────────────────────────────────────────────────
 
     def _on_roi_updated(self):
-        """ROI was updated — refresh both canvases and named-class overlays."""
+        """ROI was updated — refresh the panel, both canvases and overlays."""
+        # Keeps the unsaved-selection row in step with what is being drawn
+        self._update_roi_list()
         self._refresh_named_roi_overlays()
         self.global_canvas.update_plot()
         self.local_canvas.update_plot()
