@@ -1,5 +1,44 @@
 # Bug-fix and cleanup notes
 
+## A drawn polygon selected less than its outline enclosed (latest)
+
+**Symptom:** an area clearly inside a polygon ROI's outline was not
+segmented.
+
+**Root cause — two faults compounding:**
+
+1. **Stray vertices.** `HistogramCanvas.on_mouse_press` checked neither the
+   mouse button nor the navigation toolbar. Every pan or zoom-rectangle drag
+   *also* dropped a polygon vertex where the drag started — so zooming in to
+   place a vertex precisely, the natural thing to do on a dense histogram,
+   silently corrupted the polygon into a self-crossing shape. Right- and
+   middle-clicks added vertices too.
+2. **Winding-rule mismatch.** ROIs were drawn as outlines only, but
+   containment is decided by the winding rule
+   (`Path.contains_points`). In a self-crossing polygon a region can be
+   ringed by edges yet have winding number 0, so it looks enclosed while
+   being excluded from the selection. The drawing and the segmentation
+   genuinely disagreed, and nothing on screen showed it.
+
+**Fix:**
+
+- Only a plain left-click places a vertex, and clicks are ignored while the
+  toolbar's pan/zoom tool is active (or the canvas widget lock is held), so
+  the polygon stays what the user actually drew.
+- ROIs and class overlays are now drawn **filled** as well as outlined.
+  Matplotlib fills with the same winding rule that decides containment
+  (verified by rasterizing and comparing against `contains_points`), so the
+  shaded area *is* the region that will be segmented — any excluded pocket
+  is now plainly visible.
+- Finishing a polygon whose edges cross warns explicitly that part of the
+  enclosed area may be left out, instead of letting the segmentation come
+  out quietly wrong. `utils.roi_manager.polygon_self_intersects()` does the
+  detection.
+
+The bounding-box prefilter added earlier was checked against
+`Path.contains_points` over 200 random concave polygons and matched exactly,
+ruling it out as a cause.
+
 ## Edited ROIs rewrote what had already been segmented (latest)
 
 **Symptom:** after editing a histogram region, the segmented volume no

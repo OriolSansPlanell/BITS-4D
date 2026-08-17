@@ -74,6 +74,17 @@ new code must preserve it:
   tests `(neutron, xray)` pairs against ROIs stored in those same
   coordinates. `SegmentationEngine4D` simply forwards volumes to it.
 
+**Draw ROIs filled, not as bare outlines.** Containment is decided by the
+winding rule (`Path.contains_points`), and matplotlib fills by the same
+rule, so a translucent fill shows exactly which region will be segmented.
+An outline alone does not: in a self-crossing polygon an area can be ringed
+by edges yet have winding number 0, looking enclosed while being excluded.
+Drawing code that adds ROI patches should keep the fill for that reason, and
+`polygon_self_intersects()` flags the crossing case when a polygon is
+finished. Interactive drawing must also ignore non-left clicks and any click
+made while the navigation toolbar's pan/zoom tool is active, or those drags
+inject stray vertices into the polygon.
+
 Because display, ROI storage, and containment all share this convention, a
 region drawn on the histogram selects exactly the voxels whose intensity
 pairs fall inside it. `tests/test_selection_segmentation_consistency.py`
