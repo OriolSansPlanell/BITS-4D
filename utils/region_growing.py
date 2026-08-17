@@ -167,76 +167,82 @@ class RegionGrowing:
         return neutron_values, xray_values
     
     @staticmethod
+    def _bounding_box_roi(neutron_values, xray_values, margin):
+        """Rectangle ROI around a point cloud, always with a positive area.
+
+        A region of uniform intensity (a saturated or single-valued phase)
+        has zero spread on one or both axes. Padding by a percentage of zero
+        leaves a degenerate outline that contains nothing, so fall back to an
+        absolute pad in that case — otherwise the selection would silently
+        segment no voxels at all.
+        """
+        def bounds(values):
+            low = float(np.min(values))
+            high = float(np.max(values))
+            spread = high - low
+            pad = spread * margin
+            if pad <= 0:
+                # Half a grey level, or a relative pad for large magnitudes
+                pad = max(abs(low) * 1e-6, 0.5)
+            return low - pad, high + pad
+
+        n_min, n_max = bounds(neutron_values)
+        x_min, x_max = bounds(xray_values)
+        return np.array([
+            [n_min, x_min],
+            [n_max, x_min],
+            [n_max, x_max],
+            [n_min, x_max],
+        ])
+
+    @staticmethod
     def create_convex_hull_roi(neutron_values, xray_values, margin=0.05):
         """
         Create convex hull polygon ROI from point cloud in histogram space
-        
+
         Args:
             neutron_values: 1D array of neutron intensities
             xray_values: 1D array of X-ray intensities
             margin: Percentage margin to add
-            
+
         Returns:
             polygon_points: Nx2 array of (neutron, xray) vertices
         """
         from scipy.spatial import ConvexHull
-        
+
         print(f"RegionGrowing.create_convex_hull_roi:", file=sys.stderr)
-        
+
         if len(neutron_values) < 3:
-            print(f"  ERROR: Need at least 3 points for convex hull", file=sys.stderr)
-            # Fall back to bounding box
-            n_min, n_max = float(np.min(neutron_values)), float(np.max(neutron_values))
-            x_min, x_max = float(np.min(xray_values)), float(np.max(xray_values))
-            
-            # Add margin
-            n_range = n_max - n_min
-            x_range = x_max - x_min
-            n_min -= n_range * margin
-            n_max += n_range * margin
-            x_min -= x_range * margin
-            x_max += x_range * margin
-            
-            # Return rectangle vertices
-            return np.array([
-                [n_min, x_min],
-                [n_max, x_min],
-                [n_max, x_max],
-                [n_min, x_max]
-            ])
-        
-        # Create point cloud
+            print("  fewer than 3 points; using a bounding box", file=sys.stderr)
+            return RegionGrowing._bounding_box_roi(
+                neutron_values, xray_values, margin
+            )
+
+        # Create point cloud. A 3-D region-grow mask can hold millions of
+        # voxels but only a small number of *distinct* intensity pairs;
+        # deduplicating first bounds the hull computation without changing
+        # its result (the hull of a set equals the hull of its unique points).
         points = np.column_stack([neutron_values, xray_values])
-        
-        # Compute convex hull
+        if len(points) > 100_000:
+            points = np.unique(points, axis=0)
+            print(f"  reduced to {len(points)} distinct intensity pairs",
+                  file=sys.stderr)
+
+        # Compute convex hull. Degenerate clouds (a single value, or all
+        # points collinear) have no 2-D hull, so fall back to a box.
         try:
             hull = ConvexHull(points)
             hull_points = points[hull.vertices]
-            
+
             print(f"  convex hull: {len(hull_points)} vertices", file=sys.stderr)
-            
-            # Add margin to hull
+
+            # Grow the hull slightly about its centroid so the extreme voxels
+            # sit strictly inside it (boundary points are not "contained").
             centroid = np.mean(hull_points, axis=0)
-            expanded_points = centroid + (hull_points - centroid) * (1 + margin)
-            
-            return expanded_points
-            
+            return centroid + (hull_points - centroid) * (1 + margin)
+
         except Exception as e:
-            print(f"  ERROR computing convex hull: {e}", file=sys.stderr)
-            # Fall back to bounding box
-            n_min, n_max = float(np.min(neutron_values)), float(np.max(neutron_values))
-            x_min, x_max = float(np.min(xray_values)), float(np.max(xray_values))
-            
-            n_range = n_max - n_min
-            x_range = x_max - x_min
-            n_min -= n_range * margin
-            n_max += n_range * margin
-            x_min -= x_range * margin
-            x_max += x_range * margin
-            
-            return np.array([
-                [n_min, x_min],
-                [n_max, x_min],
-                [n_max, x_max],
-                [n_min, x_max]
-            ])
+            print(f"  no 2-D hull ({e}); using a bounding box", file=sys.stderr)
+            return RegionGrowing._bounding_box_roi(
+                neutron_values, xray_values, margin
+            )
