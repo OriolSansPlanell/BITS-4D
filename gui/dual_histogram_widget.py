@@ -126,23 +126,30 @@ class HistogramCanvas(FigureCanvas):
         if not self.roi_manager:
             return
 
+        # ROIs are drawn *filled* as well as outlined. Matplotlib fills with
+        # the same winding rule that decides containment, so the shaded area
+        # is exactly the region that will be segmented. With an outline alone,
+        # a polygon whose edges cross itself looks like it encloses more than
+        # it actually selects.
         if self.roi_manager.roi_type == 'polygon':
             polygon = MplPolygon(
                 self.roi_manager.polygon_points,
                 closed=True,
-                fill=False,
+                fill=True,
+                facecolor=(0.0, 1.0, 0.0, 0.18),
                 edgecolor='lime',
                 linewidth=2
             )
             self.ax.add_patch(polygon)
-        
+
         elif self.roi_manager.roi_type == 'rectangle':
             x_min, y_min, x_max, y_max = self.roi_manager.rectangle
             rect = MplRectangle(
                 (x_min, y_min),
                 x_max - x_min,
                 y_max - y_min,
-                fill=False,
+                fill=True,
+                facecolor=(0.0, 1.0, 0.0, 0.18),
                 edgecolor='lime',
                 linewidth=2
             )
@@ -203,17 +210,24 @@ class HistogramCanvas(FigureCanvas):
         """Draw multiple ROI overlays"""
         self._clear_overlay_artists()
 
+        import matplotlib.colors as mcolors
+
         for name, vertices, color in self.roi_overlays:
             if vertices is not None and len(vertices) > 2:
-                edge_color = color
+                # Filled as well as outlined, so the shaded area is exactly
+                # what this selection covers (see _draw_roi).
+                try:
+                    red, green, blue, _ = mcolors.to_rgba(color)
+                except Exception:
+                    red, green, blue = 1.0, 0.0, 0.0
                 polygon = MplPolygon(
                     vertices,
                     closed=True,
-                    fill=False,
-                    edgecolor=edge_color,
+                    fill=True,
+                    facecolor=(red, green, blue, 0.15),
+                    edgecolor=(red, green, blue, 0.9),
                     linewidth=2,
                     linestyle='--',
-                    alpha=0.8,
                     label=name
                 )
                 self.ax.add_patch(polygon)
@@ -225,11 +239,30 @@ class HistogramCanvas(FigureCanvas):
         self.vmax = vmax
         self.update_plot()
     
+    def _navigation_active(self) -> bool:
+        """True while the toolbar's pan/zoom tool owns the mouse.
+
+        Without this, zooming in to place a vertex precisely would *also*
+        drop a vertex at the point where the zoom drag started, silently
+        corrupting the polygon.
+        """
+        toolbar = getattr(self, "toolbar", None)
+        if toolbar is not None and getattr(toolbar, "mode", ""):
+            return True
+        widgetlock = getattr(self.figure.canvas, "widgetlock", None)
+        return bool(widgetlock is not None and widgetlock.locked())
+
     def on_mouse_press(self, event):
         """Handle mouse press for ROI drawing"""
         if event.inaxes != self.ax or not self.drawing_mode:
             return
-        
+        # Only a plain left-click places/starts an ROI; ignore other buttons
+        # and any click that belongs to the pan/zoom tools.
+        if event.button != 1 or self._navigation_active():
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
         if self.drawing_mode == 'polygon':
             # Save current axis limits
             xlim = self.ax.get_xlim()
@@ -262,7 +295,9 @@ class HistogramCanvas(FigureCanvas):
         """Handle mouse move for rectangle preview"""
         if event.inaxes != self.ax or not self.drawing_mode:
             return
-        
+        if event.xdata is None or event.ydata is None:
+            return
+
         if self.drawing_mode == 'rectangle' and self.rect_start:
             # Save current axis limits
             xlim = self.ax.get_xlim()
@@ -604,6 +639,20 @@ class DualHistogramWidget(QWidget):
         self.finalize_btn.setEnabled(False)
         # Enable saving as a named class now that the polygon is closed
         self.save_class_btn.setEnabled(self.roi_manager.roi_type is not None)
+
+        # A crossing outline selects less than it appears to, so say so
+        # rather than letting the segmentation quietly come out wrong.
+        if self.roi_manager.roi_type == 'polygon':
+            from utils.roi_manager import polygon_self_intersects
+            if polygon_self_intersects(self.roi_manager.polygon_points):
+                QMessageBox.warning(
+                    self, "Polygon crosses itself",
+                    "This polygon's outline crosses itself.\n\n"
+                    "The shaded area shows what will actually be segmented — "
+                    "a region enclosed by the crossing edges can be left out.\n\n"
+                    "If that is not what you intended, clear the ROI and draw "
+                    "it again without crossing edges."
+                )
 
     def clear_roi(self):
         """Clear the current active (unsaved) ROI only. Named class ROIs are kept."""

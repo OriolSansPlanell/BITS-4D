@@ -22,6 +22,47 @@ def _class_color(class_id: int) -> str:
     return _CLASS_COLORS[class_id % len(_CLASS_COLORS)]
 
 
+def _segments_cross(p1, p2, p3, p4) -> bool:
+    """True if segment p1-p2 properly crosses segment p3-p4."""
+    def orientation(a, b, c):
+        value = ((b[0] - a[0]) * (c[1] - a[1])
+                 - (b[1] - a[1]) * (c[0] - a[0]))
+        if value > 0:
+            return 1
+        return -1 if value < 0 else 0
+
+    o1 = orientation(p1, p2, p3)
+    o2 = orientation(p1, p2, p4)
+    o3 = orientation(p3, p4, p1)
+    o4 = orientation(p3, p4, p2)
+    # Proper crossing only; touching endpoints (shared vertices) don't count
+    return o1 != o2 and o3 != o4 and 0 not in (o1, o2, o3, o4)
+
+
+def polygon_self_intersects(points) -> bool:
+    """True when a closed polygon's edges cross one another.
+
+    A self-crossing outline is almost always an accident, and it matters:
+    matplotlib fills — and ``Path.contains_points`` selects — by the winding
+    rule, so a region the outline appears to enclose can be left out of the
+    selection entirely.
+    """
+    vertices = np.asarray(points, dtype=float)
+    count = len(vertices)
+    if count < 4:
+        return False
+
+    edges = [(vertices[i], vertices[(i + 1) % count]) for i in range(count)]
+    for i in range(count):
+        for j in range(i + 1, count):
+            # Skip edges that share a vertex (adjacent, and first/last)
+            if j == i + 1 or (i == 0 and j == count - 1):
+                continue
+            if _segments_cross(*edges[i], *edges[j]):
+                return True
+    return False
+
+
 class ROIManager:
     """
     Manages Region of Interest (ROI) for segmentation.
