@@ -1,5 +1,31 @@
 # Bug-fix and cleanup notes
 
+## 3-D region grow built its ROI from a single slice (latest)
+
+**Symptom:** growing a region through the volume produced a histogram ROI
+much narrower than the region selected, so segmenting with it recovered only
+part of it. Visible in the log as a 3-D grow finding 4,659 voxels while the
+ROI was derived from the 173 pixels on the displayed slice.
+
+**Root cause:** `SliceViewerWidget` computes and stores
+`region_grow_mask_3d`, but "Create Histogram ROI from Selection" emitted
+only `region_grow_mask` — the 2-D slice currently on screen. The convex hull
+therefore described 3.7% of the selected voxels, covering only the intensity
+spread that happens to appear on that one slice.
+
+**Fix:** the 3-D mask is emitted when the region was grown through the
+volume, and the main window extracts values from the whole volume when the
+mask is 3-D (2-D masks keep the slice path). Because a 3-D mask can hold
+millions of voxels, `create_convex_hull_roi` now deduplicates intensity
+pairs above 100k points before hulling — exact, since the hull of a set
+equals the hull of its distinct points.
+
+**Also fixed, found while testing:** a region of *uniform* intensity (a
+saturated or single-valued phase) has zero spread, so the percentage margin
+padded it by zero and the fallback bounding box had no area — the ROI
+selected none of its own voxels. `_bounding_box_roi()` now falls back to an
+absolute pad, guaranteeing a usable region.
+
 ## A drawn polygon selected less than its outline enclosed (latest)
 
 **Symptom:** an area clearly inside a polygon ROI's outline was not

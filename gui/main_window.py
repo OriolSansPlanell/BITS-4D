@@ -1710,13 +1710,22 @@ class SliceViewerWidget(QWidget):
             return
         
         if has_region:
-            # Region growing mode - emit mask instead of coords
-            print(f"  Using region growing mask ({np.sum(self.region_grow_mask)} pixels)", file=sys.stderr)
-            print(f"  Emitting signal with: mask, axis={self.current_axis}, slice={self.current_slice_index}", file=sys.stderr)
-            
-            # Emit with special tuple to indicate mask mode
+            # Region growing mode - emit the mask instead of coords.
+            # Prefer the 3-D mask when the region was grown through the
+            # volume: building the histogram ROI from the current slice
+            # alone would describe only the few voxels visible here, giving
+            # an ROI far narrower than the region actually selected.
+            mask = (
+                self.region_grow_mask_3d
+                if self.region_grow_mask_3d is not None
+                else self.region_grow_mask
+            )
+            print(f"  Using region growing mask "
+                  f"({np.count_nonzero(mask):,} voxels, {mask.ndim}-D)",
+                  file=sys.stderr)
+
             self.spatial_roi_to_histogram.emit(
-                ('mask', self.region_grow_mask),
+                ('mask', mask),
                 self.current_axis,
                 self.current_slice_index
             )
@@ -3181,26 +3190,35 @@ class BiTS4DMainWindow(QMainWindow):
             
             if is_mask:
                 # Region growing mode - extract from mask
-                print("  Mode: Region growing (mask)", file=sys.stderr)
-                mask = spatial_coords[1]
-                
-                # Extract appropriate slice
-                if axis == 'z':
-                    neutron_slice = neutron_vol[slice_index, :, :]
-                    xray_slice = xray_vol[slice_index, :, :]
-                elif axis == 'y':
-                    neutron_slice = neutron_vol[:, slice_index, :]
-                    xray_slice = xray_vol[:, slice_index, :]
-                else:  # 'x'
-                    neutron_slice = neutron_vol[:, :, slice_index]
-                    xray_slice = xray_vol[:, :, slice_index]
-                
-                # Extract values from mask
-                neutron_values, xray_values = RegionGrowing.extract_values_from_mask(
-                    neutron_slice,
-                    xray_slice,
-                    mask
-                )
+                mask = np.asarray(spatial_coords[1])
+
+                if mask.ndim == 3:
+                    # Grown through the volume: use every selected voxel, so
+                    # the ROI covers the whole region's intensity spread
+                    # rather than just the slice that happens to be shown.
+                    print("  Mode: Region growing (3-D mask)", file=sys.stderr)
+                    neutron_values, xray_values = (
+                        RegionGrowing.extract_values_from_mask(
+                            neutron_vol, xray_vol, mask
+                        )
+                    )
+                else:
+                    print("  Mode: Region growing (2-D mask)", file=sys.stderr)
+                    if axis == 'z':
+                        neutron_slice = neutron_vol[slice_index, :, :]
+                        xray_slice = xray_vol[slice_index, :, :]
+                    elif axis == 'y':
+                        neutron_slice = neutron_vol[:, slice_index, :]
+                        xray_slice = xray_vol[:, slice_index, :]
+                    else:  # 'x'
+                        neutron_slice = neutron_vol[:, :, slice_index]
+                        xray_slice = xray_vol[:, :, slice_index]
+
+                    neutron_values, xray_values = (
+                        RegionGrowing.extract_values_from_mask(
+                            neutron_slice, xray_slice, mask
+                        )
+                    )
             else:
                 # Rectangle mode - extract from coords
                 print("  Mode: Rectangle", file=sys.stderr)
@@ -3261,8 +3279,9 @@ class BiTS4DMainWindow(QMainWindow):
                 # Polygon ROI from region growing
                 n_min, n_max = np.min(neutron_values), np.max(neutron_values)
                 x_min, x_max = np.min(xray_values), np.max(xray_values)
+                unit = "voxels" if mask.ndim == 3 else "pixels"
                 self.status_bar.showMessage(
-                    f"✅ Created polygon ROI from {len(neutron_values):,} pixels "
+                    f"✅ Created polygon ROI from {len(neutron_values):,} {unit} "
                     f"(Neutron: [{n_min:.1f}, {n_max:.1f}], X-ray: [{x_min:.1f}, {x_max:.1f}])"
                 )
             else:
