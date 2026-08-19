@@ -1942,16 +1942,27 @@ class ExportOptionsDialog(QDialog):
         self._neutron_cb = QCheckBox("Neutron volume  (masked intensity)")
         self._xray_cb    = QCheckBox("X-ray volume  (masked intensity)")
         self._labels_cb  = QCheckBox("Integer label volume  (all selected layers combined)")
+        self._histogram_cb = QCheckBox(
+            "Bimodal histogram of the class  (.npy + .png)"
+        )
+        self._histogram_cb.setToolTip(
+            "For every selected class and timepoint, compute the 2-D\n"
+            "neutron/X-ray histogram of that class's segmented voxels.\n"
+            "The bins and limits are the same as the main histogram, so the\n"
+            "files can be compared bin-for-bin across classes and time."
+        )
 
         self._mask_cb.setChecked(True)
         self._neutron_cb.setChecked(True)
         self._xray_cb.setChecked(True)
         self._labels_cb.setChecked(False)
+        self._histogram_cb.setChecked(False)
 
         mod_vbox.addWidget(self._mask_cb)
         mod_vbox.addWidget(self._neutron_cb)
         mod_vbox.addWidget(self._xray_cb)
         mod_vbox.addWidget(self._labels_cb)
+        mod_vbox.addWidget(self._histogram_cb)
 
         mod_group.setLayout(mod_vbox)
         main_layout.addWidget(mod_group)
@@ -1964,7 +1975,8 @@ class ExportOptionsDialog(QDialog):
         # Connect all checkboxes to the preview update
         for cb, *_ in self._layer_cbs:
             cb.stateChanged.connect(self._update_preview)
-        for cb in (self._mask_cb, self._neutron_cb, self._xray_cb, self._labels_cb):
+        for cb in (self._mask_cb, self._neutron_cb, self._xray_cb,
+                   self._labels_cb, self._histogram_cb):
             cb.stateChanged.connect(self._update_preview)
         self._update_preview()
 
@@ -1987,10 +1999,13 @@ class ExportOptionsDialog(QDialog):
         n_mods   = sum([self._mask_cb.isChecked(),
                         self._neutron_cb.isChecked(),
                         self._xray_cb.isChecked()])
+        # A histogram export writes a counts file and an image per layer
+        if self._histogram_cb.isChecked():
+            n_mods += 2
         n_label  = 1 if self._labels_cb.isChecked() else 0
         per_tp   = n_layers * n_mods + n_label
         self._preview_label.setText(
-            f"→  {n_layers} layer(s) × {n_mods} modality file(s)"
+            f"→  {n_layers} layer(s) × {n_mods} file(s) each"
             + (f" + 1 label file" if n_label else "")
             + f"  =  {per_tp} file(s) per timepoint"
         )
@@ -2005,6 +2020,7 @@ class ExportOptionsDialog(QDialog):
         self.export_neutron = self._neutron_cb.isChecked()
         self.export_xray    = self._xray_cb.isChecked()
         self.export_labels  = self._labels_cb.isChecked()
+        self.export_histogram = self._histogram_cb.isChecked()
         self.accept()
 
 
@@ -2025,6 +2041,9 @@ class BiTS4DMainWindow(QMainWindow):
         self.rf_engine = RandomForestSegmentation4D(n_estimators=100)
         self.rf_masks = {}           # {timepoint -> (Z,Y,X) int32 label array}
         self.rf_confidence = {}      # {timepoint -> (Z,Y,X) float32}
+        # {class id -> the training layer's name}, so predictions inherit the
+        # names given in the selection panel instead of "RF class 1"
+        self.rf_class_names = {}
         self._rf_cluster_map = None  # Last k-means cluster map (for RF training)
         self._last_kmeans_cluster_selections = []
         self._rf_cluster_timepoint = None
@@ -2877,6 +2896,7 @@ class BiTS4DMainWindow(QMainWindow):
         self.rf_engine = RandomForestSegmentation4D(n_estimators=100)
         self.rf_masks.clear()
         self.rf_confidence.clear()
+        self.rf_class_names.clear()
         self._rf_cluster_map = None
         self._last_kmeans_cluster_selections = []
         self._rf_cluster_timepoint = None
@@ -3932,6 +3952,16 @@ class BiTS4DMainWindow(QMainWindow):
             if not roi.get('visible', True)
         }
 
+    def _rf_class_label(self, class_id):
+        """Name for an RF-predicted class.
+
+        Uses the name of the training layer that became this class (so a
+        class called "Lithium" stays "Lithium" through prediction and
+        export) and falls back to the class number when unknown.
+        """
+        name = self.rf_class_names.get(int(class_id))
+        return f"RF: {name}" if name else f"RF class {int(class_id)}"
+
     def _count_layers_for_class(self, name):
         """How many stored segmentation layers came from class *name*."""
         return sum(
@@ -4465,6 +4495,12 @@ class BiTS4DMainWindow(QMainWindow):
                 labels[mask_3d.astype(bool)] = cls_id
             return labels
 
+        # Remember which training layer each class id came from, so
+        # predictions and their exported files keep the user's class names.
+        self.rf_class_names = {
+            cls_id: layer[2] for cls_id, layer in enumerate(layers, start=1)
+        }
+
         # ── Run training ──────────────────────────────────────────────────────
         self.rf_status_label.setText("Status: training …")
         self.rf_status_label.setStyleSheet("color: orange; font-style: italic;")
@@ -4579,7 +4615,7 @@ class BiTS4DMainWindow(QMainWindow):
         for cls_id in classes:
             mask_cls = (lbl == cls_id)
             color    = self._OVERLAY_COLORS[(cls_id - 1) % len(self._OVERLAY_COLORS)]
-            name     = f"RF class {cls_id}"
+            name     = self._rf_class_label(cls_id)
             self.segmentation_masks[t].append((mask_cls, color, name))
 
         # Show in viewer + update histograms
@@ -4661,7 +4697,9 @@ class BiTS4DMainWindow(QMainWindow):
             for cls_id in classes:
                 mask_cls = (lbl == cls_id)
                 color    = self._OVERLAY_COLORS[(cls_id - 1) % len(self._OVERLAY_COLORS)]
-                self.segmentation_masks[t].append((mask_cls, color, f"RF class {cls_id}"))
+                self.segmentation_masks[t].append(
+                    (mask_cls, color, self._rf_class_label(cls_id))
+                )
 
         # Refresh viewer for the currently displayed timepoint
         cur_t = self.dataset.current_timepoint
@@ -4711,7 +4749,7 @@ class BiTS4DMainWindow(QMainWindow):
         ref_layers = [
             (lbl_ref == c,
              self._OVERLAY_COLORS[(c - 1) % len(self._OVERLAY_COLORS)],
-             f"RF class {c}")
+             self._rf_class_label(c))
             for c in classes
         ]
 
@@ -4721,16 +4759,17 @@ class BiTS4DMainWindow(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
 
-        sel_names   = {name for _, _, name in dlg.selected_layers}
-        do_mask     = dlg.export_mask
-        do_neutron  = dlg.export_neutron
-        do_xray     = dlg.export_xray
-        do_labels   = dlg.export_labels
+        sel_names    = {name for _, _, name in dlg.selected_layers}
+        do_mask      = dlg.export_mask
+        do_neutron   = dlg.export_neutron
+        do_xray      = dlg.export_xray
+        do_labels    = dlg.export_labels
+        do_histogram = dlg.export_histogram
 
         if not sel_names:
             QMessageBox.warning(self, "Nothing selected", "No classes were selected.")
             return
-        if not (do_mask or do_neutron or do_xray or do_labels):
+        if not (do_mask or do_neutron or do_xray or do_labels or do_histogram):
             QMessageBox.warning(self, "Nothing selected", "No output modalities were selected.")
             return
 
@@ -4745,6 +4784,10 @@ class BiTS4DMainWindow(QMainWindow):
             import os, tifffile
             from PyQt5.QtWidgets import QProgressDialog
             from PyQt5.QtCore import Qt
+            from utils.histogram_export import sanitize_name, save_bin_edges
+
+            if do_histogram and self.global_histogram is not None:
+                save_bin_edges(self.global_histogram, output_dir)
 
             T_list = sorted(self.rf_masks.keys())
             progress = QProgressDialog(
@@ -4765,7 +4808,7 @@ class BiTS4DMainWindow(QMainWindow):
 
                 lbl = self.rf_masks[t]
                 t_classes = [c for c in np.unique(lbl) if c != 0
-                              and f"RF class {c}" in sel_names]
+                              and self._rf_class_label(c) in sel_names]
                 if not t_classes:
                     continue
 
@@ -4778,8 +4821,11 @@ class BiTS4DMainWindow(QMainWindow):
 
                 for cls_id in t_classes:
                     mask_bool = (lbl == cls_id)
-                    safe = f"RF_class_{cls_id}"
-                    pfx  = os.path.join(output_dir, f"{base}_{safe}")
+                    # Carries the class name given in the selection panel
+                    label = self._rf_class_label(cls_id)
+                    pfx = os.path.join(
+                        output_dir, f"{base}_{sanitize_name(label)}"
+                    )
 
                     if do_mask:
                         tifffile.imwrite(f"{pfx}_mask.tif",
@@ -4793,6 +4839,10 @@ class BiTS4DMainWindow(QMainWindow):
                         vol = xray_vol.copy(); vol[~mask_bool] = 0
                         tifffile.imwrite(f"{pfx}_xray.tif", vol)
                         total_files += 1
+                    if do_histogram and has_volumes:
+                        total_files += len(self._export_class_histogram(
+                            t, label, mask_bool, output_dir, pfx
+                        ))
 
                 if do_labels:
                     label_vol = np.zeros(lbl.shape, dtype=np.uint8)
@@ -5085,6 +5135,29 @@ class BiTS4DMainWindow(QMainWindow):
         )
     
     @pyqtSlot()
+    def _export_class_histogram(self, timepoint, name, mask_3d, output_dir,
+                                path_prefix):
+        """Write the bimodal histogram of one segmented class.
+
+        Computed on the full-resolution volumes and on the global
+        histogram's bin grid, so every exported class shares identical edges
+        and can be compared bin-for-bin.
+        """
+        from utils.histogram_export import save_class_histogram
+
+        if self.histogram_engine is None or self.global_histogram is None:
+            return []
+
+        neutron_vol, xray_vol = self.dataset.get_volume_at_time(timepoint)
+        class_hist = self.histogram_engine.compute_masked_histogram(
+            neutron_vol, xray_vol, mask_3d
+        )
+        return save_class_histogram(
+            class_hist,
+            f"{path_prefix}_hist",
+            title=f"{name} — T={timepoint}  ({class_hist.num_voxels:,} voxels)",
+        )
+
     def _export_current_timepoint(self):
         """Export segmented data for current timepoint with user-chosen options."""
         if not self.dataset:
@@ -5113,11 +5186,12 @@ class BiTS4DMainWindow(QMainWindow):
         do_neutron   = dlg.export_neutron
         do_xray      = dlg.export_xray
         do_labels    = dlg.export_labels
+        do_histogram = dlg.export_histogram
 
         if not sel_layers:
             QMessageBox.warning(self, "Nothing selected", "No layers were selected for export.")
             return
-        if not (do_mask or do_neutron or do_xray or do_labels):
+        if not (do_mask or do_neutron or do_xray or do_labels or do_histogram):
             QMessageBox.warning(self, "Nothing selected", "No output modalities were selected.")
             return
 
@@ -5129,12 +5203,17 @@ class BiTS4DMainWindow(QMainWindow):
 
         try:
             import os, tifffile
+            from utils.histogram_export import sanitize_name, save_bin_edges
             neutron_vol, xray_vol = self.dataset.get_volume_at_time(current_t)
             base = f"timepoint_{current_t:03d}"
             files_written = []
 
+            if do_histogram and self.global_histogram is not None:
+                files_written += save_bin_edges(self.global_histogram, output_dir)
+
             for mask_3d, color, name in sel_layers:
-                safe_name = name.replace(" ", "_").replace("/", "-")
+                # Use the class's own name (e.g. "Lithium") in the file name
+                safe_name = sanitize_name(name)
                 mask_bool = mask_3d.astype(bool)
                 pfx = os.path.join(output_dir, f"{base}_{safe_name}")
 
@@ -5152,6 +5231,10 @@ class BiTS4DMainWindow(QMainWindow):
                     p = f"{pfx}_xray.tif"
                     tifffile.imwrite(p, vol)
                     files_written.append(os.path.basename(p))
+                if do_histogram:
+                    files_written += self._export_class_histogram(
+                        current_t, name, mask_bool, output_dir, pfx
+                    )
 
             if do_labels:
                 label_vol = np.zeros(neutron_vol.shape, dtype=np.uint8)
@@ -5213,11 +5296,12 @@ class BiTS4DMainWindow(QMainWindow):
         do_neutron   = dlg.export_neutron
         do_xray      = dlg.export_xray
         do_labels    = dlg.export_labels
+        do_histogram = dlg.export_histogram
 
         if not sel_names:
             QMessageBox.warning(self, "Nothing selected", "No layers were selected.")
             return
-        if not (do_mask or do_neutron or do_xray or do_labels):
+        if not (do_mask or do_neutron or do_xray or do_labels or do_histogram):
             QMessageBox.warning(self, "Nothing selected", "No output modalities were selected.")
             return
 
@@ -5233,6 +5317,7 @@ class BiTS4DMainWindow(QMainWindow):
             import os, tifffile
             from PyQt5.QtWidgets import QProgressDialog
             from PyQt5.QtCore import Qt
+            from utils.histogram_export import sanitize_name, save_bin_edges
 
             progress = QProgressDialog(
                 "Exporting…", "Cancel", 0, num_timepoints, self
@@ -5242,6 +5327,13 @@ class BiTS4DMainWindow(QMainWindow):
             progress.setValue(0)
 
             total_files = 0
+
+            # The bin grid is shared by every class and timepoint, so it is
+            # written once for the whole export.
+            if do_histogram and self.global_histogram is not None:
+                total_files += len(
+                    save_bin_edges(self.global_histogram, output_dir)
+                )
 
             for i, (t, layers) in enumerate(sorted(self.segmentation_masks.items())):
                 if not layers:
@@ -5262,7 +5354,8 @@ class BiTS4DMainWindow(QMainWindow):
                     continue
 
                 for mask_3d, color, name in t_layers:
-                    safe = name.replace(" ", "_").replace("/", "-")
+                    # Use the class's own name (e.g. "Lithium") in the file name
+                    safe = sanitize_name(name)
                     pfx  = os.path.join(output_dir, f"{base}_{safe}")
                     mask_bool = mask_3d.astype(bool)
 
@@ -5278,6 +5371,10 @@ class BiTS4DMainWindow(QMainWindow):
                         vol = xray_vol.copy(); vol[~mask_bool] = 0
                         tifffile.imwrite(f"{pfx}_xray.tif", vol)
                         total_files += 1
+                    if do_histogram:
+                        total_files += len(self._export_class_histogram(
+                            t, name, mask_bool, output_dir, pfx
+                        ))
 
                 if do_labels:
                     label_vol = np.zeros(neutron_vol.shape, dtype=np.uint8)

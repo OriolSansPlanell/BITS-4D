@@ -33,7 +33,10 @@ back to voxels.
   other timepoints with per-voxel confidence.
 - **Analysis and export** — per-selection statistics, morphological analysis,
   time-series tracking, histogram-evolution maps, and export to
-  TIFF / CSV / Excel / PDF.
+  TIFF / CSV / Excel / PDF. Exports are named after your classes
+  ("Lithium", not "Class 1"), and can optionally include the **bimodal
+  histogram of each class** at every timepoint, computed on the main
+  histogram's bin grid so the files compare directly.
 - **Big-dataset mode** — all histograms are computed once at load and served
   from memory; volumes larger than 1 GiB are median-binned for display (with
   segmentation still running at full resolution), so time scrolling and

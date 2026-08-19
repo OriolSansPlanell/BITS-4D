@@ -174,6 +174,13 @@ Two coordinate spaces follow from this, and the split is strict:
   the bridge — they are resolution-independent, so a selection made while
   looking at binned data segments the original voxels exactly.
 
+`HistogramEngine4D.compute_masked_histogram()` builds the histogram of one
+segmented class on the **global** histogram's bin grid, which is what lets
+exported per-class histograms be compared bin-for-bin across classes and
+timepoints; `utils/histogram_export.py` writes them (`.npy` counts + `.png`)
+together with the shared edges. Anything producing a histogram meant for
+comparison should go through that method rather than binning independently.
+
 `utils/histogram_evolution.py` renders the temporal analyses from the cached
 local histograms — cumulative panels (vs T0), incremental panels (vs the
 previous timepoint) and marginal kymographs per modality. The GUI exposes

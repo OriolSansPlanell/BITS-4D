@@ -1,5 +1,33 @@
 # Bug-fix and cleanup notes
 
+## Per-class histogram export and class names in file names (latest)
+
+**Bimodal histogram per class.** The export dialogs gain a "Bimodal
+histogram of the class" option. For every selected class and every exported
+timepoint it computes the 2-D neutron/X-ray histogram of just that class's
+segmented voxels and writes `<timepoint>_<class>_hist.npy` (counts) plus a
+`.png` for quick viewing.
+
+`HistogramEngine4D.compute_masked_histogram()` does the work on the
+full-resolution volumes, reusing the **bin count and data range of the
+global histogram**, so every exported histogram shares its edges exactly and
+the files can be stacked or compared bin-for-bin across classes and time. It
+is chunked like the other accumulators, so a large class costs no more peak
+memory. The shared edges are written once per export as
+`histogram_edges_neutron.npy` / `histogram_edges_xray.npy`, with a short
+README recording that counts are laid out `[X-ray bin, neutron bin]`.
+
+**Class names in file names.** Exports already used a layer's name, so a
+class called "Lithium" produced `timepoint_000_Lithium_*`. Random Forest
+predictions were the exception — they were named `RF class 1` regardless of
+what the training class was called. `_rf_train` now records which training
+layer became each class id, and `_rf_class_label()` turns that into
+`RF: Lithium`, which flows through the prediction layers, the slice-viewer
+legend, the histogram outlines and the exported file names. Names are
+sanitized for the filesystem (`utils.histogram_export.sanitize_name`), so
+"Solid Electrolyte" becomes `Solid_Electrolyte` and "Li/graphite" becomes
+`Li_graphite` rather than creating a stray directory.
+
 ## Removing a class asks about its segmentation (latest)
 
 Unticking a class hides the segmentation computed from it, but *removing*

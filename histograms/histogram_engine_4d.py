@@ -401,6 +401,82 @@ class HistogramEngine4D:
             del n_tensor, x_tensor, n_bins, x_bins, counts
         return histogram
 
+    def compute_masked_histogram(
+        self,
+        neutron_3d: np.ndarray,
+        xray_3d: np.ndarray,
+        mask_3d: np.ndarray,
+        progress_callback: Progress = None,
+        cancel_check: CancelCheck = None,
+    ) -> HistogramData:
+        """2-D histogram of the voxels inside *mask_3d* only.
+
+        Uses the bin count and data range of the global histogram, so the
+        result shares its edges exactly and can be compared bin-for-bin with
+        it and with other classes/timepoints.
+        """
+        self._validate_pair(neutron_3d, xray_3d, ndim=3)
+        if self._data_range is None:
+            raise RuntimeError("Must compute global histogram first")
+
+        mask = np.asarray(mask_3d, dtype=bool)
+        if mask.shape != np.asarray(neutron_3d).shape:
+            raise ValueError(
+                f"Mask shape {mask.shape} does not match volume "
+                f"{np.asarray(neutron_3d).shape}"
+            )
+
+        histogram = np.zeros((self.bins, self.bins), dtype=np.uint64)
+        neutron_flat = np.asarray(neutron_3d).ravel()
+        xray_flat = np.asarray(xray_3d).ravel()
+        mask_flat = mask.ravel()
+        total = neutron_flat.size
+        valid_total = 0
+        ignored_total = 0
+
+        for start in range(0, total, self.chunk_voxels):
+            self._cancel(cancel_check)
+            stop = min(start + self.chunk_voxels, total)
+            selected = mask_flat[start:stop]
+            if np.any(selected):
+                # float64 also normalizes byte order for big-endian TIFFs
+                n_chunk = np.asarray(
+                    neutron_flat[start:stop][selected], dtype=np.float64
+                )
+                x_chunk = np.asarray(
+                    xray_flat[start:stop][selected], dtype=np.float64
+                )
+                finite = np.isfinite(n_chunk) & np.isfinite(x_chunk)
+                finite_count = int(np.count_nonzero(finite))
+                valid_total += finite_count
+                ignored_total += int(finite.size - finite_count)
+                if finite_count:
+                    chunk_hist, _, _ = np.histogram2d(
+                        n_chunk[finite],
+                        x_chunk[finite],
+                        bins=self.bins,
+                        range=[self._data_range[0], self._data_range[1]],
+                    )
+                    histogram += chunk_hist.T.astype(np.uint64, copy=False)
+            self._report(
+                progress_callback,
+                int(100 * stop / max(total, 1)),
+                "Accumulating class histogram...",
+            )
+
+        x_edges = np.linspace(*self._data_range[0], self.bins + 1, dtype=np.float64)
+        y_edges = np.linspace(*self._data_range[1], self.bins + 1, dtype=np.float64)
+        return HistogramData(
+            histogram=histogram,
+            x_edges=x_edges,
+            y_edges=y_edges,
+            x_centers=(x_edges[:-1] + x_edges[1:]) / 2.0,
+            y_centers=(y_edges[:-1] + y_edges[1:]) / 2.0,
+            data_range=self._data_range,
+            num_voxels=int(valid_total),
+            ignored_voxels=int(ignored_total),
+        )
+
     def precompute_all_local_histograms(
         self,
         neutron_4d: np.ndarray,
