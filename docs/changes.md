@@ -1,6 +1,42 @@
 # Bug-fix and cleanup notes
 
-## Per-class histogram export and class names in file names (latest)
+## Quality metrics and the segmentation report (latest)
+
+**Metrics.** *Analytics → Histogram Time Analysis → Histogram &
+Segmentation Metrics…* computes the ground-truth-free subset of the
+reference metric tables and writes a CSV plus a multi-panel evolution plot.
+Two scopes are covered: the global histogram, and every timepoint using its
+own cached local histogram and its own class masks. Hidden classes are
+excluded, matching what segmentation does. Full metric list and CSV layout:
+[docs/metrics.md](metrics.md).
+
+`eps_k`, `CE` and `O_ab` are **not** computed. All three measure distance to
+a known material position or label, which measured data does not have —
+reporting them would mean inventing a reference. `CD` (mean class-centroid
+drift against T0) is provided instead as the honest time-series analogue of
+`CE`, and `DB`, the per-class spreads and `E_k` are computed as ordinary
+internal cluster indices over the classes the user actually created.
+
+*Edge case found while testing:* a perfectly uniform class has zero spread
+on both axes, and the elongation ratio returned 0 — an isotropic class
+reported as maximally flat. `E_k` is now 1.0 when both spreads vanish.
+
+**Segmentation report.** The export dialogs gain a "Text report" option
+(on by default) that writes `segmentation_report.txt` next to the exported
+volumes: the class legend (integer value in the label volumes, class name,
+total voxels, mean volume fraction), voxel counts and volume fractions per
+class and timepoint, the histogram selections the classes came from, and the
+settings involved — bin count, neutron and X-ray ranges, Random Forest
+training accuracy and class names, and whether display binning was active
+(with a note that segmentation and export are always full resolution).
+
+*Latent bug fixed alongside it:* the batch export numbered label values
+per timepoint, so if a class was absent at one timepoint every later class
+shifted down by one and a label value meant different classes in different
+files. The export now fixes a single `class_order` up front and uses it for
+every timepoint, which is also what the report documents.
+
+## Per-class histogram export and class names in file names
 
 **Bimodal histogram per class.** The export dialogs gain a "Bimodal
 histogram of the class" option. For every selected class and every exported
