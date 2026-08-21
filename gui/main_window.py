@@ -1942,6 +1942,14 @@ class ExportOptionsDialog(QDialog):
         self._neutron_cb = QCheckBox("Neutron volume  (masked intensity)")
         self._xray_cb    = QCheckBox("X-ray volume  (masked intensity)")
         self._labels_cb  = QCheckBox("Integer label volume  (all selected layers combined)")
+        self._report_cb = QCheckBox(
+            "Text report  (class names, label values, voxels per timepoint)"
+        )
+        self._report_cb.setToolTip(
+            "Write a segmentation_report.txt describing each class: its name,\n"
+            "the integer value it takes in the label volumes, its voxel count\n"
+            "at every timepoint, and how the segmentation was produced."
+        )
         self._histogram_cb = QCheckBox(
             "Bimodal histogram of the class  (.npy + .png)"
         )
@@ -1957,12 +1965,14 @@ class ExportOptionsDialog(QDialog):
         self._xray_cb.setChecked(True)
         self._labels_cb.setChecked(False)
         self._histogram_cb.setChecked(False)
+        self._report_cb.setChecked(True)
 
         mod_vbox.addWidget(self._mask_cb)
         mod_vbox.addWidget(self._neutron_cb)
         mod_vbox.addWidget(self._xray_cb)
         mod_vbox.addWidget(self._labels_cb)
         mod_vbox.addWidget(self._histogram_cb)
+        mod_vbox.addWidget(self._report_cb)
 
         mod_group.setLayout(mod_vbox)
         main_layout.addWidget(mod_group)
@@ -1976,7 +1986,7 @@ class ExportOptionsDialog(QDialog):
         for cb, *_ in self._layer_cbs:
             cb.stateChanged.connect(self._update_preview)
         for cb in (self._mask_cb, self._neutron_cb, self._xray_cb,
-                   self._labels_cb, self._histogram_cb):
+                   self._labels_cb, self._histogram_cb, self._report_cb):
             cb.stateChanged.connect(self._update_preview)
         self._update_preview()
 
@@ -2021,6 +2031,7 @@ class ExportOptionsDialog(QDialog):
         self.export_xray    = self._xray_cb.isChecked()
         self.export_labels  = self._labels_cb.isChecked()
         self.export_histogram = self._histogram_cb.isChecked()
+        self.export_report = self._report_cb.isChecked()
         self.accept()
 
 
@@ -2686,6 +2697,16 @@ class BiTS4DMainWindow(QMainWindow):
             self._on_export_marginal_increment
         )
         hist_menu.addAction(hist_marginal_increment_action)
+
+        metrics_action = QAction("Histogram & Segmentation Metrics...", self)
+        metrics_action.setToolTip(
+            "Compute the ground-truth-free histogram metrics (S_h, S_v, S_d,\n"
+            "A_x, Delta_n) and class metrics (DB, spreads, elongation, drift)\n"
+            "for the global histogram and for every timepoint.\n"
+            "Writes a CSV of all values plus a plot of each metric over time."
+        )
+        metrics_action.triggered.connect(self._on_export_histogram_metrics)
+        hist_menu.addAction(metrics_action)
 
         analytics_menu.addSeparator()
         
@@ -5135,6 +5156,93 @@ class BiTS4DMainWindow(QMainWindow):
         )
     
     @pyqtSlot()
+    def _write_segmentation_report(self, output_dir, class_names, timepoints,
+                                   layers_by_timepoint):
+        """Write the text report describing an exported segmentation.
+
+        *layers_by_timepoint* maps a timepoint to its list of
+        ``(mask, colour, name)`` layers, in the order they were exported —
+        which is also the order that fixes their label values.
+        """
+        import os
+        from utils.segmentation_report import write_segmentation_report
+
+        voxels_per_timepoint = {
+            timepoint: {
+                name: int(np.count_nonzero(mask))
+                for mask, _color, name in layers_by_timepoint.get(timepoint, [])
+            }
+            for timepoint in timepoints
+        }
+        # Label volumes number the selected layers 1..N in export order
+        label_values = {name: index for index, name in enumerate(class_names, 1)}
+
+        dataset_info = {}
+        metadata = getattr(self.dataset, "metadata", None) or {}
+        for key in ("neutron_file", "xray_file"):
+            if metadata.get(key):
+                dataset_info[key] = str(metadata[key])
+        dataset_info["dataset shape (T,Z,Y,X)"] = str(tuple(self.dataset.shape))
+        dataset_info["mode"] = self.mode
+
+        roi_manager = self.dual_histogram.get_roi_manager()
+        roi_info = {}
+        for roi in roi_manager.named_rois:
+            roi_info[roi['name']] = (
+                f"{roi['roi_type']} ROI, class id {roi['class_id']}"
+                + ("" if roi.get('visible', True) else "  (hidden)")
+            )
+        if roi_manager.roi_type is not None:
+            roi_info["Active ROI"] = f"{roi_manager.roi_type} (unsaved)"
+
+        settings = {
+            "histogram bins": str(self.histogram_engine.bins)
+            if self.histogram_engine else "n/a",
+        }
+        if self.global_histogram is not None:
+            neutron_range, xray_range = self.global_histogram.data_range
+            settings["neutron range"] = (
+                f"[{neutron_range[0]:.6g}, {neutron_range[1]:.6g}]"
+            )
+            settings["X-ray range"] = (
+                f"[{xray_range[0]:.6g}, {xray_range[1]:.6g}]"
+            )
+        if self.rf_engine is not None and self.rf_engine.is_trained:
+            stats = self.rf_engine.get_train_stats()
+            settings["Random Forest"] = (
+                f"trained, features '{stats.get('feature_level')}', "
+                f"accuracy {100 * stats.get('training_accuracy', 0):.2f}%"
+            )
+            if self.rf_class_names:
+                settings["RF class names"] = ", ".join(
+                    f"{cid}={cname}"
+                    for cid, cname in sorted(self.rf_class_names.items())
+                )
+        if self.display_bin_factor > 1:
+            settings["display binning"] = (
+                f"x{self.display_bin_factor} (median) — display only; "
+                "segmentation and export are full resolution"
+            )
+
+        notes = [
+            "Voxel counts are for the full-resolution segmentation.",
+            "Label values apply to the *_labels.tif volumes; individual "
+            "class masks are written as 0/255.",
+        ]
+
+        volume_shape = self.dataset.shape[-3:]
+        return write_segmentation_report(
+            os.path.join(output_dir, "segmentation_report.txt"),
+            class_names=class_names,
+            label_values=label_values,
+            voxels_per_timepoint=voxels_per_timepoint,
+            volume_shape=volume_shape,
+            dataset_info=dataset_info,
+            roi_info=roi_info,
+            settings=settings,
+            notes=notes,
+        )
+
     def _export_class_histogram(self, timepoint, name, mask_3d, output_dir,
                                 path_prefix):
         """Write the bimodal histogram of one segmented class.
@@ -5187,11 +5295,13 @@ class BiTS4DMainWindow(QMainWindow):
         do_xray      = dlg.export_xray
         do_labels    = dlg.export_labels
         do_histogram = dlg.export_histogram
+        do_report    = dlg.export_report
 
         if not sel_layers:
             QMessageBox.warning(self, "Nothing selected", "No layers were selected for export.")
             return
-        if not (do_mask or do_neutron or do_xray or do_labels or do_histogram):
+        if not (do_mask or do_neutron or do_xray or do_labels or do_histogram
+                or do_report):
             QMessageBox.warning(self, "Nothing selected", "No output modalities were selected.")
             return
 
@@ -5243,6 +5353,15 @@ class BiTS4DMainWindow(QMainWindow):
                 p = os.path.join(output_dir, f"{base}_labels.tif")
                 tifffile.imwrite(p, label_vol)
                 files_written.append(os.path.basename(p))
+
+            if do_report:
+                report = self._write_segmentation_report(
+                    output_dir,
+                    [name for _m, _c, name in sel_layers],
+                    [current_t],
+                    {current_t: sel_layers},
+                )
+                files_written.append(os.path.basename(report))
 
             preview = "\n".join(f"• {f}" for f in files_written[:10])
             if len(files_written) > 10:
@@ -5297,11 +5416,13 @@ class BiTS4DMainWindow(QMainWindow):
         do_xray      = dlg.export_xray
         do_labels    = dlg.export_labels
         do_histogram = dlg.export_histogram
+        do_report    = dlg.export_report
 
         if not sel_names:
             QMessageBox.warning(self, "Nothing selected", "No layers were selected.")
             return
-        if not (do_mask or do_neutron or do_xray or do_labels or do_histogram):
+        if not (do_mask or do_neutron or do_xray or do_labels or do_histogram
+                or do_report):
             QMessageBox.warning(self, "Nothing selected", "No output modalities were selected.")
             return
 
@@ -5334,6 +5455,16 @@ class BiTS4DMainWindow(QMainWindow):
                 total_files += len(
                     save_bin_edges(self.global_histogram, output_dir)
                 )
+
+            # One fixed class order for the whole batch, so label values are
+            # stable across timepoints and the report legend applies to all.
+            class_order = [
+                name for _m, _c, name in dlg.selected_layers if name in sel_names
+            ]
+            label_values = {
+                name: index for index, name in enumerate(class_order, start=1)
+            }
+            exported_layers = {}
 
             for i, (t, layers) in enumerate(sorted(self.segmentation_masks.items())):
                 if not layers:
@@ -5376,16 +5507,28 @@ class BiTS4DMainWindow(QMainWindow):
                             t, name, mask_bool, output_dir, pfx
                         ))
 
+                exported_layers[t] = t_layers
+
                 if do_labels:
                     label_vol = np.zeros(neutron_vol.shape, dtype=np.uint8)
-                    for idx, (mask_3d, _, _) in enumerate(t_layers, start=1):
-                        label_vol[mask_3d.astype(bool)] = idx
+                    # Label values come from the fixed class order, not this
+                    # timepoint's list, so a value means the same class in
+                    # every exported volume even if a class is missing here.
+                    for mask_3d, _color, layer_name in t_layers:
+                        label_vol[mask_3d.astype(bool)] = label_values[layer_name]
                     tifffile.imwrite(
                         os.path.join(output_dir, f"{base}_labels.tif"), label_vol
                     )
                     total_files += 1
 
             progress.setValue(num_timepoints)
+
+            if do_report and exported_layers:
+                self._write_segmentation_report(
+                    output_dir, class_order,
+                    sorted(exported_layers), exported_layers,
+                )
+                total_files += 1
 
             if total_files > 0:
                 QMessageBox.information(
@@ -5707,6 +5850,149 @@ class BiTS4DMainWindow(QMainWindow):
                 self, "Image Saved",
                 f"{title} saved to:\n{saved}\n\n{explanation}"
             )
+
+    def _collect_metrics_rows(self, progress_callback=None, cancel_check=None):
+        """Metrics for the global histogram and for every timepoint.
+
+        The global row analyses the whole-dataset histogram with the classes
+        of the reference timepoint; each timepoint row analyses that
+        timepoint's local histogram and its own classes. Delta_n and the
+        drift metrics are measured against the first segmented timepoint.
+        """
+        from utils.histogram_metrics import (
+            MetricsRow, compute_class_metrics, compute_shape_metrics,
+        )
+
+        num_timepoints = self.dataset.num_timepoints
+        rows = []
+
+        def class_masks_for(timepoint):
+            return {
+                name: mask for mask, _color, name in self._visible_layers(timepoint)
+            }
+
+        # Global scope: whole-dataset histogram, classes of the first
+        # segmented timepoint (they are what the histogram ROIs describe).
+        reference_t = next(
+            (t for t in range(num_timepoints) if class_masks_for(t)), None
+        )
+        global_row = MetricsRow(scope="global")
+        global_row.scalars.update(compute_shape_metrics(self.global_histogram))
+        if reference_t is not None:
+            neutron_vol, xray_vol = self.dataset.get_volume_at_time(reference_t)
+            scalars, per_class, _ = compute_class_metrics(
+                neutron_vol, xray_vol, class_masks_for(reference_t)
+            )
+            global_row.scalars.update(scalars)
+            global_row.per_class = per_class
+        rows.append(global_row)
+
+        # Per-timepoint scope
+        reference_hist = None
+        reference_centroids = None
+        for timepoint in range(num_timepoints):
+            if cancel_check:
+                cancel_check()
+
+            local_hist = self.histogram_engine.get_cached_local_histogram(timepoint)
+            if local_hist is None:
+                local_hist = self.histogram_engine.compute_local_histogram(
+                    self.dataset.neutron_data[timepoint],
+                    self.dataset.xray_data[timepoint],
+                    timepoint,
+                )
+            if reference_hist is None:
+                reference_hist = local_hist
+
+            row = MetricsRow(scope="timepoint", timepoint=timepoint)
+            row.scalars.update(
+                compute_shape_metrics(local_hist, reference=reference_hist)
+            )
+
+            masks = class_masks_for(timepoint)
+            if masks:
+                neutron_vol, xray_vol = self.dataset.get_volume_at_time(timepoint)
+                scalars, per_class, centroids = compute_class_metrics(
+                    neutron_vol, xray_vol, masks,
+                    reference_centroids=reference_centroids,
+                )
+                row.scalars.update(scalars)
+                row.per_class = per_class
+                if reference_centroids is None:
+                    reference_centroids = centroids
+            rows.append(row)
+
+            if progress_callback:
+                progress_callback(
+                    int(95 * (timepoint + 1) / num_timepoints),
+                    f"Metrics for timepoint {timepoint + 1}/{num_timepoints}",
+                )
+        return rows
+
+    def _on_export_histogram_metrics(self):
+        """Compute the metrics and save them as a CSV plus evolution plots."""
+        from PyQt5.QtWidgets import QFileDialog
+        from utils.cancellation import OperationCancelled, OperationFailed
+        from utils.histogram_metrics import (
+            plot_metric_evolution, write_metrics_csv,
+        )
+
+        if not self.dataset or not self.histogram_engine:
+            QMessageBox.information(self, "No Data", "Load a dataset first.")
+            return
+        if self.global_histogram is None:
+            QMessageBox.information(
+                self, "No Histograms", "Compute the global histogram first."
+            )
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Metrics CSV", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not filepath:
+            return
+        if not filepath.lower().endswith(".csv"):
+            filepath += ".csv"
+        plot_path = filepath[:-4] + "_evolution.png"
+
+        def operation(progress_callback=None, cancel_check=None):
+            rows = self._collect_metrics_rows(progress_callback, cancel_check)
+            if progress_callback:
+                progress_callback(97, "Writing CSV and plots...")
+            write_metrics_csv(rows, filepath)
+            return rows, plot_metric_evolution(rows, plot_path)
+
+        try:
+            result = run_with_progress(
+                self, "Histogram Metrics",
+                "Computing metrics for every timepoint...", operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            return
+        if result is None:
+            return
+
+        rows, saved_plot = result
+        segmented = sum(
+            1 for row in rows if row.scope == "timepoint" and row.per_class.get("voxels_k")
+        )
+        message = (
+            f"Metrics written to:\n{filepath}\n\n"
+            f"{len(rows) - 1} timepoint(s) analysed, "
+            f"{segmented} with segmentation classes."
+        )
+        if saved_plot:
+            message += f"\n\nEvolution plot:\n{saved_plot}"
+        else:
+            message += "\n\n(No evolution plot — it needs at least 2 timepoints.)"
+        if not segmented:
+            message += (
+                "\n\nClass metrics (DB, spreads, elongation, drift) need "
+                "segmented classes; only the histogram shape metrics were "
+                "computed."
+            )
+        self.status_bar.showMessage(f"Metrics saved: {filepath}")
+        QMessageBox.information(self, "Metrics Saved", message)
 
     def _on_export_histogram_evolution(self):
         """Save each timepoint's log-histogram change against T0."""

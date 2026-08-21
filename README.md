@@ -36,7 +36,16 @@ back to voxels.
   TIFF / CSV / Excel / PDF. Exports are named after your classes
   ("Lithium", not "Class 1"), and can optionally include the **bimodal
   histogram of each class** at every timepoint, computed on the main
-  histogram's bin grid so the files compare directly.
+  histogram's bin grid so the files compare directly, plus a
+  **`segmentation_report.txt`** recording each class's name, its integer
+  value in the exported label volumes, its voxel count at every timepoint,
+  and the settings the segmentation was made with.
+- **Quality metrics** — *Analytics → Histogram Time Analysis → Histogram &
+  Segmentation Metrics* writes a CSV of every ground-truth-free metric
+  (streak and smear scores, marginal asymmetry and drift, Davies–Bouldin
+  separability, per-class spread, elongation and centroid drift) for the
+  global histogram and for each timepoint, plus a multi-panel plot of how
+  each one evolves. See [docs/metrics.md](docs/metrics.md).
 - **Big-dataset mode** — all histograms are computed once at load and served
   from memory; volumes larger than 1 GiB are median-binned for display (with
   segmentation still running at full resolution), so time scrolling and
@@ -87,7 +96,10 @@ python main.py
 4. **Generalise (optional)** — on the *🌳 Random Forest* tab, train on the
    segmented reference timepoint and predict the remaining timepoints.
 5. **Export** — masked volumes, binary masks, and label maps as TIFF;
-   statistics as CSV/Excel; reports as PDF.
+   per-class bimodal histograms and a `segmentation_report.txt`; statistics
+   as CSV/Excel; reports as PDF.
+6. **Measure (optional)** — *Analytics → Histogram Time Analysis →
+   Histogram & Segmentation Metrics* for the metrics CSV and evolution plot.
 
 ## Library usage (no GUI)
 
@@ -114,9 +126,10 @@ stats = SegmentationEngine4D.get_temporal_statistics(mask_4d, neutron, xray)
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the module map, the
-histogram coordinate conventions, and extension guidelines, and
-[`docs/changes.md`](docs/changes.md) for the bug-fix history of this
-refactoring pass.
+histogram coordinate conventions, and extension guidelines,
+[`docs/metrics.md`](docs/metrics.md) for the quality metrics and their CSV
+layout, and [`docs/changes.md`](docs/changes.md) for the bug-fix history of
+this refactoring pass.
 
 ## Testing
 

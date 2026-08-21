@@ -34,6 +34,8 @@ Computation layer (GUI-independent, scriptable):
     utils/progress_dialog.py      Worker thread + cancellable progress dialogs
     utils/cancellation.py         CancellationToken, OperationCancelled/Failed
     utils/selection_library.py    Selection persistence + CSV/Excel export
+    utils/histogram_metrics.py    Ground-truth-free quality metrics + CSV/plots
+    utils/segmentation_report.py  Text report describing an exported segmentation
     utils/config.py               Application-wide defaults
 ```
 
@@ -188,6 +190,39 @@ all three under *Analytics → Histogram Time Analysis*, driven by the shared
 `_run_histogram_time_analysis()` helper, which gathers the histograms and
 delegates rendering. `notebooks/joint_hist_4d-5.ipynb` on `main` is the
 reference implementation for these figures.
+
+## Quality metrics
+
+`utils/histogram_metrics.py` implements the subset of the reference metric
+tables (`metrics_table.py`, `metrics_table_morphology.py`) that needs **no
+ground truth**, because measured data has no phantom to anchor on:
+
+- **Shape metrics** (`S_h`, `S_v`, `S_d`, `A_x`) are computed from a
+  `HistogramData` alone. `Delta_n` additionally needs a *reference*
+  histogram, for which the time series supplies the first timepoint.
+- **Class metrics** (`DB`, `CD`, per-class `sigma_n_k`, `sigma_x_k`, `E_k`,
+  centroids, `drift_k`, `voxels_k`) are computed over the user's existing
+  segmentation classes, where they are ordinary internal cluster indices.
+
+`eps_k`, `CE` and `O_ab` are deliberately absent — all three measure distance
+to *known* material positions or labels. `CD`, the mean class-centroid drift
+against T0, is the honest time-series analogue of `CE`.
+
+`MetricsRow` is the transport unit: one row per scope (`global` plus one per
+timepoint), carrying a `scalars` dict and a `per_class` dict of
+`metric -> {class name -> value}`. `write_metrics_csv()` flattens rows into a
+long-format, self-describing CSV (label, unit, meaning, direction that is
+better), and `plot_metric_evolution()` renders one panel per metric with the
+global value as a dashed reference. `BiTS4DMainWindow._collect_metrics_rows()`
+is the only place that knows about the GUI: it pairs the cached local
+histograms with `_visible_layers(timepoint)` so hidden classes are excluded
+from the metrics exactly as they are from segmentation.
+
+`utils/segmentation_report.py` writes the companion `segmentation_report.txt`
+during export. `_write_segmentation_report()` derives the label values from
+the **export order** of the selected layers — the same fixed `class_order`
+the batch export uses to fill the label volumes, so a value means the same
+class at every timepoint.
 
 ## Slice-viewer overlays
 
