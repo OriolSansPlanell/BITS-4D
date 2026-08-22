@@ -1841,6 +1841,214 @@ class SliceViewerWidget(QWidget):
         self.canvas.draw_idle()
 
 
+class AnchorSelectionDialog(QDialog):
+    """Pick the classes to treat as chemically inert.
+
+    An anchor is a phase that cannot really change during the experiment, so
+    any movement of its histogram centroid must be instrumental. Picking a
+    reactive class here would fit the physics away as if it were drift, which
+    is why the choice is the user's and not a default.
+    """
+
+    def __init__(self, class_names, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Anchor Classes")
+        self.anchor_classes = []
+        self.estimate_scale = False
+
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Choose the classes that cannot change chemically during the\n"
+            "experiment — an inert container, a support, a structural metal.\n"
+            "Their movement measures the instrument, not the sample.\n\n"
+            "Do not choose a reacting phase: its real change would be\n"
+            "subtracted from every other class as if it were drift."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self._checkboxes = []
+        for name in class_names:
+            box = QCheckBox(name)
+            layout.addWidget(box)
+            self._checkboxes.append((name, box))
+
+        self.scale_box = QCheckBox(
+            "Also fit a per-axis gain (needs two or more separated anchors)"
+        )
+        self.scale_box.setToolTip(
+            "A gain change stretches the histogram as well as shifting it.\n"
+            "With a single anchor the gain is not identifiable and is left\n"
+            "at 1.0."
+        )
+        layout.addWidget(self.scale_box)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self
+        )
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept(self):
+        self.anchor_classes = [
+            name for name, box in self._checkboxes if box.isChecked()
+        ]
+        self.estimate_scale = self.scale_box.isChecked()
+        if not self.anchor_classes:
+            QMessageBox.warning(
+                self, "No Anchors",
+                "Select at least one class to use as an anchor."
+            )
+            return
+        self.accept()
+
+
+class ModelSegmentationDialog(QDialog):
+    """Settings for tracking the manual classes across the series."""
+
+    def __init__(self, class_names, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Model-Based Segmentation")
+        self.class_names = list(class_names)
+
+        self.anchor_strength = 0.5
+        self.anchor_classes = []
+        self.estimate_scale = False
+        self.beta = 1.0
+        self.sweeps = 5
+        self.memory = 0.5
+        self.reject_margin = None
+        self.outlier_component = True
+        self.detect_mixels = True
+
+        layout = QVBoxLayout(self)
+        header = QLabel(
+            "Your classes become the model's prior instead of a frozen\n"
+            "boundary. Each one is free to follow the data as far as the\n"
+            "anchor strength allows, and no further."
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        anchor_group = QGroupBox("Anchor strength")
+        anchor_layout = QVBoxLayout(anchor_group)
+        self.strength_spin = QDoubleSpinBox()
+        self.strength_spin.setRange(0.0, 1.0)
+        self.strength_spin.setSingleStep(0.05)
+        self.strength_spin.setValue(0.5)
+        self.strength_spin.setToolTip(
+            "0.00  free mixture: follows the data, and also the noise\n"
+            "0.50  the T0 selection counts for as much as the data\n"
+            "1.00  frozen at T0: the fixed-ROI behaviour\n\n"
+            "Scaled by each class's own size, so the same value means the\n"
+            "same thing for a 1% phase and a 40% one."
+        )
+        anchor_layout.addWidget(self.strength_spin)
+        layout.addWidget(anchor_group)
+
+        drift_group = QGroupBox("Instrumental drift (optional)")
+        drift_layout = QVBoxLayout(drift_group)
+        drift_note = QLabel(
+            "Classes that cannot change chemically. Their movement is "
+            "instrumental by definition and corrects every other class."
+        )
+        drift_note.setWordWrap(True)
+        drift_layout.addWidget(drift_note)
+        self._anchor_boxes = []
+        for name in self.class_names:
+            box = QCheckBox(name)
+            drift_layout.addWidget(box)
+            self._anchor_boxes.append((name, box))
+        self.scale_box = QCheckBox("Also fit a per-axis gain")
+        drift_layout.addWidget(self.scale_box)
+        layout.addWidget(drift_group)
+
+        spatial_group = QGroupBox("Spatial coherence")
+        spatial_layout = QVBoxLayout(spatial_group)
+        self.beta_spin = QDoubleSpinBox()
+        self.beta_spin.setRange(0.0, 20.0)
+        self.beta_spin.setSingleStep(0.25)
+        self.beta_spin.setValue(1.0)
+        self.beta_spin.setToolTip(
+            "Strength of the spatial smoothing. 0 turns it off and gives the\n"
+            "raw per-voxel mixture labels, which are speckled — a mixture on\n"
+            "its own has no spatial term at all.\n"
+            "The cost of each class boundary is learned from your own T0\n"
+            "labels, so common boundaries stay cheap."
+        )
+        spatial_layout.addWidget(QLabel("Smoothing strength"))
+        spatial_layout.addWidget(self.beta_spin)
+        layout.addWidget(spatial_group)
+
+        temporal_group = QGroupBox("Between timepoints")
+        temporal_layout = QVBoxLayout(temporal_group)
+        self.memory_spin = QDoubleSpinBox()
+        self.memory_spin.setRange(0.0, 1.0)
+        self.memory_spin.setSingleStep(0.1)
+        self.memory_spin.setValue(0.5)
+        self.memory_spin.setToolTip(
+            "How much of each timepoint's prior comes from the timepoint\n"
+            "before rather than from T0.\n"
+            "0 re-anchors to T0 every time; 1 is a pure random walk that\n"
+            "stops looking back at your selection."
+        )
+        temporal_layout.addWidget(QLabel("Memory of the previous timepoint"))
+        temporal_layout.addWidget(self.memory_spin)
+        layout.addWidget(temporal_group)
+
+        self.outlier_box = QCheckBox(
+            "Absorb unrecognised voxels into an outlier class"
+        )
+        self.outlier_box.setChecked(True)
+        self.outlier_box.setToolTip(
+            "A uniform component that takes padding, artifacts and materials\n"
+            "you did not model, instead of forcing them into whichever real\n"
+            "class happens to be nearest."
+        )
+        layout.addWidget(self.outlier_box)
+
+        self.reject_box = QCheckBox(
+            "Leave low-confidence voxels unassigned"
+        )
+        self.reject_box.setToolTip(
+            "Voxels no class claims strongly are reported as unassigned\n"
+            "rather than given the best of a bad set of options."
+        )
+        layout.addWidget(self.reject_box)
+
+        self.mixel_box = QCheckBox(
+            "Look for mixing lines (partial-volume classes)"
+        )
+        self.mixel_box.setChecked(True)
+        self.mixel_box.setToolTip(
+            "Flags a class that is really the boundary between two others —\n"
+            "elongated along the line joining them. Such a class is a\n"
+            "fraction, not a phase, and a hard label for it is ill-posed."
+        )
+        layout.addWidget(self.mixel_box)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self
+        )
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept(self):
+        self.anchor_strength = float(self.strength_spin.value())
+        self.anchor_classes = [
+            name for name, box in self._anchor_boxes if box.isChecked()
+        ]
+        self.estimate_scale = self.scale_box.isChecked()
+        self.beta = float(self.beta_spin.value())
+        self.memory = float(self.memory_spin.value())
+        self.outlier_component = self.outlier_box.isChecked()
+        self.reject_margin = 0.5 if self.reject_box.isChecked() else None
+        self.detect_mixels = self.mixel_box.isChecked()
+        self.accept()
+
+
 class ExportOptionsDialog(QDialog):
     """
     Dialog that lets the user choose which segmentation layers and which
@@ -2061,6 +2269,8 @@ class BiTS4DMainWindow(QMainWindow):
 
         # Current state
         self.global_histogram = None
+        # Result of the last model-based run, kept for inspection/export
+        self.model_result = None
         # segmentation_masks: {timepoint -> [(mask_3d, color, name), ...]}
         # Each entry is one coloured segmentation layer for that timepoint.
         self.segmentation_masks = {}
@@ -2707,6 +2917,51 @@ class BiTS4DMainWindow(QMainWindow):
         )
         metrics_action.triggered.connect(self._on_export_histogram_metrics)
         hist_menu.addAction(metrics_action)
+
+        spatial_metrics_action = QAction("Spatial Metrics...", self)
+        spatial_metrics_action.setToolTip(
+            "Metrics computed in the volume rather than the histogram plane:\n"
+            "centre of mass and its drift, radius of gyration, connected\n"
+            "components, surface-to-volume, and class interface areas.\n"
+            "A speckled or displaced segmentation is invisible to the\n"
+            "histogram metrics but obvious here."
+        )
+        spatial_metrics_action.triggered.connect(self._on_export_spatial_metrics)
+        hist_menu.addAction(spatial_metrics_action)
+
+        analytics_menu.addSeparator()
+
+        # ── Model-based time-series segmentation ────────────────────────
+        model_menu = analytics_menu.addMenu("Model-Based Segmentation")
+
+        model_run_action = QAction("Track Classes Across Time...", self)
+        model_run_action.setToolTip(
+            "Segment the whole series with a mixture anchored on your ROIs\n"
+            "instead of a frozen histogram polygon. Follows instrumental\n"
+            "drift measured on inert anchor classes, and regularises the\n"
+            "result spatially so it is not speckled."
+        )
+        model_run_action.triggered.connect(self._on_model_segmentation)
+        model_menu.addAction(model_run_action)
+
+        drift_action = QAction("Estimate Instrumental Drift...", self)
+        drift_action.setToolTip(
+            "Measure how far the histogram has moved at each timepoint,\n"
+            "using classes that cannot chemically change. Any movement of an\n"
+            "inert class is instrumental by definition."
+        )
+        drift_action.triggered.connect(self._on_estimate_drift)
+        model_menu.addAction(drift_action)
+
+        block_cv_action = QAction("Block Cross-Validation (Random Forest)...", self)
+        block_cv_action.setToolTip(
+            "Honest Random Forest accuracy: holds out contiguous 3-D blocks,\n"
+            "so the score is not inflated by neighbouring voxels that are\n"
+            "near-duplicates of the training data. Expect a lower number\n"
+            "than the training accuracy."
+        )
+        block_cv_action.triggered.connect(self._on_block_cross_validation)
+        model_menu.addAction(block_cv_action)
 
         analytics_menu.addSeparator()
         
@@ -5993,6 +6248,485 @@ class BiTS4DMainWindow(QMainWindow):
             )
         self.status_bar.showMessage(f"Metrics saved: {filepath}")
         QMessageBox.information(self, "Metrics Saved", message)
+
+    # ── model-based time-series segmentation ─────────────────────────────
+    def _model_class_masks(self, timepoint):
+        """Visible class layers at *timepoint* as ``{name: mask}``."""
+        return {
+            name: np.asarray(mask, dtype=bool)
+            for mask, _color, name in self._visible_layers(timepoint)
+        }
+
+    def _on_model_segmentation(self):
+        """Track the manual classes across the series with the anchored model."""
+        from utils.cancellation import OperationCancelled, OperationFailed
+
+        if not self.dataset or self.global_histogram is None:
+            QMessageBox.information(
+                self, "No Data",
+                "Load a dataset and compute the global histogram first."
+            )
+            return
+
+        reference = self.dataset.current_timepoint
+        masks = self._model_class_masks(reference)
+        if len(masks) < 1:
+            QMessageBox.information(
+                self, "No Classes",
+                "Segment the current timepoint first: the model uses your "
+                "classes as its prior, so it needs at least one to start from."
+            )
+            return
+
+        dialog = ModelSegmentationDialog(sorted(masks), self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        from model import (
+            DriftTracker, ROIAnchoredMixture, ROIDerivedMRF, SequentialSegmenter,
+        )
+        from model.temporal import DriftTransition, StaticTransition
+
+        tracker = None
+        if dialog.anchor_classes:
+            tracker = DriftTracker(
+                anchor_classes=dialog.anchor_classes,
+                estimate_scale=dialog.estimate_scale,
+            )
+        mrf = (
+            ROIDerivedMRF(beta=dialog.beta, n_sweeps=dialog.sweeps)
+            if dialog.beta > 0 else None
+        )
+        temporal = (
+            DriftTransition(memory=dialog.memory)
+            if dialog.memory > 0 else StaticTransition()
+        )
+        mixture = ROIAnchoredMixture(
+            outlier_component=dialog.outlier_component,
+            reject_margin=dialog.reject_margin,
+        )
+
+        neutron_reference, xray_reference = self.dataset.get_volume_at_time(reference)
+
+        def operation(progress_callback=None, cancel_check=None):
+            segmenter = SequentialSegmenter(
+                mixture=mixture, mrf=mrf, temporal=temporal,
+                drift_tracker=tracker, bins=self.histogram_engine.bins,
+            )
+            segmenter.prepare(
+                neutron_reference, xray_reference, masks,
+                self.global_histogram.x_edges, self.global_histogram.y_edges,
+                anchor_strength=dialog.anchor_strength,
+            )
+            outcome = segmenter.run(
+                self.dataset,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+            mixels = []
+            if dialog.detect_mixels and outcome.timepoints:
+                from model import detect_mixing_lines
+
+                mixels = detect_mixing_lines(outcome.timepoints[0].fit)
+            return outcome, mixels
+
+        try:
+            result = run_with_progress(
+                self, "Model-Based Segmentation",
+                "Tracking classes across the series...", operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            return
+        if result is None:
+            return
+
+        outcome, mixels = result
+        self._install_model_layers(outcome)
+        self.model_result = outcome
+        QMessageBox.information(
+            self, "Segmentation Complete",
+            self._model_segmentation_summary(outcome, mixels, dialog),
+        )
+
+    def _install_model_layers(self, outcome):
+        """Replace the segmentation layers with the model's output."""
+        for entry in outcome.timepoints:
+            timepoint = entry.timepoint
+            self.segmentation_masks[timepoint] = []
+            self._clear_layer_shapes(timepoint)
+            for index, name in enumerate(entry.class_names):
+                mask = entry.labels == index
+                if not mask.any():
+                    continue
+                color = self._OVERLAY_COLORS[index % len(self._OVERLAY_COLORS)]
+                self.segmentation_masks[timepoint].append((mask, color, name))
+
+        current = self.dataset.current_timepoint
+        neutron, xray = self.dataset.get_volume_at_time(current)
+        self._apply_segmentation_overlays(current, neutron, xray)
+
+    @staticmethod
+    def _model_segmentation_summary(outcome, mixels, dialog) -> str:
+        lines = [f"{len(outcome)} timepoint(s) segmented."]
+        drifts = [
+            entry.drift.magnitude for entry in outcome.timepoints
+            if entry.drift is not None
+        ]
+        if drifts:
+            lines.append(
+                f"Instrumental drift: up to {max(drifts):.4g} intensity units "
+                f"since T0."
+            )
+        unassigned = sum(entry.unassigned_voxels for entry in outcome.timepoints)
+        if unassigned:
+            lines.append(
+                f"{unassigned:,} voxel(s) left unassigned — invalid, or the "
+                f"model declined to recognise them."
+            )
+        dormant = [
+            name for entry in outcome.timepoints
+            if entry.transition is not None
+            for name in entry.transition.dormant
+        ]
+        if dormant:
+            lines.append(
+                "Went dormant (kept, not deleted): " + ", ".join(sorted(set(dormant)))
+            )
+        clipped = {
+            name for entry in outcome.timepoints
+            if entry.transition is not None
+            for name in entry.transition.clipped
+        }
+        if clipped:
+            lines.append(
+                "Implausible jump clipped for: " + ", ".join(sorted(clipped))
+            )
+        if mixels:
+            lines.append(
+                "Possible mixing lines (partial volume rather than a phase): "
+                + ", ".join(
+                    f"{m.name} between {m.phase_a} and {m.phase_b}" for m in mixels
+                )
+            )
+        lines.append(
+            f"\nAnchor strength {dialog.anchor_strength:.2f} "
+            f"(0 = free mixture, 1 = frozen at T0)."
+        )
+        return "\n".join(lines)
+
+    def _on_estimate_drift(self):
+        """Measure the histogram's instrumental drift across the series."""
+        from PyQt5.QtWidgets import QFileDialog
+        from utils.cancellation import OperationCancelled, OperationFailed
+
+        if not self.dataset or self.global_histogram is None:
+            QMessageBox.information(
+                self, "No Data",
+                "Load a dataset and compute the global histogram first."
+            )
+            return
+        reference = self.dataset.current_timepoint
+        masks = self._model_class_masks(reference)
+        if not masks:
+            QMessageBox.information(
+                self, "No Classes",
+                "Segment a timepoint first, then choose which of its classes "
+                "are chemically inert."
+            )
+            return
+
+        dialog = AnchorSelectionDialog(sorted(masks), self)
+        if dialog.exec_() != QDialog.Accepted or not dialog.anchor_classes:
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Drift Estimates", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not filepath:
+            return
+        if not filepath.lower().endswith(".csv"):
+            filepath += ".csv"
+
+        neutron_reference, xray_reference = self.dataset.get_volume_at_time(reference)
+
+        def operation(progress_callback=None, cancel_check=None):
+            import csv
+
+            from model import (
+                DriftTracker, build_histogram_cache, build_valid_mask,
+                estimate_process_noise, moments_from_mask,
+            )
+
+            valid = build_valid_mask(neutron_reference, xray_reference)
+            moments = {}
+            for name, mask in masks.items():
+                entry = moments_from_mask(
+                    neutron_reference, xray_reference, mask & valid
+                )
+                if entry is not None:
+                    moments[name] = entry
+
+            tracker = DriftTracker(
+                anchor_classes=dialog.anchor_classes,
+                estimate_scale=dialog.estimate_scale,
+            )
+            tracker.fit_reference(moments)
+
+            estimates = []
+            previous = None
+            total = self.dataset.num_timepoints
+            for timepoint in range(total):
+                if cancel_check:
+                    cancel_check()
+                neutron, xray = self.dataset.get_volume_at_time(timepoint)
+                cache = build_histogram_cache(
+                    neutron, xray,
+                    self.global_histogram.x_edges,
+                    self.global_histogram.y_edges,
+                    valid_mask=build_valid_mask(neutron, xray),
+                )
+                estimate = tracker.estimate(cache, timepoint, previous=previous)
+                estimates.append(estimate)
+                previous = estimate
+                if progress_callback:
+                    progress_callback(
+                        int(95 * (timepoint + 1) / total),
+                        f"Timepoint {timepoint + 1}/{total}",
+                    )
+
+            with open(filepath, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([
+                    "timepoint", "shift_neutron", "shift_xray", "magnitude",
+                    "scale_neutron", "scale_xray", "residual", "rejected_anchors",
+                ])
+                for estimate in estimates:
+                    writer.writerow([
+                        estimate.timepoint,
+                        estimate.shift[0], estimate.shift[1], estimate.magnitude,
+                        estimate.scale[0], estimate.scale[1], estimate.residual,
+                        "|".join(estimate.rejected_anchors),
+                    ])
+            return estimates, estimate_process_noise(estimates)
+
+        try:
+            result = run_with_progress(
+                self, "Instrumental Drift",
+                "Locating the anchor classes at each timepoint...", operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            return
+        if result is None:
+            return
+
+        estimates, noise = result
+        largest = max((e.magnitude for e in estimates), default=0.0)
+        rejected = sum(1 for e in estimates if e.rejected_anchors)
+        message = (
+            f"Drift estimates written to:\n{filepath}\n\n"
+            f"Largest shift since T0: {largest:.4g} intensity units.\n"
+            f"Instrumental noise floor (per-axis variance): "
+            f"{noise[0]:.4g}, {noise[1]:.4g}."
+        )
+        if rejected:
+            message += (
+                f"\n\n{rejected} timepoint(s) had an anchor rejected as "
+                f"implausibly far from where it was last seen; those carry the "
+                f"previous estimate forward."
+            )
+        self.status_bar.showMessage(f"Drift estimates saved: {filepath}")
+        QMessageBox.information(self, "Drift Estimated", message)
+
+    def _on_export_spatial_metrics(self):
+        """Spatial descriptors of the current segmentation, over time."""
+        from PyQt5.QtWidgets import QFileDialog
+        from utils.cancellation import OperationCancelled, OperationFailed
+        from utils.histogram_metrics import plot_metric_evolution, write_metrics_csv
+        from utils.metrics_spatial import combined_registry, spatial_metrics_rows
+
+        if not self.dataset:
+            QMessageBox.information(self, "No Data", "Load a dataset first.")
+            return
+        masks_by_timepoint = {
+            timepoint: self._model_class_masks(timepoint)
+            for timepoint in range(self.dataset.num_timepoints)
+        }
+        masks_by_timepoint = {
+            timepoint: masks for timepoint, masks in masks_by_timepoint.items()
+            if masks
+        }
+        if not masks_by_timepoint:
+            QMessageBox.information(
+                self, "No Segmentation",
+                "Segment at least one timepoint first — these metrics describe "
+                "the shape and position of the segmented classes."
+            )
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Spatial Metrics", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not filepath:
+            return
+        if not filepath.lower().endswith(".csv"):
+            filepath += ".csv"
+        plot_path = filepath[:-4] + "_evolution.png"
+
+        def operation(progress_callback=None, cancel_check=None):
+            if progress_callback:
+                progress_callback(10, "Measuring class shapes...")
+            rows = spatial_metrics_rows(masks_by_timepoint)
+            info, scalars, per_class = combined_registry()
+            if progress_callback:
+                progress_callback(85, "Writing CSV and plot...")
+            write_metrics_csv(
+                rows, filepath, metric_info=info,
+                scalar_metrics=scalars, per_class_metrics=per_class,
+            )
+            saved = plot_metric_evolution(
+                rows, plot_path, metric_info=info,
+                scalar_metrics=scalars, per_class_metrics=per_class,
+            )
+            return rows, saved
+
+        try:
+            result = run_with_progress(
+                self, "Spatial Metrics",
+                "Measuring the segmentation in the volume...", operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            return
+        if result is None:
+            return
+
+        rows, saved_plot = result
+        message = f"Spatial metrics written to:\n{filepath}\n\n"
+        message += f"{len(rows)} timepoint(s) measured."
+        if saved_plot:
+            message += f"\n\nEvolution plot:\n{saved_plot}"
+        else:
+            message += "\n\n(No evolution plot — it needs at least 2 timepoints.)"
+        self.status_bar.showMessage(f"Spatial metrics saved: {filepath}")
+        QMessageBox.information(self, "Spatial Metrics Saved", message)
+
+    def _on_block_cross_validation(self):
+        """Score the Random Forest on held-out contiguous blocks."""
+        from utils.cancellation import OperationCancelled, OperationFailed
+
+        if self.rf_engine is None or not self.rf_engine.is_trained:
+            QMessageBox.information(
+                self, "No Model",
+                "Train the Random Forest first — this re-scores that model's "
+                "configuration on held-out spatial blocks."
+            )
+            return
+
+        reference = (
+            self.rf_ref_spin.value() if hasattr(self, "rf_ref_spin") else 0
+        )
+        masks = self._model_class_masks(reference)
+        if len(masks) < 2:
+            QMessageBox.information(
+                self, "Not Enough Classes",
+                "Cross-validation needs at least two classes at the "
+                "timepoint the model was trained on."
+            )
+            return
+
+        neutron, xray = self.dataset.get_volume_at_time(reference)
+
+        def operation(progress_callback=None, cancel_check=None):
+            from sklearn.ensemble import RandomForestClassifier
+
+            from segmentation.features import extract_features_at_indices, resolve_spec
+            from segmentation.random_forest_4d import labels_from_manual
+            from utils.validation import block_cross_validation, block_ids_for_volume
+
+            spec = resolve_spec(self.rf_engine.feature_level)
+            label_volume = labels_from_manual(
+                np.zeros(neutron.shape, dtype=bool),
+                {index: mask for index, mask in enumerate(masks.values(), start=1)},
+            )
+            blocks = block_ids_for_volume(neutron.shape)
+            labelled = np.flatnonzero(label_volume.reshape(-1) > 0)
+            if labelled.size == 0:
+                raise ValueError("No labelled voxels to validate on")
+
+            rng = np.random.default_rng(0)
+            cap = 200_000
+            if labelled.size > cap:
+                labelled = rng.choice(labelled, cap, replace=False)
+
+            if progress_callback:
+                progress_callback(15, "Extracting features...")
+            features = extract_features_at_indices(neutron, xray, labelled, spec)
+            targets = label_volume.reshape(-1)[labelled]
+            groups = blocks.reshape(-1)[labelled]
+
+            engine = self.rf_engine
+
+            def factory():
+                return RandomForestClassifier(
+                    n_estimators=engine.n_estimators,
+                    min_samples_leaf=max(engine.min_samples_leaf, 1),
+                    max_depth=engine.max_depth,
+                    class_weight="balanced_subsample",
+                    random_state=engine.random_state,
+                    n_jobs=-1,
+                )
+
+            return block_cross_validation(
+                features, targets, groups, factory,
+                n_folds=8, progress_callback=progress_callback,
+            ), spec
+
+        try:
+            result = run_with_progress(
+                self, "Block Cross-Validation",
+                "Holding out contiguous blocks...", operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            return
+        if result is None:
+            return
+
+        validation, spec = result
+        names = list(masks)
+        lines = [validation.describe(), ""]
+        for index, name in enumerate(names, start=1):
+            value = validation.iou.get(index)
+            if value is not None and np.isfinite(value):
+                lines.append(f"  {name}: IoU {value:.3f}")
+
+        training = self.rf_engine.get_train_stats().get("training_accuracy")
+        if training is not None:
+            lines.append("")
+            lines.append(
+                f"Training accuracy was {100 * training:.2f}%. The gap is not a "
+                f"bug: neighbouring voxels are near-duplicates, so an in-sample "
+                f"score measures memorisation. The block figure is the one to "
+                f"quote."
+            )
+        anchoring = self.rf_engine.get_train_stats().get("anchoring_index", 0.0)
+        if anchoring and anchoring > 0.20:
+            lines.append("")
+            lines.append(
+                f"Anchoring index {anchoring:.2f}: about "
+                f"{100 * anchoring:.0f}% of this model's decision function "
+                f"rests on coordinates that are identical at every timepoint, "
+                f"so it is partly recalling T0 geometry rather than measuring. "
+                f"A time-invariant feature preset avoids that."
+            )
+        lines.append("")
+        lines.append(f"Features: {spec.describe()}")
+
+        QMessageBox.information(
+            self, "Block Cross-Validation", "\n".join(lines)
+        )
+        self.status_bar.showMessage(
+            f"Block CV: kappa {validation.kappa:.3f}, "
+            f"mean IoU {validation.mean_iou:.3f}"
+        )
 
     def _on_export_histogram_evolution(self):
         """Save each timepoint's log-histogram change against T0."""

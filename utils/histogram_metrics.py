@@ -347,18 +347,31 @@ def compute_class_metrics(
 
 # ── output ───────────────────────────────────────────────────────────────────
 
-def write_metrics_csv(rows: Sequence[MetricsRow], output_path) -> str:
-    """Write every scalar and per-class value as one long-format CSV."""
+def write_metrics_csv(rows: Sequence[MetricsRow], output_path,
+                      metric_info=None, scalar_metrics=None,
+                      per_class_metrics=None) -> str:
+    """Write every scalar and per-class value as one long-format CSV.
+
+    The three registry arguments let another module contribute metrics — the
+    spatial ones in :mod:`utils.metrics_spatial`, say — without this module
+    having to know about them. Rows written by different registries share the
+    schema, so the files concatenate.
+    """
+    metric_info = METRIC_INFO if metric_info is None else metric_info
+    scalar_metrics = SCALAR_METRICS if scalar_metrics is None else scalar_metrics
+    per_class_metrics = (
+        PER_CLASS_METRICS if per_class_metrics is None else per_class_metrics
+    )
     fieldnames = [
         "scope", "timepoint", "metric", "class", "value",
         "label", "unit", "meaning", "better_when",
     ]
     records = []
     for row in rows:
-        for metric in SCALAR_METRICS:
+        for metric in scalar_metrics:
             if metric not in row.scalars:
                 continue
-            info = METRIC_INFO[metric]
+            info = metric_info[metric]
             records.append({
                 "scope": row.scope,
                 "timepoint": "" if row.timepoint is None else row.timepoint,
@@ -370,8 +383,10 @@ def write_metrics_csv(rows: Sequence[MetricsRow], output_path) -> str:
                 "meaning": info["meaning"],
                 "better_when": info["better"],
             })
-        for metric in PER_CLASS_METRICS:
-            info = METRIC_INFO[metric]
+        for metric in per_class_metrics:
+            if metric not in metric_info:
+                continue
+            info = metric_info[metric]
             for class_name, value in row.per_class.get(metric, {}).items():
                 records.append({
                     "scope": row.scope,
@@ -393,12 +408,19 @@ def write_metrics_csv(rows: Sequence[MetricsRow], output_path) -> str:
 
 
 def plot_metric_evolution(rows: Sequence[MetricsRow], output_path,
-                          dpi: int = 130) -> Optional[str]:
+                          dpi: int = 130, metric_info=None,
+                          scalar_metrics=None,
+                          per_class_metrics=None) -> Optional[str]:
     """Plot every metric against time; one panel per metric.
 
     The global value, where one exists, is drawn as a dashed reference line.
     Returns None when there are fewer than two timepoints to plot.
     """
+    metric_info = METRIC_INFO if metric_info is None else metric_info
+    scalar_metrics = SCALAR_METRICS if scalar_metrics is None else scalar_metrics
+    per_class_metrics = (
+        PER_CLASS_METRICS if per_class_metrics is None else per_class_metrics
+    )
     timepoint_rows = sorted(
         (row for row in rows if row.scope == "timepoint"),
         key=lambda row: row.timepoint,
@@ -410,13 +432,15 @@ def plot_metric_evolution(rows: Sequence[MetricsRow], output_path,
     timepoints = [row.timepoint for row in timepoint_rows]
 
     panels = []
-    for metric in SCALAR_METRICS:
-        if metric == "n_classes":
+    for metric in scalar_metrics:
+        if metric == "n_classes" or metric not in metric_info:
             continue
         values = [row.scalars.get(metric) for row in timepoint_rows]
         if any(value is not None and np.isfinite(value) for value in values):
             panels.append(("scalar", metric, values))
-    for metric in PER_CLASS_METRICS:
+    for metric in per_class_metrics:
+        if metric not in metric_info:
+            continue
         class_names = sorted({
             name for row in timepoint_rows for name in row.per_class.get(metric, {})
         })
@@ -434,7 +458,7 @@ def plot_metric_evolution(rows: Sequence[MetricsRow], output_path,
 
     for index, (kind, metric, payload) in enumerate(panels):
         axis = axes[index // columns][index % columns]
-        info = METRIC_INFO[metric]
+        info = metric_info[metric]
 
         if kind == "scalar":
             series = [

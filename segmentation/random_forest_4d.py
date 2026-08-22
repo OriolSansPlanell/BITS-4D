@@ -7,11 +7,20 @@ from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import laplace, uniform_filter
 from sklearn.ensemble import RandomForestClassifier
 
+from segmentation.features import (
+    LEGACY_SPECS,
+    PRESETS,
+    FeatureSpec,
+    extract_features_at_indices,
+    resolve_spec,
+)
 
-_VALID_LEVELS = {"basic", "advanced", "expert"}
+# Legacy names, kept so saved models and existing notebooks keep working.
+# New code should pass a FeatureSpec or a preset name instead — see
+# segmentation/features.py for why the ladder was a problem.
+_VALID_LEVELS = set(LEGACY_SPECS)
 
 
 def _validate_pair(neutron_vol: np.ndarray, xray_vol: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -28,54 +37,17 @@ def _extract_features_at_indices(
     neutron_vol: np.ndarray,
     xray_vol: np.ndarray,
     indices: np.ndarray,
-    level: str = "basic",
+    level="basic",
 ) -> np.ndarray:
-    if level not in _VALID_LEVELS:
-        raise ValueError(f"Unknown feature level {level!r}; choose {_VALID_LEVELS}")
+    """Feature matrix for the voxels at *indices*.
+
+    *level* may be a legacy name (``'basic'``, ``'advanced'``, ``'expert'``),
+    a preset name, or a :class:`~segmentation.features.FeatureSpec`. The
+    legacy names produce exactly the columns they always did, in the same
+    order.
+    """
     neutron, xray = _validate_pair(neutron_vol, xray_vol)
-    indices = np.asarray(indices, dtype=np.int64)
-    n_flat = neutron.reshape(-1).astype(np.float32, copy=False)
-    x_flat = xray.reshape(-1).astype(np.float32, copy=False)
-    n = n_flat[indices]
-    x = x_flat[indices]
-
-    features = [
-        n,
-        x,
-        n / (x + np.float32(1e-6)),
-        n + x,
-        n - x,
-        np.hypot(n, x),
-    ]
-
-    if level in {"advanced", "expert"}:
-        z, y, x_coord = np.unravel_index(indices, neutron.shape)
-        denominators = [max(size - 1, 1) for size in neutron.shape]
-        features.extend(
-            [
-                z.astype(np.float32) / denominators[0],
-                y.astype(np.float32) / denominators[1],
-                x_coord.astype(np.float32) / denominators[2],
-            ]
-        )
-
-    if level == "expert":
-        for volume in (neutron, xray):
-            volume_float = volume.astype(np.float32, copy=False)
-            mean = uniform_filter(volume_float, size=3, mode="nearest")
-            mean_square = uniform_filter(volume_float * volume_float, size=3, mode="nearest")
-            variance = np.maximum(mean_square - mean * mean, 0.0)
-            features.append(mean.reshape(-1)[indices])
-            features.append(np.sqrt(variance, dtype=np.float32).reshape(-1)[indices])
-        features.append(
-            laplace(neutron.astype(np.float32, copy=False), mode="nearest")
-            .reshape(-1)[indices]
-        )
-
-    matrix = np.column_stack(features).astype(np.float32, copy=False)
-    if not np.all(np.isfinite(matrix)):
-        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
-    return matrix
+    return extract_features_at_indices(neutron, xray, indices, resolve_spec(level))
 
 
 def _extract_features(neutron_vol, xray_vol, level="basic") -> np.ndarray:
@@ -174,11 +146,27 @@ class RandomForestSegmentation4D:
         max_samples_per_class: int = 100_000,
         prediction_chunk_size: int = 1_000_000,
         random_state: int = 42,
+        min_samples_leaf: int = 50,
+        max_depth: Optional[int] = 20,
     ) -> None:
+        """
+        Parameters
+        ----------
+        min_samples_leaf, max_depth
+            Capacity limits. Neighbouring voxels are near-duplicates, so an
+            unrestricted forest grows leaves around individual voxels and
+            memorises the training volume — which inflates in-sample accuracy
+            without improving anything that transfers to another timepoint.
+            The defaults (50, 20) are deliberately tighter than scikit-learn's
+            (1, unlimited); pass ``min_samples_leaf=5, max_depth=None`` to
+            reproduce a model trained before this changed.
+        """
         self.n_estimators = int(n_estimators)
         self.max_samples_per_class = int(max_samples_per_class)
         self.prediction_chunk_size = int(prediction_chunk_size)
         self.random_state = int(random_state)
+        self.min_samples_leaf = int(min_samples_leaf)
+        self.max_depth = None if max_depth is None else int(max_depth)
         self.rf: Optional[RandomForestClassifier] = None
         self.scaler = None  # retained for backward-compatible model payloads
         self.feature_level = "basic"
@@ -215,8 +203,7 @@ class RandomForestSegmentation4D:
         labels_array = np.asarray(labels, dtype=np.int32)
         if labels_array.shape != neutron.shape:
             raise ValueError("labels must match the training volume shape")
-        if feature_level not in _VALID_LEVELS:
-            raise ValueError(f"Unknown feature level {feature_level!r}")
+        spec = resolve_spec(feature_level)
 
         labels_flat = labels_array.reshape(-1)
         sampled_indices = self._sample_indices(labels_flat)
@@ -226,10 +213,22 @@ class RandomForestSegmentation4D:
         y_train = labels_flat[sampled_indices]
         self.feature_level = feature_level
 
+        # The capacity limit is a ceiling, not a fixed size: a leaf floor of
+        # 50 is right for a million sampled voxels and fatal for a few
+        # hundred, where it would stop the forest splitting at all. Scale it
+        # to the training set so the intent — leaves that hold a
+        # neighbourhood rather than a voxel — survives at every dataset size.
+        n_train = int(len(y_train))
+        n_classes_train = max(int(np.unique(y_train).size), 1)
+        effective_leaf = int(
+            max(1, min(self.min_samples_leaf, n_train // (n_classes_train * 20)))
+        )
+
         self.rf = RandomForestClassifier(
             n_estimators=self.n_estimators,
-            min_samples_split=10,
-            min_samples_leaf=5,
+            min_samples_split=max(2 * effective_leaf, 10),
+            min_samples_leaf=effective_leaf,
+            max_depth=self.max_depth,
             random_state=self.random_state,
             n_jobs=-1,
             class_weight="balanced_subsample",
@@ -241,6 +240,24 @@ class RandomForestSegmentation4D:
         self.trained = True
 
         train_accuracy = float(np.mean(self.rf.predict(x_train) == y_train))
+
+        # How much of the decision function rests on features that are
+        # identical at every timepoint. Impurity importance over-weights
+        # continuous, high-cardinality features — which normalised
+        # coordinates are — so read this as an upper bound and confirm with
+        # utils.validation.permutation_anchoring_index on held-out blocks.
+        feature_names = spec.feature_names()
+        anchored = spec.anchored_features()
+        anchoring = 0.0
+        if anchored:
+            from utils.validation import anchoring_index
+
+            anchoring = float(
+                anchoring_index(
+                    self.rf.feature_importances_, feature_names, anchored
+                )
+            )
+
         unique_all, counts_all = np.unique(labels_flat, return_counts=True)
         unique_sample, counts_sample = np.unique(y_train, return_counts=True)
         self.train_stats = {
@@ -260,6 +277,14 @@ class RandomForestSegmentation4D:
             "training_accuracy": train_accuracy,
             "oob_score": float(getattr(self.rf, "oob_score_", np.nan)),
             "feature_level": feature_level,
+            "feature_spec": spec.describe(),
+            "feature_names": feature_names,
+            "anchored_features": anchored,
+            "anchoring_index": anchoring,
+            "time_invariant": bool(spec.is_time_invariant),
+            "min_samples_leaf": effective_leaf,
+            "min_samples_leaf_requested": self.min_samples_leaf,
+            "max_depth": self.max_depth,
             "class_balanced": True,
         }
         return dict(self.train_stats)
@@ -420,6 +445,8 @@ class RandomForestSegmentation4D:
             "max_samples_per_class": self.max_samples_per_class,
             "prediction_chunk_size": self.prediction_chunk_size,
             "random_state": self.random_state,
+            "min_samples_leaf": self.min_samples_leaf,
+            "max_depth": self.max_depth,
         }
         with Path(filepath).open("wb") as handle:
             pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -439,6 +466,9 @@ class RandomForestSegmentation4D:
             "prediction_chunk_size", self.prediction_chunk_size
         )
         self.random_state = payload.get("random_state", self.random_state)
+        # Models saved before capacity limits existed carry the old values
+        self.min_samples_leaf = payload.get("min_samples_leaf", self.min_samples_leaf)
+        self.max_depth = payload.get("max_depth", self.max_depth)
         self.trained = True
 
     @property

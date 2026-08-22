@@ -45,7 +45,20 @@ back to voxels.
   (streak and smear scores, marginal asymmetry and drift, Davies–Bouldin
   separability, per-class spread, elongation and centroid drift) for the
   global histogram and for each timepoint, plus a multi-panel plot of how
-  each one evolves. See [docs/metrics.md](docs/metrics.md).
+  each one evolves. *Spatial Metrics* adds the same for the volume —
+  centre of mass and its drift, radius of gyration, connected components,
+  surface-to-volume, class interface areas. See
+  [docs/metrics.md](docs/metrics.md).
+- **Model-based time-series segmentation** — *Analytics → Model-Based
+  Segmentation* replaces the frozen T0 boundary with a mixture **anchored**
+  on your ROIs. An anchor-strength dial runs from "frozen at T0" (the
+  fixed-ROI method) to an unconstrained mixture; instrumental drift is
+  measured on classes you declare chemically inert and applied to the model
+  rather than to your data; a Markov random field whose boundary costs are
+  learned from your own T0 labels keeps the result spatially coherent; and
+  classes that are really mixing lines between two phases are reported as
+  fractions instead of forced into a hard label. See
+  [docs/model_segmentation.md](docs/model_segmentation.md).
 - **Big-dataset mode** — all histograms are computed once at load and served
   from memory; volumes larger than 1 GiB are median-binned for display (with
   segmentation still running at full resolution), so time scrolling and
@@ -127,9 +140,13 @@ stats = SegmentationEngine4D.get_temporal_statistics(mask_4d, neutron, xray)
 
 See [`docs/architecture.md`](docs/architecture.md) for the module map, the
 histogram coordinate conventions, and extension guidelines,
+[`docs/model_segmentation.md`](docs/model_segmentation.md) for the
+model-based segmentation and what each of its controls does,
 [`docs/metrics.md`](docs/metrics.md) for the quality metrics and their CSV
-layout, and [`docs/changes.md`](docs/changes.md) for the bug-fix history of
-this refactoring pass.
+layout, [`docs/v17_plan_evaluation.md`](docs/v17_plan_evaluation.md) for how
+the v17 proposal was assessed and where it was corrected, and
+[`docs/changes.md`](docs/changes.md) for the bug-fix history of this
+refactoring pass.
 
 ## Testing
 
@@ -149,10 +166,11 @@ main.py                  Application entry point
 data/                    TIFF loading and 4D dataset container
 histograms/              Chunked CPU/GPU 2-D histogram engine
 segmentation/            ROI segmentation, Random Forest, K-means→RF conversion
-utils/                   ROI manager, clustering, region growing, exports, config
+model/                   Anchored mixture, MRF, drift tracking, sequential segmenter
+utils/                   ROI manager, clustering, region growing, metrics, exports
 gui/                     PyQt5 widgets (main window, histograms, viewers)
 tests/                   pytest suite
-docs/                    Architecture and change documentation
+docs/                    Architecture, method and change documentation
 ```
 
 ## License
