@@ -26,6 +26,15 @@ Computation layer (GUI-independent, scriptable):
                                   Memory-bounded RF training / prediction
     segmentation/kmeans_class_conversion.py
                                   K-means clusters → RF training layers
+    segmentation/features.py      Composable FeatureSpec (texture ⟂ geometry)
+    model/validity.py             Which voxels are measurements at all
+    model/histogram_cache.py      Per-bin sufficient statistics for the mixture
+    model/drift_tracker.py        Instrumental drift from inert anchor classes
+    model/mixture.py              ROI-anchored mixture, MAP-EM
+    model/spatial_prior.py        MRF with costs learned from the T0 labels
+    model/temporal.py             How a component may move between timepoints
+    model/partial_volume.py       Mixing lines as fractions, not classes
+    model/segmenter.py            The HMRF-EM loop over a series
     utils/roi_manager.py          Histogram-space ROI state + containment tests
     utils/clustering_3d.py        Scale-aware K-means on paired volumes
     utils/region_growing.py       2-D flood fill (uni/bivariate)
@@ -35,6 +44,8 @@ Computation layer (GUI-independent, scriptable):
     utils/cancellation.py         CancellationToken, OperationCancelled/Failed
     utils/selection_library.py    Selection persistence + CSV/Excel export
     utils/histogram_metrics.py    Ground-truth-free quality metrics + CSV/plots
+    utils/metrics_spatial.py      Metrics in the volume: shape, position, topology
+    utils/validation.py           Block CV, anchoring index, bootstrap bands
     utils/segmentation_report.py  Text report describing an exported segmentation
     utils/config.py               Application-wide defaults
 ```
@@ -223,6 +234,42 @@ during export. `_write_segmentation_report()` derives the label values from
 the **export order** of the selected layers — the same fixed `class_order`
 the batch export uses to fill the label volumes, so a value means the same
 class at every timepoint.
+
+## Model-based segmentation
+
+`model/` holds a GUI-independent pipeline that replaces the frozen T0
+histogram partition with a model in which the manual ROIs are the *prior*.
+Full user-facing description in [model_segmentation.md](model_segmentation.md);
+the design decisions worth knowing when extending it:
+
+- **`HistogramCache` stores moments, not just counts.** A mixture depends on
+  the data only through per-component sums of `1`, `v` and `v vᵀ`, so those
+  are accumulated per bin once. Because the first and second moments of each
+  bin are kept, the M-step is algebraically the voxel-level one — no
+  bin-centre approximation, and no Sheppard bias on the covariances. It also
+  makes the log-likelihood a genuine per-voxel quantity, so **BIC/ICL must
+  use `cache.num_voxels`**, never the number of occupied bins.
+- **Drift is applied to the model, never to the data.** `DriftEstimate`
+  transforms a component's `(μ, Σ)` into a timepoint's frame. Rewriting the
+  volumes would be a full pass per timepoint and would silently change the
+  units of every downstream export. Anything that needs normalised *values*
+  calls `DriftTracker.to_reference_frame` explicitly.
+- **Anchor strength is dimensionless.** `anchor_strength_to_kappa` maps
+  `[0, 1]` onto the NIW pseudo-count using the class's own T0 size, so a
+  setting means the same thing at every class size. Never expose κ₀ directly.
+- **The unary term is a per-bin table.** `UnaryScores` holds `[n_bins, K]`
+  plus a per-voxel row lookup, so ICM never materialises `[Z, Y, X, K]`.
+  Mean-field does, and `ROIDerivedMRF.refine` chooses between them from a
+  memory budget. Anything added to the spatial pass should keep working
+  through `column(k)` rather than assuming a dense array.
+- **Mixels are fitted after their parents**, not jointly. That keeps the EM
+  derivation intact and means a mispaired mixing line degrades a fractional
+  map instead of destabilising the whole mixture.
+
+`segmentation/features.py` decouples texture from frozen geometry. The legacy
+level names produce exactly the columns they always did, in the same order —
+there is a test asserting bit-for-bit equality — so saved models keep
+working; new work should pass a `FeatureSpec` or a preset name.
 
 ## Slice-viewer overlays
 

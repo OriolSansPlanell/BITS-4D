@@ -1,6 +1,82 @@
 # Bug-fix and cleanup notes
 
-## Quality metrics and the segmentation report (latest)
+## Model-based time-series segmentation (latest)
+
+Implements the BiTS v17 proposal. The plan's assessment — including which of
+its claims held against this codebase, which were addressed to a different
+one, and the seven places it was corrected — is in
+[v17_plan_evaluation.md](v17_plan_evaluation.md); the method and its controls
+are in [model_segmentation.md](model_segmentation.md).
+
+**The change.** A histogram ROI drawn at T0 is a frozen partition of the
+(neutron, X-ray) plane and cannot follow the drift every long series carries;
+it keeps segmenting, reports no error, and progressively segments the wrong
+thing. The new `model/` package keeps the manual selection as a *prior*
+instead: a Normal-Inverse-Wishart prior on each mixture component, centred on
+the moments of the voxels that ROI selects, whose strength interpolates
+between "frozen at T0" and an unconstrained mixture. Around it sit a validity
+mask, drift tracking on inert anchor classes, an MRF whose boundary costs are
+counted from the T0 labels, a temporal transition, and partial-volume
+components for classes that are really mixing lines.
+
+**Corrections to the plan as specified.** The hardcoded `neutron_floor=3000`
+became an opt-in policy (a floor tuned on one dataset deletes a real phase in
+the next); the histogram cache stores per-bin *moments* rather than counts,
+because fitting on bin centres inflates every covariance by the Sheppard
+bias; drift is applied to the model rather than by rewriting every volume,
+which keeps exports in native units; κ₀ is exposed as a dimensionless
+strength in [0, 1] scaled by class size; the anchoring index is documented as
+an upper bound and paired with a permutation version; and the mutually
+contradictory acceptance criteria were resolved by versioning the feature
+spec and the RF capacity limits.
+
+**Bugs found while building it.**
+
+* *M-step double-counting.* The first mixture implementation weighted the
+  per-bin moment sums by the bin count a second time, inflating every
+  covariance by roughly the mean bin occupancy until the uniform outlier
+  component won every voxel. `cache.sums` and `cache.scatter` already carry
+  the count; they take the bare responsibility.
+* *Drift tracking gave up where it was needed most.* The plausibility guard
+  compared each anchor against its T0 position, so on a series whose
+  cumulative drift exceeds a few σ every anchor was rejected exactly when the
+  drift was largest. The search is now cumulative — it starts from the
+  previous estimate and checks the step since then.
+* *Two anchors on one mode.* Neither moves implausibly far on its own, so the
+  distance guard sees nothing wrong, but the drift is then estimated from one
+  mode counted twice. All anchors involved in a collision are rejected;
+  picking one would be a guess dressed as a measurement.
+* *A uniform class reported elongation 0.* Already fixed in the previous
+  round for `E_k`; the same degenerate ratio appears in the mixel machinery
+  and is guarded there too.
+* *`interface_area` counted a class's own interior faces* when compared with
+  itself. Only voxels in exactly one of the two masks count now.
+* *`f_rind` and `n_interior_components` measured different erosion depths*,
+  so a small displaced object scored as a boundary rind with zero surviving
+  components — both signals failing at once. They now share a depth, and the
+  scale-dependence of `f_rind` is documented.
+* *Tightened RF capacity broke small training sets.* `min_samples_leaf=50`
+  with 80 training samples stops the forest splitting at all. The limit is
+  now a ceiling scaled to the training set, so the intent survives at every
+  dataset size.
+
+**Also new.** `utils/metrics_spatial.py` adds the metric family the software
+had none of — every previous quantity was computed in the histogram plane, so
+a speckled or displaced class was structurally invisible.
+`utils/validation.py` replaces in-sample accuracy with block
+cross-validation and adds bootstrap bands, the anchoring index and the
+temporal generalisation matrix. `segmentation/features.py` decouples texture
+features from frozen T0 coordinates — in the old ladder texture was
+unreachable without them, which made any experiment about either one
+uninterpretable — while reproducing the legacy feature columns bit-for-bit.
+
+**Not implemented, deliberately:** component birth-by-novelty (cannot be
+validated without data containing a genuinely new phase) and the fuel-cell
+path (where a dry reference exists, Beer–Lambert gives water thickness
+directly and segmenting first throws that away — which is the source plan's
+own advice).
+
+## Quality metrics and the segmentation report
 
 **Metrics.** *Analytics → Histogram Time Analysis → Histogram &
 Segmentation Metrics…* computes the ground-truth-free subset of the

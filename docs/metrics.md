@@ -1,5 +1,14 @@
 # Quality metrics
 
+Two families, sharing one CSV schema so their outputs concatenate:
+
+- **histogram metrics** — *Analytics → Histogram Time Analysis → Histogram &
+  Segmentation Metrics…* (this page);
+- **spatial metrics** — *Analytics → Histogram Time Analysis → Spatial
+  Metrics…* ([below](#spatial-metrics)).
+
+## Histogram metrics
+
 *Analytics → Histogram Time Analysis → Histogram & Segmentation Metrics…*
 
 Pick a CSV filename; BiTS 4D writes that file plus `<name>_evolution.png`
@@ -93,3 +102,73 @@ single timepoint has nothing to evolve.
 Class statistics on classes larger than 2 million voxels are computed on a
 random subsample of that size. Mean, spread and elongation are unchanged
 within sampling error, and `voxels_k` still reports the full count.
+
+---
+
+# Spatial metrics
+
+*Analytics → Histogram Time Analysis → Spatial Metrics…*
+
+Everything above lives in the (neutron, X-ray) plane. That is a real gap,
+because a segmentation failure is usually a **spatial** one: a class that is
+right in aggregate but scattered into a thousand speckles, a deposit whose
+centre of mass has walked across the sample, a rim that belongs to a boundary
+rather than to a phase. None of those move the histogram much, so a
+histogram-only metric set cannot see them.
+
+| Metric | Unit | Meaning | Better |
+| --- | --- | --- | --- |
+| `com_z_k`, `com_y_k`, `com_x_k` | voxels | Centre of mass of the class. | — |
+| `com_drift_k` | voxels | How far it has physically moved since the first timepoint it appears in. | — |
+| `rg_k` | voxels | Radius of gyration — grows when a compact deposit becomes diffuse. | — |
+| `n_components_k` | count | Connected components. A coherent phase is a few; a noisy segmentation is thousands. | lower |
+| `largest_frac_k` | fraction | Share of the class in its single biggest piece. | higher |
+| `sa_vol_k` | faces/voxel | Boundary roughness. Speckle drives it up. | lower |
+| `interface_kl` | faces | Shared surface between a class **pair** (the `class` column holds `A\|B`). The quantity that governs reaction kinetics at a boundary. | — |
+
+## Comparing two segmentations: rind or blob?
+
+`utils.metrics_spatial.disagreement_topology` answers the question two
+methods always raise. Erode what they disagree about and watch what survives:
+
+| Metric | Meaning |
+| --- | --- |
+| `disagreement_voxels` | Voxels labelled differently. |
+| `f_rind` | Share gone within two erosions. Near 1 = a boundary shell. |
+| `n_interior_components` | Compact clumps still standing at that depth. |
+
+A shell one or two voxels thick vanishes immediately: the methods agree about
+where the material is and differ only on partial-volume voxels, whose
+membership is fractional anyway — so the disagreement was never evidence
+about the interior. Clumps that survive are a real disagreement, and worth
+investigating.
+
+**Read both.** `f_rind` is scale-dependent: a genuinely displaced *small*
+object erodes away in two voxels just as a shell does. `n_interior_components`
+does not have that problem, so a high `f_rind` with a non-zero component count
+is still a real disagreement — about something thin.
+
+## Honest accuracy and error bars
+
+`utils/validation.py` covers the two quantities that do not mean what they
+appear to:
+
+- **`block_cross_validation`** — holds out contiguous 3-D blocks instead of
+  random voxels. Voxels are spatially autocorrelated, so an in-sample,
+  random-fold or out-of-bag score asks a model to recognise data it has
+  effectively already seen, which is why such numbers sit above 95 %
+  regardless of quality. Reports per-class IoU and Cohen's κ.
+- **`bootstrap_bands`** — resamples the training subsample and the random
+  seed and reports a band, which is what turns "these two methods differ by
+  6 %" into a claim that can be true or false rather than merely observed.
+  `difference_within_band` settles it.
+- **`anchoring_index`** — the share of a classifier's decision function
+  carried by features identical at every timepoint. Above 0.20, a fifth of
+  the segmentation is T0 geometric memory rather than measurement. The
+  impurity-based figure is an *upper bound* (impurity importance over-weights
+  continuous high-cardinality features, which normalised coordinates are);
+  `permutation_anchoring_index` computes it on held-out blocks instead.
+- **`temporal_generalisation_matrix`** — train at several timepoints, predict
+  all of them. A flat row generalises; a row decaying with `|t_pred − t_train|`
+  is extrapolating, and `staleness_half_life` turns that slope into a
+  re-anchoring interval.
