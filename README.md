@@ -28,9 +28,11 @@ back to voxels.
 - **Automated segmentation** — multi-level Otsu thresholding and K-means
   clustering (2-D slice, 3-D volume, or hybrid) that generate class masks
   and histogram overlays.
-- **Random Forest generalisation** — train on the segmented reference
-  timepoint (intensity, ratio, spatial, and texture features) and predict all
-  other timepoints with per-voxel confidence.
+- **Classifier generalisation (legacy)** — train on the segmented reference
+  timepoint and predict the others. No longer the recommended route: where a
+  material sits on the histogram is fixed by physics, so there is nothing
+  there for a classifier to learn that your own regions do not already state
+  exactly. Kept runnable for reproducing earlier work and for comparison.
 - **Analysis and export** — per-selection statistics, morphological analysis,
   time-series tracking, histogram-evolution maps, and export to
   TIFF / CSV / Excel / PDF. Exports are named after your classes
@@ -49,16 +51,15 @@ back to voxels.
   centre of mass and its drift, radius of gyration, connected components,
   surface-to-volume, class interface areas. See
   [docs/metrics.md](docs/metrics.md).
-- **Model-based time-series segmentation** — *Analytics → Model-Based
-  Segmentation* replaces the frozen T0 boundary with a mixture **anchored**
-  on your ROIs. An anchor-strength dial runs from "frozen at T0" (the
-  fixed-ROI method) to an unconstrained mixture; instrumental drift is
-  measured on classes you declare chemically inert and applied to the model
-  rather than to your data; a Markov random field whose boundary costs are
-  learned from your own T0 labels keeps the result spatially coherent; and
-  classes that are really mixing lines between two phases are reported as
-  fractions instead of forced into a hard label. See
-  [docs/model_segmentation.md](docs/model_segmentation.md).
+- **Time-series segmentation** — *Analytics → Time Series Segmentation*
+  measures every timepoint against the materials you drew once, with the
+  definitions held fixed so a change in a volume is a change in the sample.
+  Spatial smoothing strength is chosen automatically rather than left at a
+  default, boundary costs are learned from your own reference labels,
+  materials you mark as unchanging act as a null control, and a health check
+  runs before any numbers are shown — a run that has gone wrong invisibly
+  does not reach a results screen. Start with
+  [docs/workflow.md](docs/workflow.md).
 - **Big-dataset mode** — all histograms are computed once at load and served
   from memory; volumes larger than 1 GiB are median-binned for display (with
   segmentation still running at full resolution), so time scrolling and
@@ -94,6 +95,9 @@ installed):
 python main.py
 ```
 
+> **New here?** [`docs/workflow.md`](docs/workflow.md) walks through the nine
+> steps of a segmentation run. The short version follows.
+
 1. **Load data** — *File → Load 4D Dataset*, choosing the neutron and X-ray
    TIFF stacks. Both must have identical shapes: `(T, Z, Y, X)` for 4D or
    `(Z, Y, X)` for 3D (*Settings → Data Mode* switches modes). The global
@@ -106,8 +110,10 @@ python main.py
    (all named classes **and** the active one) to the current timepoint;
    *✂✂ Segment All* processes the whole series. Each class becomes a coloured
    overlay in the slice viewer.
-4. **Generalise (optional)** — on the *🌳 Random Forest* tab, train on the
-   segmented reference timepoint and predict the remaining timepoints.
+4. **Track the series** — *Analytics → Time Series Segmentation → Track
+   Materials Across Time* measures every timepoint against the materials you
+   drew, picks the smoothing strength for you, and checks the result before
+   showing it.
 5. **Export** — masked volumes, binary masks, and label maps as TIFF;
    per-class bimodal histograms and a `segmentation_report.txt`; statistics
    as CSV/Excel; reports as PDF.
@@ -138,10 +144,11 @@ mask_4d = SegmentationEngine4D().segment_all_volumes(neutron, xray, roi)
 stats = SegmentationEngine4D.get_temporal_statistics(mask_4d, neutron, xray)
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for the module map, the
-histogram coordinate conventions, and extension guidelines,
-[`docs/model_segmentation.md`](docs/model_segmentation.md) for the
-model-based segmentation and what each of its controls does,
+See [`docs/workflow.md`](docs/workflow.md) for the step-by-step segmentation
+workflow, [`docs/architecture.md`](docs/architecture.md) for the module map,
+the histogram coordinate conventions, and extension guidelines,
+[`docs/model_segmentation.md`](docs/model_segmentation.md) for the method
+behind the time-series segmentation,
 [`docs/metrics.md`](docs/metrics.md) for the quality metrics and their CSV
 layout, [`docs/v17_plan_evaluation.md`](docs/v17_plan_evaluation.md) for how
 the v17 proposal was assessed and where it was corrected, and

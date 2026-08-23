@@ -28,6 +28,9 @@ Computation layer (GUI-independent, scriptable):
                                   K-means clusters → RF training layers
     segmentation/features.py      Composable FeatureSpec (texture ⟂ geometry)
     model/validity.py             Which voxels are measurements at all
+    model/likelihood.py           Fixed material classes + the per-bin match table
+    model/locked.py               Locked-mode segmentation, auto smoothing, guards
+    model/health_check.py         Automatic checks before results are shown
     model/histogram_cache.py      Per-bin sufficient statistics for the mixture
     model/drift_tracker.py        Instrumental drift from inert anchor classes
     model/mixture.py              ROI-anchored mixture, MAP-EM
@@ -265,6 +268,31 @@ the design decisions worth knowing when extending it:
 - **Mixels are fitted after their parents**, not jointly. That keeps the EM
   derivation intact and means a mispaired mixing line degrades a fractional
   map instead of destabilising the whole mixture.
+
+### Locked mode
+
+`model/locked.py` is the default path and the one to read first. It has no
+parameter estimation at all: `ClassLibrary` holds fixed material loci,
+`model/likelihood.py` scores every occupied histogram bin against them once,
+and each timepoint is a table lookup plus a spatial pass. Because nothing is
+fitted, timepoints are independent — a property worth preserving in anything
+added here, since it is what makes the results order-independent and
+parallelisable.
+
+Two invariants the guards depend on:
+
+- **Label 0 is Unclassified and is never a class.** Class *k* is label
+  `k + 1`, in `ClassLibrary` order, which is ROI order. There is no matching
+  step, so identities cannot permute.
+- **Unmatched is not the same as unmeasured.** `unclassified_voxels` counts
+  measured voxels that matched nothing; `excluded_voxels` counts voxels there
+  was nothing to measure. Conflating them makes a field-of-view mismatch look
+  like a missing material, which needs the opposite response.
+
+`auto_smoothing` compares each candidate strength against the **unsmoothed
+result at the same timepoint**, never against the first timepoint — otherwise
+a genuine change in the sample would read as smoothing damage, and the guard
+would abort on exactly what the software exists to measure.
 
 `segmentation/features.py` decouples texture from frozen geometry. The legacy
 level names produce exactly the columns they always did, in the same order —

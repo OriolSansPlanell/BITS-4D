@@ -1,6 +1,26 @@
-# Model-based time-series segmentation
+# Model-based time-series segmentation — how it works
 
-*Analytics → Model-Based Segmentation → Track Classes Across Time…*
+For how to *use* it, read [workflow.md](workflow.md) first. This page is the
+method behind it.
+
+*Analytics → Time Series Segmentation → Track Materials Across Time…*
+
+## Two modes
+
+**Locked (default).** Class positions are fixed, taken from the regions drawn
+at the reference timepoint. Per timepoint the software scores every voxel
+against every fixed material and resolves the assignment spatially. Nothing
+is estimated, so timepoints are independent and three failure modes are
+structurally impossible rather than guarded against: classes cannot merge,
+identities cannot permute, and there is no coupling between timepoints to
+oscillate. This is the right default because attenuation coefficients are
+material constants — a class that moves is a class absorbing material that
+should have left it.
+
+**Adaptive (advanced, off by default).** The definitions themselves are
+allowed to move, anchored to where they were drawn. Appropriate only when the
+instrument genuinely drifts. The rest of this page describes the machinery
+that mode uses.
 
 ## The problem this solves
 

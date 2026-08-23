@@ -1,22 +1,32 @@
 """Which voxels are allowed to take part in a fit, a metric or an export.
 
 Reconstructed tomograms carry voxels that are not measurements: zero padding
-outside the reconstruction circle, NaN/Inf from a failed slice, and detector
-saturation. Nothing in the pipeline used to exclude them, so they were
-binned, fitted and segmented like data — a padding region large enough to
-rival a real phase gets absorbed into whichever class happens to be nearest,
-inflating that class's spread and dragging its centroid.
+outside the reconstruction circle, NaN/Inf from a failed slice, detector
+saturation — and, in a paired dataset, **regions one modality covers and the
+other does not**. Nothing in the pipeline used to exclude any of them, so
+they were binned, segmented and counted like data.
 
-The default policy here rejects only what is provably not a measurement:
-non-finite values, and the exact sentinel value the padding was written with
-(usually 0). Everything else is opt-in, because a hard intensity floor is
-dataset-specific and will silently delete a genuinely low-attenuation phase
-in a dataset it was not tuned for.
+Both channels, not either
+────────────────────────
+A paired measurement is only meaningful where *both* instruments measured.
+If the neutron and X-ray fields of view differ, the non-overlapping region
+has a real value in one channel and nothing in the other; treated as data it
+forms a large, static, perfectly-zero-in-one-axis blob that a class will
+happily absorb — inflating that class's spread and pinning part of it to a
+value no material has. Rejecting a voxel only when *both* channels are empty
+misses this entirely, which is why the default requires both.
+
+The default policy rejects what is provably not a measurement: non-finite
+values, and the exact sentinel the padding was written with (usually 0), in
+either channel. Intensity floors are available and auto-derivable but are
+opt-in, because a floor tuned on one dataset will silently delete a
+genuinely low-attenuation phase in the next one — so the software proposes
+one and shows what it would remove rather than applying it unasked.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 import numpy as np
@@ -32,31 +42,52 @@ class ValidityPolicy:
         Drop NaN/Inf. Always sensible; on by default.
     sentinel_values
         Exact values written by the reconstruction for "no data". ``(0.0,)``
-        catches the usual zero padding. A voxel is rejected when *either*
-        channel holds a sentinel, because a pair is only meaningful when both
-        modalities measured it.
+        catches the usual zero padding.
+    require_both_channels
+        Reject a voxel when *either* channel is missing (default). Set False
+        only for a dataset where a sentinel value is genuinely meaningful in
+        one modality — and check what that admits before you do.
     neutron_floor, xray_floor
         Optional hard lower bounds. ``None`` (the default) means no floor.
-        Use :func:`estimate_floor` rather than a literal — a floor copied
-        from another dataset is how a real phase gets deleted.
+        Use :func:`auto_floor` or :meth:`ValidityPolicy.from_data` rather
+        than a literal copied from elsewhere.
     neutron_ceiling, xray_ceiling
         Optional hard upper bounds, for detector saturation.
     """
 
     reject_non_finite: bool = True
     sentinel_values: Sequence[float] = (0.0,)
+    require_both_channels: bool = True
     neutron_floor: Optional[float] = None
     xray_floor: Optional[float] = None
     neutron_ceiling: Optional[float] = None
     xray_ceiling: Optional[float] = None
+
+    @classmethod
+    def from_data(cls, neutron_volume, xray_volume, quantile: float = 0.001,
+                  sigma: float = 3.0, **kwargs) -> "ValidityPolicy":
+        """Policy with floors derived from the data's own lower tails.
+
+        A suggestion to inspect, not a rule to trust: look at what it would
+        remove (:func:`validity_report`) before adopting it.
+        """
+        base = cls(**kwargs)
+        provisional = build_valid_mask(neutron_volume, xray_volume, base)
+        base.neutron_floor = auto_floor(
+            neutron_volume, provisional, quantile, sigma
+        )
+        base.xray_floor = auto_floor(xray_volume, provisional, quantile, sigma)
+        return base
 
     def describe(self) -> str:
         parts = []
         if self.reject_non_finite:
             parts.append("non-finite")
         if self.sentinel_values:
+            scope = "either channel" if self.require_both_channels else "both channels"
             parts.append(
                 "sentinels " + ", ".join(f"{v:g}" for v in self.sentinel_values)
+                + f" in {scope}"
             )
         for label, low, high in (
             ("neutron", self.neutron_floor, self.neutron_ceiling),
@@ -72,13 +103,21 @@ class ValidityPolicy:
 DEFAULT_POLICY = ValidityPolicy()
 
 
+def _channel_has_data(volume, sentinels, reject_non_finite: bool) -> np.ndarray:
+    """Per-channel mask of voxels this instrument actually measured."""
+    array = np.asarray(volume)
+    present = np.ones(array.shape, dtype=bool)
+    if reject_non_finite:
+        present &= np.isfinite(array)
+    for sentinel in sentinels:
+        with np.errstate(invalid="ignore"):
+            present &= array != sentinel
+    return present
+
+
 def build_valid_mask(neutron_volume, xray_volume,
                      policy: Optional[ValidityPolicy] = None) -> np.ndarray:
-    """Boolean mask of the voxels that count as measurements.
-
-    Both volumes must have the same shape; a voxel is valid only when both
-    channels are.
-    """
+    """Boolean mask of the voxels that count as measurements."""
     policy = policy or DEFAULT_POLICY
     neutron = np.asarray(neutron_volume)
     xray = np.asarray(xray_volume)
@@ -87,15 +126,18 @@ def build_valid_mask(neutron_volume, xray_volume,
             f"Shape mismatch: neutron {neutron.shape} vs X-ray {xray.shape}"
         )
 
-    valid = np.ones(neutron.shape, dtype=bool)
-    if policy.reject_non_finite:
-        valid &= np.isfinite(neutron) & np.isfinite(xray)
-
-    for sentinel in policy.sentinel_values:
-        # Compare on the finite part only; NaN == x is False anyway, but this
-        # keeps the comparison free of invalid-value warnings.
-        with np.errstate(invalid="ignore"):
-            valid &= ~((neutron == sentinel) & (xray == sentinel))
+    neutron_ok = _channel_has_data(
+        neutron, policy.sentinel_values, policy.reject_non_finite
+    )
+    xray_ok = _channel_has_data(
+        xray, policy.sentinel_values, policy.reject_non_finite
+    )
+    if policy.require_both_channels:
+        valid = neutron_ok & xray_ok
+    else:
+        valid = neutron_ok | xray_ok
+        if policy.reject_non_finite:
+            valid &= np.isfinite(neutron) & np.isfinite(xray)
 
     for volume, floor, ceiling in (
         (neutron, policy.neutron_floor, policy.neutron_ceiling),
@@ -109,14 +151,13 @@ def build_valid_mask(neutron_volume, xray_volume,
     return valid
 
 
-def estimate_floor(volume, valid_mask=None, quantile: float = 0.001,
-                   sigma: float = 3.0) -> float:
+def auto_floor(volume, valid_mask=None, quantile: float = 0.001,
+               sigma: float = 3.0) -> float:
     """Suggest a floor from the lower tail of the data itself.
 
     Takes the *quantile* point of the valid data and steps back *sigma*
-    robust standard deviations (from the median absolute deviation, which the
-    padding cannot skew as badly as the plain σ can). The result is a
-    suggestion to inspect and record — not something to apply blindly.
+    robust standard deviations (from the median absolute deviation, which
+    padding cannot skew as badly as the plain σ can).
     """
     array = np.asarray(volume, dtype=np.float64)
     if valid_mask is not None:
@@ -130,6 +171,45 @@ def estimate_floor(volume, valid_mask=None, quantile: float = 0.001,
     return low - sigma * 1.4826 * mad
 
 
+# Retained name from the previous release
+estimate_floor = auto_floor
+
+
+def channel_coverage(neutron_volume, xray_volume,
+                     policy: Optional[ValidityPolicy] = None) -> dict:
+    """How far the two modalities' fields of view actually agree.
+
+    ``neutron_only`` and ``xray_only`` are the voxels one instrument measured
+    and the other did not. A large value there means the two scans do not
+    cover the same region, and every paired quantity is only meaningful on
+    the overlap.
+    """
+    policy = policy or DEFAULT_POLICY
+    neutron = np.asarray(neutron_volume)
+    xray = np.asarray(xray_volume)
+    neutron_ok = _channel_has_data(
+        neutron, policy.sentinel_values, policy.reject_non_finite
+    )
+    xray_ok = _channel_has_data(
+        xray, policy.sentinel_values, policy.reject_non_finite
+    )
+    total = int(neutron.size)
+    both = int(np.count_nonzero(neutron_ok & xray_ok))
+    neutron_only = int(np.count_nonzero(neutron_ok & ~xray_ok))
+    xray_only = int(np.count_nonzero(~neutron_ok & xray_ok))
+    neither = total - both - neutron_only - xray_only
+    return {
+        "total_voxels": total,
+        "both_channels": both,
+        "neutron_only": neutron_only,
+        "xray_only": xray_only,
+        "neither": neither,
+        "overlap_fraction": both / total if total else 0.0,
+        "neutron_only_fraction": neutron_only / total if total else 0.0,
+        "xray_only_fraction": xray_only / total if total else 0.0,
+    }
+
+
 def validity_report(neutron_volume, xray_volume,
                     policy: Optional[ValidityPolicy] = None) -> dict:
     """Counts behind a validity mask, for logging and for the alarm below."""
@@ -137,6 +217,8 @@ def validity_report(neutron_volume, xray_volume,
     neutron = np.asarray(neutron_volume)
     xray = np.asarray(xray_volume)
     valid = build_valid_mask(neutron, xray, policy)
+    coverage = channel_coverage(neutron, xray, policy)
+
     total = int(neutron.size)
     n_valid = int(np.count_nonzero(valid))
     non_finite = int(
@@ -145,8 +227,10 @@ def validity_report(neutron_volume, xray_volume,
     sentinel = 0
     for value in policy.sentinel_values:
         with np.errstate(invalid="ignore"):
-            sentinel += int(np.count_nonzero((neutron == value) & (xray == value)))
-    return {
+            sentinel += int(
+                np.count_nonzero((neutron == value) | (xray == value))
+            )
+    report = {
         "total_voxels": total,
         "valid_voxels": n_valid,
         "rejected_voxels": total - n_valid,
@@ -155,19 +239,21 @@ def validity_report(neutron_volume, xray_volume,
         "sentinel_voxels": sentinel,
         "policy": policy.describe(),
     }
+    report.update(coverage)
+    return report
 
 
 def find_acquisition_steps(reports: Sequence[dict],
                            tolerance: float = 0.02) -> list:
-    """Timepoints where the rejected fraction jumps.
+    """Timepoints where the fraction of usable data jumps.
 
     A step in how much of the volume is not a measurement is an acquisition
     change — a shifted field of view, a different reconstruction, a detector
     fault. Absolute volume comparisons across such a step are not valid, so
-    it is worth knowing about before the numbers are interpreted as physics.
+    it is worth knowing about before the numbers are read as physics.
 
-    Returns a list of ``(timepoint, previous_fraction, fraction)`` for every
-    jump larger than *tolerance*.
+    Returns ``(timepoint, previous_fraction, fraction)`` for every jump
+    larger than *tolerance*.
     """
     steps = []
     for index in range(1, len(reports)):

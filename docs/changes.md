@@ -1,6 +1,90 @@
 # Bug-fix and cleanup notes
 
-## Model-based time-series segmentation (latest)
+## Locked material definitions, guards and a health check (latest)
+
+Implements the revised v17 specification, which withdraws the assumption that
+the class parameters should be fitted. The user-facing result is
+[workflow.md](workflow.md); the method note is
+[model_segmentation.md](model_segmentation.md).
+
+**The design change.** Neutron and X-ray attenuation are material constants,
+so where a material sits on the histogram is fixed by physics rather than
+estimated from data. Letting each class mean float is therefore wrong: a
+class centroid that moves is a class absorbing material that should have left
+it. Locked mode is now the default — class positions come from the drawn
+regions and stay put, and only the assignment of voxels changes between
+timepoints. Three failure modes become structurally impossible rather than
+guarded against: classes cannot merge, identities cannot permute (classes
+*are* the regions, in region order), and timepoints are independent so there
+is no coupling to oscillate. The fitted path remains available under
+Advanced, off by default and with a warning.
+
+**A real bug in the previous release.** The validity mask rejected a voxel
+only when *both* channels held the sentinel value, so a region the neutron
+instrument measured and the X-ray instrument did not passed as valid. Where
+the two fields of view differ, that region is large, static and pinned to
+zero in one axis, and whichever material is nearest absorbs it. A voxel now
+needs data in **both** channels; `channel_coverage()` reports the overlap and
+the Check Data step surfaces it on load.
+
+**Automatic smoothing strength.** Spatial smoothing was a parameter with a
+default, which is the one setting that can destroy a result invisibly — too
+strong and a minority material is simply erased with everything downstream
+still looking healthy. `auto_smoothing()` now measures instead of guessing:
+it sweeps a grid and keeps the strongest setting at which no material loses
+volume and the control materials stay put, and it retains the whole sweep as
+the evidence for that choice.
+
+**Guards and a health check.** Over-smoothing, too many unmatched voxels, a
+voxel budget that does not close, and a spatial pass that cycles instead of
+settling now stop the run rather than producing numbers. A health check runs
+before results are shown, with control materials as the null control, and
+every finding names the material involved and suggests an action.
+
+**Interface language.** No term from the derivation appears in any
+user-facing string, and `tests/test_ui_language.py` parses every string
+literal in the GUI to keep it that way.
+
+**Corrections to the specification as written.**
+
+* The retention guard is specified as "a class loses > 50 % of its
+  unsmoothed volume". Implemented literally against the *first timepoint* it
+  would abort on genuine physics — a material that really shrinks is the
+  measurement, not a fault. Retention is therefore compared against the
+  unsmoothed result **at the same timepoint**, which isolates what smoothing
+  did from what the sample did. There is a test for each direction.
+* "Unclassified" conflated two different things. Voxels that were measured
+  and matched nothing mean a material may be missing; voxels that were never
+  measured mean the instruments disagree about coverage. They are counted
+  separately, and the advice differs: unmatched voxels that appear gradually
+  are drift, not a missing material, and the message says so and points at
+  Check Instrument Stability.
+* The learned boundary cost `V(k,l) = -log(n_kl / Σ_m n_km)` carries a
+  per-row offset, so a class whose own voxels are less reliably adjacent — a
+  thin or scattered one — pays a standing penalty for existing on top of the
+  penalty for bordering anything. That is a bias against exactly the classes
+  most at risk of being smoothed away. The diagonal is removed by default;
+  the raw form is available and there is a test showing the difference.
+* Monotone cost decrease cannot be *asserted* for a synchronous update, which
+  can settle into a two-cycle rather than converging — the oscillation the
+  specification reports from an earlier run. The update is damped, the cost
+  is traced every sweep, and non-monotone behaviour is reported and can be
+  made fatal, rather than being claimed as guaranteed.
+* Unclassified needed a boundary cost of its own. Free would let smoothing
+  flood unmatched voxels across the volume; prohibitive would push them into
+  a real material, which is the outcome Unclassified exists to prevent. It is
+  priced at the typical cost of any other boundary.
+* The docstring fix in §12 does not apply here: this codebase has no such
+  docstring, and its feature counts are 6 / 9 / 14, not 13.
+
+**Worth recording as a finding.** The learned boundary costs turn out to
+*protect* a minority material that genuinely borders its neighbour — its
+boundary is cheap, so smoothing has no incentive to remove it even though it
+is small. A uniform cost cannot express that. What over-smoothing actually
+destroys is a **finely dispersed** phase, whose voxels have no neighbours to
+lean on. Both cases are tested.
+
+## Model-based time-series segmentation
 
 Implements the BiTS v17 proposal. The plan's assessment — including which of
 its claims held against this codebase, which were addressed to a different

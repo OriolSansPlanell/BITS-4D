@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton,
     QLabel, QFileDialog, QMessageBox, QStatusBar, QProgressBar, QAction,
     QMenu, QMenuBar, QToolBar, QSplitter, QApplication, QCheckBox, QDoubleSpinBox,
-    QDialog, QDialogButtonBox, QScrollArea, QFrame
+    QDialog, QDialogButtonBox, QScrollArea, QFrame, QComboBox
 )
 from PyQt5.QtCore import Qt, pyqtSlot, pyqtSignal
 from matplotlib.figure import Figure
@@ -1841,8 +1841,18 @@ class SliceViewerWidget(QWidget):
         self.canvas.draw_idle()
 
 
+def _plain_validation_summary(validation) -> str:
+    """Held-out scores, said without the vocabulary of the method."""
+    return (
+        f"Tested on {validation.n_folds} region(s) the classifier never saw "
+        f"during training: {100 * validation.accuracy:.1f}% of voxels "
+        f"correct, {100 * validation.mean_iou:.1f}% average overlap with the "
+        f"materials you drew."
+    )
+
+
 class AnchorSelectionDialog(QDialog):
-    """Pick the classes to treat as chemically inert.
+    """Pick the materials that cannot change during the experiment.
 
     An anchor is a phase that cannot really change during the experiment, so
     any movement of its histogram centroid must be instrumental. Picking a
@@ -1852,17 +1862,19 @@ class AnchorSelectionDialog(QDialog):
 
     def __init__(self, class_names, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Anchor Classes")
+        self.setWindowTitle("Control Materials")
         self.anchor_classes = []
         self.estimate_scale = False
 
         layout = QVBoxLayout(self)
         explanation = QLabel(
-            "Choose the classes that cannot change chemically during the\n"
-            "experiment — an inert container, a support, a structural metal.\n"
-            "Their movement measures the instrument, not the sample.\n\n"
-            "Do not choose a reacting phase: its real change would be\n"
-            "subtracted from every other class as if it were drift."
+            "Choose the materials that cannot change during the experiment "
+            "— a container, a support, a structural metal. If one of these "
+            "appears to move, it is the instrument that moved, not the "
+            "sample.\n\n"
+            "Do not choose a material that reacts: its real change would be "
+            "subtracted from every other material as though it were an "
+            "instrument effect."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -1874,12 +1886,13 @@ class AnchorSelectionDialog(QDialog):
             self._checkboxes.append((name, box))
 
         self.scale_box = QCheckBox(
-            "Also fit a per-axis gain (needs two or more separated anchors)"
+            "Also correct for a change in scale (needs two or more "
+            "separated control materials)"
         )
         self.scale_box.setToolTip(
-            "A gain change stretches the histogram as well as shifting it.\n"
-            "With a single anchor the gain is not identifiable and is left\n"
-            "at 1.0."
+            "Some instrument changes stretch the histogram as well as\n"
+            "shifting it. With a single control material this cannot be\n"
+            "separated from a plain shift, so it is left alone."
         )
         layout.addWidget(self.scale_box)
 
@@ -1897,156 +1910,169 @@ class AnchorSelectionDialog(QDialog):
         self.estimate_scale = self.scale_box.isChecked()
         if not self.anchor_classes:
             QMessageBox.warning(
-                self, "No Anchors",
-                "Select at least one class to use as an anchor."
+                self, "No Control Materials",
+                "Select at least one material to use as a control."
             )
             return
         self.accept()
 
 
-class ModelSegmentationDialog(QDialog):
-    """Settings for tracking the manual classes across the series."""
+class MaterialTrackingDialog(QDialog):
+    """Settings for following the drawn materials across the whole series.
+
+    Deliberately plain language throughout: the person using this knows
+    segmentation, and should never need to know how it is implemented to
+    make a good decision here.
+    """
 
     def __init__(self, class_names, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Model-Based Segmentation")
+        self.setWindowTitle("Track Materials Across Time")
         self.class_names = list(class_names)
 
-        self.anchor_strength = 0.5
-        self.anchor_classes = []
-        self.estimate_scale = False
-        self.beta = 1.0
-        self.sweeps = 5
-        self.memory = 0.5
-        self.reject_margin = None
-        self.outlier_component = True
-        self.detect_mixels = True
+        self.control_materials = []
+        self.smoothing_mode = "auto"
+        self.smoothing_strength = None
+        self.linked_pairs = []
+        self.lock_definitions = True
+        self.find_mixed_boundaries = True
 
         layout = QVBoxLayout(self)
         header = QLabel(
-            "Your classes become the model's prior instead of a frozen\n"
-            "boundary. Each one is free to follow the data as far as the\n"
-            "anchor strength allows, and no further."
+            "Each material you drew becomes a definition that the whole\n"
+            "series is measured against. Voxels move between materials from\n"
+            "one timepoint to the next; the definitions themselves stay put."
         )
         header.setWordWrap(True)
         layout.addWidget(header)
 
-        anchor_group = QGroupBox("Anchor strength")
-        anchor_layout = QVBoxLayout(anchor_group)
-        self.strength_spin = QDoubleSpinBox()
-        self.strength_spin.setRange(0.0, 1.0)
-        self.strength_spin.setSingleStep(0.05)
-        self.strength_spin.setValue(0.5)
-        self.strength_spin.setToolTip(
-            "0.00  free mixture: follows the data, and also the noise\n"
-            "0.50  the T0 selection counts for as much as the data\n"
-            "1.00  frozen at T0: the fixed-ROI behaviour\n\n"
-            "Scaled by each class's own size, so the same value means the\n"
-            "same thing for a 1% phase and a 40% one."
+        # ── control materials ────────────────────────────────────────────
+        control_group = QGroupBox("Control materials")
+        control_layout = QVBoxLayout(control_group)
+        control_note = QLabel(
+            "Tick anything that should not change during the experiment — a "
+            "casing, a support, a structural metal. We use these as a check: "
+            "if their volume changes, something is wrong with the "
+            "segmentation rather than with the sample."
         )
-        anchor_layout.addWidget(self.strength_spin)
-        layout.addWidget(anchor_group)
-
-        drift_group = QGroupBox("Instrumental drift (optional)")
-        drift_layout = QVBoxLayout(drift_group)
-        drift_note = QLabel(
-            "Classes that cannot change chemically. Their movement is "
-            "instrumental by definition and corrects every other class."
-        )
-        drift_note.setWordWrap(True)
-        drift_layout.addWidget(drift_note)
-        self._anchor_boxes = []
+        control_note.setWordWrap(True)
+        control_layout.addWidget(control_note)
+        self._control_boxes = []
         for name in self.class_names:
             box = QCheckBox(name)
-            drift_layout.addWidget(box)
-            self._anchor_boxes.append((name, box))
-        self.scale_box = QCheckBox("Also fit a per-axis gain")
-        drift_layout.addWidget(self.scale_box)
-        layout.addWidget(drift_group)
+            control_layout.addWidget(box)
+            self._control_boxes.append((name, box))
+        layout.addWidget(control_group)
 
-        spatial_group = QGroupBox("Spatial coherence")
-        spatial_layout = QVBoxLayout(spatial_group)
-        self.beta_spin = QDoubleSpinBox()
-        self.beta_spin.setRange(0.0, 20.0)
-        self.beta_spin.setSingleStep(0.25)
-        self.beta_spin.setValue(1.0)
-        self.beta_spin.setToolTip(
-            "Strength of the spatial smoothing. 0 turns it off and gives the\n"
-            "raw per-voxel mixture labels, which are speckled — a mixture on\n"
-            "its own has no spatial term at all.\n"
-            "The cost of each class boundary is learned from your own T0\n"
-            "labels, so common boundaries stay cheap."
+        # ── smoothing ────────────────────────────────────────────────────
+        smoothing_group = QGroupBox("Spatial smoothing")
+        smoothing_layout = QVBoxLayout(smoothing_group)
+        smoothing_note = QLabel(
+            "Uses neighbouring voxels to clean up noisy assignments. "
+            "Auto is recommended: it picks the strongest setting that does "
+            "not shrink any of your materials."
         )
-        spatial_layout.addWidget(QLabel("Smoothing strength"))
-        spatial_layout.addWidget(self.beta_spin)
-        layout.addWidget(spatial_group)
+        smoothing_note.setWordWrap(True)
+        smoothing_layout.addWidget(smoothing_note)
 
-        temporal_group = QGroupBox("Between timepoints")
-        temporal_layout = QVBoxLayout(temporal_group)
-        self.memory_spin = QDoubleSpinBox()
-        self.memory_spin.setRange(0.0, 1.0)
-        self.memory_spin.setSingleStep(0.1)
-        self.memory_spin.setValue(0.5)
-        self.memory_spin.setToolTip(
-            "How much of each timepoint's prior comes from the timepoint\n"
-            "before rather than from T0.\n"
-            "0 re-anchors to T0 every time; 1 is a pure random walk that\n"
-            "stops looking back at your selection."
+        self.smoothing_choice = QComboBox()
+        self.smoothing_choice.addItems(["Auto", "Off", "Low", "Medium", "High"])
+        self.smoothing_choice.setToolTip(
+            "Higher values give smoother regions. Auto is recommended.\n"
+            "Too much smoothing erases a small material entirely, which is\n"
+            "why Auto measures the effect instead of guessing."
         )
-        temporal_layout.addWidget(QLabel("Memory of the previous timepoint"))
-        temporal_layout.addWidget(self.memory_spin)
-        layout.addWidget(temporal_group)
+        smoothing_layout.addWidget(self.smoothing_choice)
+        layout.addWidget(smoothing_group)
 
-        self.outlier_box = QCheckBox(
-            "Absorb unrecognised voxels into an outlier class"
+        # ── mixed boundaries ─────────────────────────────────────────────
+        boundary_group = QGroupBox("Mixed boundaries (optional)")
+        boundary_layout = QVBoxLayout(boundary_group)
+        boundary_note = QLabel(
+            "Where two materials touch, some voxels contain a bit of both. "
+            "Those voxels have no single correct label, so we can report how "
+            "much of each they contain instead."
         )
-        self.outlier_box.setChecked(True)
-        self.outlier_box.setToolTip(
-            "A uniform component that takes padding, artifacts and materials\n"
-            "you did not model, instead of forcing them into whichever real\n"
-            "class happens to be nearest."
-        )
-        layout.addWidget(self.outlier_box)
+        boundary_note.setWordWrap(True)
+        boundary_layout.addWidget(boundary_note)
 
-        self.reject_box = QCheckBox(
-            "Leave low-confidence voxels unassigned"
+        self.mixed_box = QCheckBox(
+            "Look for boundaries that behave like a mix of two materials"
         )
-        self.reject_box.setToolTip(
-            "Voxels no class claims strongly are reported as unassigned\n"
-            "rather than given the best of a bad set of options."
+        self.mixed_box.setChecked(True)
+        self.mixed_box.setToolTip(
+            "Flags a material that is really the boundary between two\n"
+            "others. You will be told which, and can decide what to do."
         )
-        layout.addWidget(self.reject_box)
+        boundary_layout.addWidget(self.mixed_box)
+        layout.addWidget(boundary_group)
 
-        self.mixel_box = QCheckBox(
-            "Look for mixing lines (partial-volume classes)"
+        # ── advanced ─────────────────────────────────────────────────────
+        advanced_group = QGroupBox("Advanced")
+        advanced_layout = QVBoxLayout(advanced_group)
+        self.lock_box = QCheckBox("Lock material definitions")
+        self.lock_box.setChecked(True)
+        self.lock_box.setToolTip(
+            "Material properties do not change during an experiment, so we\n"
+            "keep the definitions fixed and let voxels move between them.\n"
+            "Recommended.\n\n"
+            "Unticking this lets the definitions themselves drift, which is\n"
+            "only appropriate when the instrument is known to drift — and it\n"
+            "can turn a real change in the sample into an apparent one in\n"
+            "the definitions."
         )
-        self.mixel_box.setChecked(True)
-        self.mixel_box.setToolTip(
-            "Flags a class that is really the boundary between two others —\n"
-            "elongated along the line joining them. Such a class is a\n"
-            "fraction, not a phase, and a hard label for it is ill-posed."
-        )
-        layout.addWidget(self.mixel_box)
+        advanced_layout.addWidget(self.lock_box)
+        self.advanced_warning = QLabel("")
+        self.advanced_warning.setWordWrap(True)
+        self.advanced_warning.setStyleSheet("color: #b35c00;")
+        advanced_layout.addWidget(self.advanced_warning)
+        self.lock_box.toggled.connect(self._on_lock_toggled)
+        layout.addWidget(advanced_group)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self
         )
+        buttons.button(QDialogButtonBox.Ok).setText("Run")
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _on_lock_toggled(self, checked):
+        self.advanced_warning.setText(
+            "" if checked else
+            "Material definitions will be allowed to move. Check the control "
+            "materials carefully in the results — this setting can absorb a "
+            "real change in the sample."
+        )
+
+    _STRENGTHS = {"Off": 0.0, "Low": 0.5, "Medium": 1.0, "High": 3.0}
+
     def _accept(self):
-        self.anchor_strength = float(self.strength_spin.value())
-        self.anchor_classes = [
-            name for name, box in self._anchor_boxes if box.isChecked()
+        self.control_materials = [
+            name for name, box in self._control_boxes if box.isChecked()
         ]
-        self.estimate_scale = self.scale_box.isChecked()
-        self.beta = float(self.beta_spin.value())
-        self.memory = float(self.memory_spin.value())
-        self.outlier_component = self.outlier_box.isChecked()
-        self.reject_margin = 0.5 if self.reject_box.isChecked() else None
-        self.detect_mixels = self.mixel_box.isChecked()
+        choice = self.smoothing_choice.currentText()
+        if choice == "Auto":
+            self.smoothing_mode = "auto"
+            self.smoothing_strength = None
+        else:
+            self.smoothing_mode = "manual"
+            self.smoothing_strength = self._STRENGTHS[choice]
+        self.find_mixed_boundaries = self.mixed_box.isChecked()
+        self.lock_definitions = self.lock_box.isChecked()
         self.accept()
+
+    @staticmethod
+    def describe_strength(value) -> str:
+        """A number the software chose, said in words."""
+        if value is None or value <= 0:
+            return "Off"
+        if value < 0.75:
+            return "Low"
+        if value < 2.0:
+            return "Medium"
+        return "High"
+
 
 
 class ExportOptionsDialog(QDialog):
@@ -2532,14 +2558,31 @@ class BiTS4DMainWindow(QMainWindow):
         tr_layout = QVBoxLayout()
         tr_layout.setSpacing(6)
 
+        rf_notice = QLabel(
+            "<b>No longer the recommended route.</b> "
+            "Neutron and X-ray attenuation are material constants, so where a "
+            "material sits on the histogram is fixed by physics — there is "
+            "nothing there for a classifier to learn that your own regions do "
+            "not already state exactly.<br><br>"
+            "Use <i>Analytics → Time Series Segmentation → Track Materials "
+            "Across Time</i> instead. This tab is kept so earlier work stays "
+            "reproducible and so the two can be compared."
+        )
+        rf_notice.setWordWrap(True)
+        rf_notice.setStyleSheet(
+            "color: #8a4b00; background: #fff6e5; border: 1px solid #e8c88a;"
+            " padding: 6px; font-size: 9pt;"
+        )
+        tr_layout.addWidget(rf_notice)
+
         rf_info = QLabel(
-            "<b>Random Forest Segmentation</b><br>"
-            "Workflow: <i>draw ROIs → segment → train RF → predict all timepoints</i><br><br>"
-            "The RF trains on the <b>3-D voxel masks</b> already computed by "
-            "'✂ Segment Current', learning spatial and textural context that "
-            "generalises across timepoints. After prediction, each class is shown "
-            "as a convex-hull overlay on the histogram, revealing how the RF "
-            "boundaries differ from the original selection."
+            "<b>Classifier Segmentation (legacy)</b><br>"
+            "Workflow: <i>draw regions → segment → train → predict all "
+            "timepoints</i><br><br>"
+            "Trains on the <b>3-D voxel masks</b> already computed by "
+            "'✂ Segment Current'. After prediction each class is shown as an "
+            "outline on the histogram, so you can see how the learned "
+            "boundaries differ from the ones you drew."
         )
         rf_info.setWordWrap(True)
         rf_info.setStyleSheet("color: #555; font-size: 9pt;")
@@ -2626,7 +2669,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         tr_layout.addStretch()
         tab_rf.setLayout(tr_layout)
-        right_tabs.addTab(tab_rf, "🌳 Random Forest")
+        right_tabs.addTab(tab_rf, "🌳 Classifier (legacy)")
 
         # ── Tab 4 : Export ────────────────────────────────────────────────────
         tab_export = QWidget()
@@ -2931,34 +2974,46 @@ class BiTS4DMainWindow(QMainWindow):
 
         analytics_menu.addSeparator()
 
-        # ── Model-based time-series segmentation ────────────────────────
-        model_menu = analytics_menu.addMenu("Model-Based Segmentation")
+        # ── Time-series segmentation ────────────────────────────────────
+        model_menu = analytics_menu.addMenu("Time Series Segmentation")
 
-        model_run_action = QAction("Track Classes Across Time...", self)
+        check_action = QAction("Check Data...", self)
+        check_action.setToolTip(
+            "How much of the volume was actually measured, whether both\n"
+            "instruments cover the same region, and whether that changes\n"
+            "part-way through the series."
+        )
+        check_action.triggered.connect(self._on_check_data)
+        model_menu.addAction(check_action)
+
+        model_run_action = QAction("Track Materials Across Time...", self)
         model_run_action.setToolTip(
-            "Segment the whole series with a mixture anchored on your ROIs\n"
-            "instead of a frozen histogram polygon. Follows instrumental\n"
-            "drift measured on inert anchor classes, and regularises the\n"
-            "result spatially so it is not speckled."
+            "Follow the materials you defined through every timepoint.\n"
+            "The definitions stay fixed and voxels move between them, so a\n"
+            "change in a volume is a change in the sample.\n"
+            "Cleans up noisy assignments using neighbouring voxels, and\n"
+            "checks the result before showing it."
         )
         model_run_action.triggered.connect(self._on_model_segmentation)
         model_menu.addAction(model_run_action)
 
-        drift_action = QAction("Estimate Instrumental Drift...", self)
+        drift_action = QAction("Check Instrument Stability...", self)
         drift_action.setToolTip(
-            "Measure how far the histogram has moved at each timepoint,\n"
-            "using classes that cannot chemically change. Any movement of an\n"
-            "inert class is instrumental by definition."
+            "Measure how far the histogram moved at each timepoint, using\n"
+            "materials that cannot change. Any movement of those is the\n"
+            "instrument, not the sample."
         )
         drift_action.triggered.connect(self._on_estimate_drift)
         model_menu.addAction(drift_action)
 
-        block_cv_action = QAction("Block Cross-Validation (Random Forest)...", self)
+        model_menu.addSeparator()
+
+        block_cv_action = QAction("Held-Out Accuracy (Classifier)...", self)
         block_cv_action.setToolTip(
-            "Honest Random Forest accuracy: holds out contiguous 3-D blocks,\n"
-            "so the score is not inflated by neighbouring voxels that are\n"
-            "near-duplicates of the training data. Expect a lower number\n"
-            "than the training accuracy."
+            "Scores the classifier on regions it never saw during training.\n"
+            "Neighbouring voxels are near-copies of each other, so a score\n"
+            "measured on the training data mostly measures memorisation.\n"
+            "Expect a lower — and more honest — number."
         )
         block_cv_action.triggered.connect(self._on_block_cross_validation)
         model_menu.addAction(block_cv_action)
@@ -6257,14 +6312,82 @@ class BiTS4DMainWindow(QMainWindow):
             for mask, _color, name in self._visible_layers(timepoint)
         }
 
+    def _on_check_data(self, silent=False):
+        """Step 2 of the workflow: what is actually measurable here.
+
+        Runs on load and from the menu. The fact this surfaces — that the two
+        instruments may not cover the same region — is invisible otherwise,
+        and quietly corrupts every paired quantity computed from it.
+        """
+        from model import channel_coverage, find_acquisition_steps, validity_report
+
+        if not self.dataset:
+            if not silent:
+                QMessageBox.information(self, "No Data", "Load a dataset first.")
+            return None
+
+        reports = []
+        for timepoint in range(self.dataset.num_timepoints):
+            neutron, xray = self.dataset.get_volume_at_time(timepoint)
+            reports.append(validity_report(neutron, xray))
+        first = reports[0]
+        steps = find_acquisition_steps(reports)
+
+        lines = [
+            f"Volume size: {tuple(int(v) for v in self.dataset.shape[-3:])} "
+            f"(Z, Y, X), {self.dataset.num_timepoints} timepoint(s).",
+            "",
+            f"{100 * first['overlap_fraction']:.1f}% of the array has data "
+            f"from both instruments and can be used.",
+        ]
+        one_sided = first["neutron_only"] + first["xray_only"]
+        if one_sided:
+            share = 100 * one_sided / max(first["total_voxels"], 1)
+            which = []
+            if first["neutron_only"]:
+                which.append(
+                    f"{100 * first['neutron_only_fraction']:.1f}% has neutron "
+                    f"data but no X-ray data"
+                )
+            if first["xray_only"]:
+                which.append(
+                    f"{100 * first['xray_only_fraction']:.1f}% has X-ray data "
+                    f"but no neutron data"
+                )
+            lines += [
+                "",
+                f"{share:.1f}% of the array was measured by only one "
+                f"instrument — " + ", and ".join(which) + ".",
+                "These voxels are excluded: a material can only be identified "
+                "where both measurements exist.",
+            ]
+        if steps:
+            timepoint, before, after = steps[0]
+            lines += [
+                "",
+                f"The amount of usable data changes at timepoint {timepoint} "
+                f"({100 * (1 - before):.0f}% to {100 * (1 - after):.0f}%).",
+                "Check whether the acquisition changed there. Comparing "
+                "volumes across that point may not be meaningful.",
+            ]
+
+        self.data_check_reports = reports
+        message = "\n".join(lines)
+        self.status_bar.showMessage(
+            f"Usable data: {100 * first['overlap_fraction']:.1f}% of the array"
+        )
+        if not silent:
+            QMessageBox.information(self, "Data Check", message)
+        return reports
+
     def _on_model_segmentation(self):
-        """Track the manual classes across the series with the anchored model."""
+        """Follow the drawn materials across the whole series."""
         from utils.cancellation import OperationCancelled, OperationFailed
 
         if not self.dataset or self.global_histogram is None:
             QMessageBox.information(
                 self, "No Data",
-                "Load a dataset and compute the global histogram first."
+                "Load a dataset and compute the histogram first."
             )
             return
 
@@ -6272,90 +6395,109 @@ class BiTS4DMainWindow(QMainWindow):
         masks = self._model_class_masks(reference)
         if len(masks) < 1:
             QMessageBox.information(
-                self, "No Classes",
-                "Segment the current timepoint first: the model uses your "
-                "classes as its prior, so it needs at least one to start from."
+                self, "No Materials",
+                "Draw and segment at least one material first. The materials "
+                "you define here are what the whole series is measured "
+                "against."
             )
             return
 
-        dialog = ModelSegmentationDialog(sorted(masks), self)
+        dialog = MaterialTrackingDialog(sorted(masks), self)
         if dialog.exec_() != QDialog.Accepted:
             return
 
-        from model import (
-            DriftTracker, ROIAnchoredMixture, ROIDerivedMRF, SequentialSegmenter,
-        )
-        from model.temporal import DriftTransition, StaticTransition
+        if not dialog.lock_definitions:
+            self._run_adaptive_tracking(dialog, reference, masks)
+            return
 
-        tracker = None
-        if dialog.anchor_classes:
-            tracker = DriftTracker(
-                anchor_classes=dialog.anchor_classes,
-                estimate_scale=dialog.estimate_scale,
-            )
-        mrf = (
-            ROIDerivedMRF(beta=dialog.beta, n_sweeps=dialog.sweeps)
-            if dialog.beta > 0 else None
-        )
-        temporal = (
-            DriftTransition(memory=dialog.memory)
-            if dialog.memory > 0 else StaticTransition()
-        )
-        mixture = ROIAnchoredMixture(
-            outlier_component=dialog.outlier_component,
-            reject_margin=dialog.reject_margin,
-        )
+        from model import ClassLibrary, LockedSegmenter, SegmentationRefused
+        from model.spatial_prior import ROIDerivedMRF
+        from model.validity import build_valid_mask
 
         neutron_reference, xray_reference = self.dataset.get_volume_at_time(reference)
+        ordered = [name for name in masks]
 
         def operation(progress_callback=None, cancel_check=None):
-            segmenter = SequentialSegmenter(
-                mixture=mixture, mrf=mrf, temporal=temporal,
-                drift_tracker=tracker, bins=self.histogram_engine.bins,
-            )
-            segmenter.prepare(
+            if progress_callback:
+                progress_callback(2, "Reading the materials you defined...")
+            valid = build_valid_mask(neutron_reference, xray_reference)
+            library = ClassLibrary.from_masks(
                 neutron_reference, xray_reference, masks,
-                self.global_histogram.x_edges, self.global_histogram.y_edges,
-                anchor_strength=dialog.anchor_strength,
+                valid_mask=valid, inert=dialog.control_materials,
             )
-            outcome = segmenter.run(
-                self.dataset,
-                progress_callback=progress_callback,
-                cancel_check=cancel_check,
+            smoother = ROIDerivedMRF(beta=1.0, n_sweeps=6)
+            segmenter = LockedSegmenter(
+                library, prior=smoother, bins=self.histogram_engine.bins
             )
-            mixels = []
-            if dialog.detect_mixels and outcome.timepoints:
-                from model import detect_mixing_lines
+            segmenter.set_grid(
+                self.global_histogram.x_edges, self.global_histogram.y_edges
+            )
 
-                mixels = detect_mixing_lines(outcome.timepoints[0].fit)
-            return outcome, mixels
+            reference_labels = np.zeros(valid.shape, dtype=np.int32)
+            for index, name in enumerate(library.names):
+                reference_labels[masks[name]] = index
+            segmenter.learn_boundaries(reference_labels, valid_mask=valid)
+
+            sweep = None
+            if dialog.smoothing_mode == "auto":
+                if progress_callback:
+                    progress_callback(8, "Choosing the smoothing strength...")
+
+                def sweep_progress(value, message):
+                    if progress_callback:
+                        progress_callback(8 + int(0.25 * value), message)
+
+                strength, sweep = segmenter.auto_smoothing(
+                    neutron_reference, xray_reference,
+                    progress_callback=sweep_progress, cancel_check=cancel_check,
+                )
+            else:
+                strength = dialog.smoothing_strength
+
+            def run_progress(value, message):
+                if progress_callback:
+                    progress_callback(35 + int(0.6 * value), message)
+
+            outcome = segmenter.segment_series(
+                self.dataset, beta=strength,
+                progress_callback=run_progress, cancel_check=cancel_check,
+                enforce_guards=False,
+            )
+            outcome.smoothing_sweep = sweep
+            return segmenter, outcome, library
 
         try:
             result = run_with_progress(
-                self, "Model-Based Segmentation",
-                "Tracking classes across the series...", operation,
+                self, "Track Materials",
+                "Following your materials through the series...", operation,
             )
         except (OperationCancelled, OperationFailed):
             return
         if result is None:
             return
 
-        outcome, mixels = result
-        self._install_model_layers(outcome)
-        self.model_result = outcome
-        QMessageBox.information(
-            self, "Segmentation Complete",
-            self._model_segmentation_summary(outcome, mixels, dialog),
-        )
+        segmenter, outcome, library = result
+        refusals = segmenter.check_guards(outcome)
+        if refusals:
+            QMessageBox.warning(
+                self, "Segmentation Problem",
+                "These results are not reliable, so they have not been "
+                "applied:\n\n" + "\n\n".join(f"• {line}" for line in refusals),
+            )
+            return
 
-    def _install_model_layers(self, outcome):
-        """Replace the segmentation layers with the model's output."""
+        self._apply_locked_result(outcome)
+        self.model_result = outcome
+        self._show_health_check(outcome, library, dialog)
+
+    def _apply_locked_result(self, outcome):
+        """Put the result into the slice viewer as ordinary layers."""
         for entry in outcome.timepoints:
             timepoint = entry.timepoint
             self.segmentation_masks[timepoint] = []
             self._clear_layer_shapes(timepoint)
             for index, name in enumerate(entry.class_names):
-                mask = entry.labels == index
+                mask = entry.mask_for(name)
                 if not mask.any():
                     continue
                 color = self._OVERLAY_COLORS[index % len(self._OVERLAY_COLORS)]
@@ -6365,54 +6507,135 @@ class BiTS4DMainWindow(QMainWindow):
         neutron, xray = self.dataset.get_volume_at_time(current)
         self._apply_segmentation_overlays(current, neutron, xray)
 
-    @staticmethod
-    def _model_segmentation_summary(outcome, mixels, dialog) -> str:
-        lines = [f"{len(outcome)} timepoint(s) segmented."]
-        drifts = [
-            entry.drift.magnitude for entry in outcome.timepoints
-            if entry.drift is not None
-        ]
-        if drifts:
-            lines.append(
-                f"Instrumental drift: up to {max(drifts):.4g} intensity units "
-                f"since T0."
-            )
-        unassigned = sum(entry.unassigned_voxels for entry in outcome.timepoints)
-        if unassigned:
-            lines.append(
-                f"{unassigned:,} voxel(s) left unassigned — invalid, or the "
-                f"model declined to recognise them."
-            )
-        dormant = [
-            name for entry in outcome.timepoints
-            if entry.transition is not None
-            for name in entry.transition.dormant
-        ]
-        if dormant:
-            lines.append(
-                "Went dormant (kept, not deleted): " + ", ".join(sorted(set(dormant)))
-            )
-        clipped = {
-            name for entry in outcome.timepoints
-            if entry.transition is not None
-            for name in entry.transition.clipped
-        }
-        if clipped:
-            lines.append(
-                "Implausible jump clipped for: " + ", ".join(sorted(clipped))
-            )
-        if mixels:
-            lines.append(
-                "Possible mixing lines (partial volume rather than a phase): "
-                + ", ".join(
-                    f"{m.name} between {m.phase_a} and {m.phase_b}" for m in mixels
-                )
-            )
-        lines.append(
-            f"\nAnchor strength {dialog.anchor_strength:.2f} "
-            f"(0 = free mixture, 1 = frozen at T0)."
+    def _show_health_check(self, outcome, library, dialog=None):
+        """Step 8: check the run before its numbers are used."""
+        from model import Status, run_health_check
+        from model.partial_volume import MixelComponent, verify_mixels
+
+        mixing_report = None
+        if dialog is not None and dialog.find_mixed_boundaries:
+            mixing_report = self._suggest_mixed_boundaries(library)
+
+        report = run_health_check(
+            outcome,
+            control_materials=library.inert_names,
+            mixing_report=mixing_report,
         )
-        return "\n".join(lines)
+        self.health_report = report
+
+        lines = [report.headline(), ""]
+        for finding in report.findings:
+            lines.append(str(finding))
+        if outcome.smoothing_sweep is not None:
+            lines += [
+                "",
+                "Smoothing strength: "
+                + MaterialTrackingDialog.describe_strength(outcome.smoothing)
+                + " (chosen automatically).",
+            ]
+
+        show = (
+            QMessageBox.warning if report.status is Status.FAIL
+            else QMessageBox.information
+        )
+        show(self, "Health Check", "\n".join(lines))
+        self.status_bar.showMessage(report.headline())
+
+    def _suggest_mixed_boundaries(self, library):
+        """Which materials look like a boundary between two others."""
+        from model.partial_volume import MixelComponent, verify_mixels
+
+        class _Fitted:
+            names = library.names
+            means = np.array([material.mu for material in library])
+            covariances = np.array([material.sigma for material in library])
+            n_components = len(library)
+
+        from model import detect_mixing_lines
+
+        suggestions = detect_mixing_lines(_Fitted())
+        if not suggestions:
+            return None
+        return verify_mixels(_Fitted(), suggestions)
+
+    def _run_adaptive_tracking(self, dialog, reference, masks):
+        """The advanced path: definitions allowed to move.
+
+        Only appropriate when the instrument is known to drift. The dialog
+        warns before this is reached; this keeps it available rather than
+        removing the capability.
+        """
+        from utils.cancellation import OperationCancelled, OperationFailed
+        from model import (
+            DriftTracker, ROIAnchoredMixture, ROIDerivedMRF, SequentialSegmenter,
+        )
+        from model.temporal import DriftTransition, StaticTransition
+
+        neutron_reference, xray_reference = self.dataset.get_volume_at_time(reference)
+        tracker = (
+            DriftTracker(anchor_classes=dialog.control_materials)
+            if dialog.control_materials else None
+        )
+        strength = (
+            1.0 if dialog.smoothing_strength is None
+            else dialog.smoothing_strength
+        )
+
+        def operation(progress_callback=None, cancel_check=None):
+            segmenter = SequentialSegmenter(
+                mixture=ROIAnchoredMixture(outlier_component=True),
+                mrf=(
+                    ROIDerivedMRF(beta=strength, n_sweeps=5)
+                    if strength > 0 else None
+                ),
+                temporal=DriftTransition(memory=0.5) if tracker else StaticTransition(),
+                drift_tracker=tracker,
+                bins=self.histogram_engine.bins,
+            )
+            segmenter.prepare(
+                neutron_reference, xray_reference, masks,
+                self.global_histogram.x_edges, self.global_histogram.y_edges,
+                anchor_strength=0.5,
+            )
+            return segmenter.run(
+                self.dataset,
+                progress_callback=progress_callback, cancel_check=cancel_check,
+            )
+
+        try:
+            outcome = run_with_progress(
+                self, "Track Materials",
+                "Following your materials, definitions allowed to move...",
+                operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            return
+        if outcome is None:
+            return
+
+        self._install_model_layers(outcome)
+        self.model_result = outcome
+        moved = []
+        for entry in outcome.timepoints:
+            if entry.fit is None:
+                continue
+            for name, distance in entry.fit.moved_sigma().items():
+                if distance > 0.5 and name in dialog.control_materials:
+                    moved.append(name)
+        message = [
+            f"{len(outcome)} timepoint(s) segmented with the material "
+            f"definitions allowed to move."
+        ]
+        if moved:
+            message += [
+                "",
+                "These control materials moved noticeably: "
+                + ", ".join(sorted(set(moved)))
+                + ". A control material that moves is picking up something "
+                "else — check the result before using it.",
+            ]
+        QMessageBox.information(self, "Done", "\n".join(message))
+
 
     def _on_estimate_drift(self):
         """Measure the histogram's instrumental drift across the series."""
@@ -6429,9 +6652,9 @@ class BiTS4DMainWindow(QMainWindow):
         masks = self._model_class_masks(reference)
         if not masks:
             QMessageBox.information(
-                self, "No Classes",
-                "Segment a timepoint first, then choose which of its classes "
-                "are chemically inert."
+                self, "No Materials",
+                "Segment a timepoint first, then choose which of its "
+                "materials should not change during the experiment."
             )
             return
 
@@ -6682,7 +6905,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         try:
             result = run_with_progress(
-                self, "Block Cross-Validation",
+                self, "Held-Out Accuracy",
                 "Holding out contiguous blocks...", operation,
             )
         except (OperationCancelled, OperationFailed):
@@ -6692,40 +6915,42 @@ class BiTS4DMainWindow(QMainWindow):
 
         validation, spec = result
         names = list(masks)
-        lines = [validation.describe(), ""]
+        lines = [_plain_validation_summary(validation), ""]
         for index, name in enumerate(names, start=1):
             value = validation.iou.get(index)
             if value is not None and np.isfinite(value):
-                lines.append(f"  {name}: IoU {value:.3f}")
+                lines.append(f"  {name}: {100 * value:.1f}% overlap")
 
         training = self.rf_engine.get_train_stats().get("training_accuracy")
         if training is not None:
             lines.append("")
             lines.append(
-                f"Training accuracy was {100 * training:.2f}%. The gap is not a "
-                f"bug: neighbouring voxels are near-duplicates, so an in-sample "
-                f"score measures memorisation. The block figure is the one to "
-                f"quote."
+                f"Scored on its own training data the same model gets "
+                f"{100 * training:.1f}%. The gap is expected, not a fault: "
+                f"neighbouring voxels are near-copies, so training-data "
+                f"accuracy mostly measures how well it memorised them. The "
+                f"held-out figure is the one to report."
             )
         anchoring = self.rf_engine.get_train_stats().get("anchoring_index", 0.0)
         if anchoring and anchoring > 0.20:
             lines.append("")
             lines.append(
-                f"Anchoring index {anchoring:.2f}: about "
-                f"{100 * anchoring:.0f}% of this model's decision function "
-                f"rests on coordinates that are identical at every timepoint, "
-                f"so it is partly recalling T0 geometry rather than measuring. "
-                f"A time-invariant feature preset avoids that."
+                f"About {100 * anchoring:.0f}% of this classifier's decision "
+                f"rests on where a voxel sits in the volume rather than on "
+                f"what it looks like. Those positions are the same at every "
+                f"timepoint, so it is partly remembering the layout of the "
+                f"first one. Choose a feature set without position to avoid "
+                f"that."
             )
         lines.append("")
-        lines.append(f"Features: {spec.describe()}")
+        lines.append(f"Features used: {spec.describe()}")
 
         QMessageBox.information(
-            self, "Block Cross-Validation", "\n".join(lines)
+            self, "Held-Out Accuracy", "\n".join(lines)
         )
         self.status_bar.showMessage(
-            f"Block CV: kappa {validation.kappa:.3f}, "
-            f"mean IoU {validation.mean_iou:.3f}"
+            f"Held-out score: agreement {validation.kappa:.3f}, "
+            f"mean overlap {validation.mean_iou:.3f}"
         )
 
     def _on_export_histogram_evolution(self):

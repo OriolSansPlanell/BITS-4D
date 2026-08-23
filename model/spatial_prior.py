@@ -42,6 +42,17 @@ class MRFDiagnostics:
     sweeps: int
     changed_fraction: float
     energy: float
+    energy_trace: list = None
+    monotone: bool = True
+
+    def describe(self) -> str:
+        text = (
+            f"{self.method}, {self.sweeps} sweeps, "
+            f"{100 * self.changed_fraction:.2f}% of voxels changed on the last"
+        )
+        if not self.monotone:
+            text += " — WARNING: cost did not fall monotonically"
+        return text
 
 
 class UnaryScores:
@@ -121,30 +132,23 @@ class ROIDerivedMRF:
         contrast_sigma: Optional[float] = None,
         max_cost: float = 5.0,
         memory_budget_gb: float = 2.0,
+        damping: float = 0.5,
+        strict: bool = False,
     ) -> None:
         self.beta = float(beta)
         self.n_sweeps = int(n_sweeps)
         self.contrast_sigma = contrast_sigma
         self.max_cost = float(max_cost)
         self.memory_budget_gb = float(memory_budget_gb)
+        self.damping = float(damping)
+        self.strict = bool(strict)
         self.pairwise: Optional[np.ndarray] = None
         self.class_names: Optional[Sequence[str]] = None
 
     # ── learning the pairwise cost ───────────────────────────────────────
-    def fit_pairwise_from_labels(
-        self,
-        labels,
-        n_classes: Optional[int] = None,
-        valid_mask=None,
-        class_names: Optional[Sequence[str]] = None,
-    ) -> np.ndarray:
-        """Count face adjacencies in a label volume and turn them into costs.
-
-        ``V(k, l) = max(0, -log( p(k,l) / sqrt(p(k,k) p(l,l)) ))`` — zero when
-        two classes touch as readily as each touches itself, large when they
-        avoid one another. ``V(k, k)`` is zero by construction, so the field
-        only ever charges for *changing* label.
-        """
+    def adjacency_counts(self, labels, n_classes: Optional[int] = None,
+                         valid_mask=None) -> np.ndarray:
+        """Face-adjacency counts ``n[k, l]`` in a label volume."""
         label_volume = np.asarray(labels)
         if label_volume.ndim != 3:
             raise ValueError("The T0 label volume must be 3-D")
@@ -172,36 +176,51 @@ class ROIDerivedMRF:
             a, b = a[inside], b[inside]
             flat = np.bincount(a * classes + b, minlength=classes * classes)
             counts += flat.reshape(classes, classes)
-        counts = counts + counts.T          # unordered pairs
+        return counts + counts.T          # unordered pairs
 
-        total = counts.sum()
-        if total <= 0:
+    def fit_pairwise_from_labels(
+        self,
+        labels,
+        n_classes: Optional[int] = None,
+        valid_mask=None,
+        class_names: Optional[Sequence[str]] = None,
+        zero_diagonal: bool = True,
+        epsilon: float = 1.0,
+    ) -> np.ndarray:
+        """Count face adjacencies at T0 and turn them into boundary costs.
+
+        ``V(k, l) = -log( (n_kl + ε) / Σ_m (n_km + ε) )``, symmetrised. A
+        class pair that touches constantly in the user's own segmentation is
+        cheap to place side by side; one that never touches is expensive.
+        This is strictly better than charging the same for every boundary,
+        and it costs nothing — the counts come from work already done.
+
+        *zero_diagonal* subtracts each row's self-cost before symmetrising.
+        Without it a class whose own voxels are less reliably adjacent —
+        which is exactly what a small or thin class looks like — pays a
+        standing penalty for existing, on top of the penalty for bordering
+        anything. That is a quiet bias against the classes most at risk of
+        being smoothed away, so it is removed by default; the raw form is
+        available for comparison.
+        """
+        counts = self.adjacency_counts(labels, n_classes, valid_mask)
+        classes = counts.shape[0]
+        if counts.sum() <= 0:
             self.pairwise = potts_cost(classes)
             self.class_names = class_names
             return self.pairwise
 
-        probability = counts / total
-        self_adjacency = np.diag(probability).copy()
-        cost = np.full((classes, classes), self.max_cost, dtype=np.float64)
-        for k in range(classes):
-            for l in range(classes):
-                if k == l:
-                    cost[k, l] = 0.0
-                    continue
-                reference = np.sqrt(self_adjacency[k] * self_adjacency[l])
-                if reference <= 0:
-                    # A class with no interior (isolated voxels) gives the
-                    # ratio no meaning; fall back to a plain Potts penalty.
-                    cost[k, l] = 1.0
-                    continue
-                joint = probability[k, l]
-                if joint <= 0:
-                    cost[k, l] = self.max_cost
-                    continue
-                cost[k, l] = min(
-                    max(-np.log(joint / reference), 0.0), self.max_cost
-                )
-        self.pairwise = 0.5 * (cost + cost.T)
+        padded = counts + float(epsilon)
+        conditional = padded / padded.sum(axis=1, keepdims=True)
+        cost = -np.log(conditional)
+        if zero_diagonal:
+            cost = cost - np.diag(cost)[:, None]
+        cost = 0.5 * (cost + cost.T)
+        np.clip(cost, 0.0, self.max_cost, out=cost)
+        if zero_diagonal:
+            np.fill_diagonal(cost, 0.0)
+
+        self.pairwise = cost
         self.class_names = class_names
         return self.pairwise
 
@@ -333,18 +352,31 @@ class ROIDerivedMRF:
 
         if method == "mean_field":
             dense = scores.dense() if isinstance(scores, UnaryScores) else scores
-            labels, changed = self._mean_field(dense, weights, valid, cancel_check)
+            labels, changed, trace = self._mean_field(
+                dense, weights, valid, cancel_check
+            )
         elif method == "icm":
-            labels, changed = self._icm(
+            labels, changed, trace = self._icm(
                 scores, weights, valid, initial_labels, cancel_check
             )
         else:
             raise ValueError(f"Unknown method {method!r}")
 
         energy = self._energy(scores, labels, weights, valid)
+        # The total cost should fall every sweep. If it rises, the refinement
+        # is cycling rather than settling, and any result it produces is an
+        # arbitrary point in that cycle rather than an answer.
+        monotone = _is_monotone(trace)
+        if not monotone and self.strict:
+            raise RuntimeError(
+                "Spatial refinement did not settle: total cost rose between "
+                f"sweeps ({[round(v, 3) for v in trace]}). Reduce the "
+                "smoothing strength or increase damping."
+            )
         return labels, MRFDiagnostics(
             method=method, sweeps=self.n_sweeps,
             changed_fraction=changed, energy=energy,
+            energy_trace=trace, monotone=monotone,
         )
 
     # ── solvers ──────────────────────────────────────────────────────────
@@ -379,23 +411,34 @@ class ROIDerivedMRF:
 
         previous = np.argmax(responsibilities, axis=3)
         changed = 0.0
+        trace = []
+        damping = np.float32(np.clip(self.damping, 0.0, 1.0))
         for _ in range(self.n_sweeps):
             if cancel_check:
                 cancel_check()
             neighbour = self._neighbour_message(responsibilities, weights)
             # message[..., k] = Σ_l neighbour[..., l] · V(k, l)
             message = neighbour @ pairwise.T
-            responsibilities = _softmax(scores - self.beta * message)
+            updated = _softmax(scores - self.beta * message)
+            # Damped update. An undamped synchronous sweep can settle into a
+            # two-cycle that flips a whole region back and forth forever and
+            # looks, from outside, like an unstable segmentation.
+            responsibilities = (
+                updated if damping >= 1.0
+                else damping * updated + (1.0 - damping) * responsibilities
+            )
             if valid is not None:
                 responsibilities[~valid] = 0.0
             current = np.argmax(responsibilities, axis=3)
             changed = float(np.mean(current != previous))
             previous = current
+            trace.append(self._energy(scores, _mask_labels(current, valid),
+                                      weights, valid))
 
         labels = previous.astype(np.int32)
         if valid is not None:
             labels[~valid] = -1
-        return labels, changed
+        return labels, changed, trace
 
     def _icm(self, scores, weights, valid, initial_labels, cancel_check):
         pairwise = self.pairwise.astype(np.float32)
@@ -412,6 +455,7 @@ class ROIDerivedMRF:
             labels[~valid] = 0
 
         changed = 0.0
+        trace = []
         for _ in range(self.n_sweeps):
             if cancel_check:
                 cancel_check()
@@ -444,10 +488,13 @@ class ROIDerivedMRF:
                 best_label = np.where(improved, k, best_label)
             changed = float(np.mean(best_label != labels))
             labels = best_label.astype(np.int32)
+            trace.append(
+                self._energy(scores, _mask_labels(labels, valid), weights, valid)
+            )
 
         if valid is not None:
             labels[~valid] = -1
-        return labels, changed
+        return labels, changed, trace
 
     def _energy(self, scores, labels, weights, valid) -> float:
         """Total energy of a labelling — lower is better."""
@@ -488,6 +535,23 @@ def potts_cost(n_classes: int, off_diagonal: float = 1.0) -> np.ndarray:
     cost = np.full((n_classes, n_classes), float(off_diagonal), dtype=np.float64)
     np.fill_diagonal(cost, 0.0)
     return cost
+
+
+def _mask_labels(labels, valid):
+    """Labels with invalid voxels marked, without touching the original."""
+    if valid is None:
+        return labels
+    return np.where(valid, labels, -1)
+
+
+def _is_monotone(trace, tolerance: float = 1e-4) -> bool:
+    """Did the cost fall (or hold) at every sweep?"""
+    values = [value for value in (trace or []) if np.isfinite(value)]
+    for previous, current in zip(values, values[1:]):
+        allowance = tolerance * max(abs(previous), 1.0)
+        if current > previous + allowance:
+            return False
+    return True
 
 
 def _argmax_scores(scores) -> np.ndarray:
