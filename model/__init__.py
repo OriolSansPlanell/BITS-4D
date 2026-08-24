@@ -41,6 +41,21 @@ from model.mixture import (
     ROIAnchoredMixture,
     anchor_strength_to_kappa,
 )
+from model.health_check import Finding, HealthReport, Status, run_health_check
+from model.likelihood import (
+    UNCLASSIFIED,
+    ClassLibrary,
+    MatchTable,
+    MaterialClass,
+    match_table,
+)
+from model.locked import (
+    SMOOTHING_GRID,
+    LockedSegmenter,
+    SegmentationRefused,
+    SeriesSegmentation,
+    TimepointSegmentation,
+)
 from model.partial_volume import (
     MixelComponent,
     build_mixel_ladder,
@@ -57,7 +72,9 @@ from model.spatial_prior import ROIDerivedMRF, UnaryScores, potts_cost
 from model.temporal import DriftTransition, StaticTransition, TemporalModel
 from model.validity import (
     ValidityPolicy,
+    auto_floor,
     build_valid_mask,
+    channel_coverage,
     estimate_floor,
     find_acquisition_steps,
     validity_report,
@@ -66,7 +83,23 @@ from model.validity import (
 __all__ = [
     "ValidityPolicy",
     "build_valid_mask",
+    "auto_floor",
+    "channel_coverage",
     "estimate_floor",
+    "MaterialClass",
+    "ClassLibrary",
+    "MatchTable",
+    "match_table",
+    "UNCLASSIFIED",
+    "LockedSegmenter",
+    "SeriesSegmentation",
+    "TimepointSegmentation",
+    "SegmentationRefused",
+    "SMOOTHING_GRID",
+    "run_health_check",
+    "HealthReport",
+    "Finding",
+    "Status",
     "validity_report",
     "find_acquisition_steps",
     "HistogramCache",

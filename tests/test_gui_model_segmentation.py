@@ -19,8 +19,7 @@ def qapp():
     return QApplication.instance() or QApplication([])
 
 
-@pytest.fixture()
-def window(qapp):
+def _build_window(drift_per_step=0.0):
     from gui import BiTS4DMainWindow
     from data import Dataset4D
     from histograms import HistogramEngine4D
@@ -30,9 +29,11 @@ def window(qapp):
     neutron = np.zeros((timepoints,) + shape)
     xray = np.zeros((timepoints,) + shape)
 
-    # Two phases, drifting together; the second one also shrinks
+    # Two materials; the second shrinks over time. *drift_per_step* moves
+    # both of them together, which is an instrument effect rather than a
+    # sample one — locked mode is explicitly not built to absorb it.
     for timepoint in range(timepoints):
-        drift = 60.0 * timepoint
+        drift = drift_per_step * timepoint
         matrix = np.zeros(shape, dtype=bool)
         matrix[:, :, :10] = True
         blob = np.zeros(shape, dtype=bool)
@@ -59,6 +60,18 @@ def window(qapp):
     return w
 
 
+@pytest.fixture()
+def window(qapp):
+    """A stable instrument: only the sample changes."""
+    return _build_window(drift_per_step=0.0)
+
+
+@pytest.fixture()
+def drifting_window(qapp):
+    """An instrument that moves under the sample."""
+    return _build_window(drift_per_step=60.0)
+
+
 def _segment_two_classes(window, monkeypatch):
     """Draw and save two ROIs, then segment the current timepoint."""
     roi_manager = window.dual_histogram.get_roi_manager()
@@ -67,6 +80,10 @@ def _segment_two_classes(window, monkeypatch):
     )
     monkeypatch.setattr(
         QMessageBox, "information", staticmethod(lambda *a, **k: None)
+    )
+    # Problems are reported through warning(); unstubbed it blocks forever
+    monkeypatch.setattr(
+        QMessageBox, "warning", staticmethod(lambda *a, **k: None)
     )
     for name, (low, high) in (
         ("Matrix", (300, 700)), ("Deposit", (900, 1300))
@@ -82,26 +99,34 @@ def _segment_two_classes(window, monkeypatch):
 
 # ── model-based segmentation ─────────────────────────────────────────────────
 
-def test_model_segmentation_labels_every_timepoint(window, monkeypatch):
+def _fake_dialog(monkeypatch, **overrides):
+    """Drive the tracking dialog without a user."""
     from gui import main_window as mw
 
+    settings = {
+        "control_materials": ["Matrix"],
+        "smoothing_mode": "auto",
+        "smoothing_strength": None,
+        "find_mixed_boundaries": False,
+        "lock_definitions": True,
+    }
+    settings.update(overrides)
+
+    class FakeDialog(mw.MaterialTrackingDialog):
+        def exec_(self):
+            for key, value in settings.items():
+                setattr(self, key, value)
+            return QDialog.Accepted
+
+    monkeypatch.setattr(mw, "MaterialTrackingDialog", FakeDialog)
+    return settings
+
+
+def test_model_segmentation_labels_every_timepoint(window, monkeypatch):
     names = _segment_two_classes(window, monkeypatch)
     assert len(names) == 2
 
-    class FakeDialog(mw.ModelSegmentationDialog):
-        def exec_(self):
-            self.anchor_strength = 0.5
-            self.anchor_classes = ["Matrix"]
-            self.estimate_scale = False
-            self.beta = 1.0
-            self.sweeps = 3
-            self.memory = 0.5
-            self.outlier_component = True
-            self.reject_margin = None
-            self.detect_mixels = True
-            return QDialog.Accepted
-
-    monkeypatch.setattr(mw, "ModelSegmentationDialog", FakeDialog)
+    _fake_dialog(monkeypatch)
     window._on_model_segmentation()
 
     assert window.model_result is not None
@@ -114,39 +139,53 @@ def test_model_segmentation_labels_every_timepoint(window, monkeypatch):
         assert layers
 
 
-def test_model_segmentation_tracks_a_drifting_class(window, monkeypatch):
-    """The point of the exercise: counts follow the truth, not the T0 box."""
-    from gui import main_window as mw
-
+def test_model_segmentation_follows_a_shrinking_material(window, monkeypatch):
+    """A real change in the sample has to come through as a real change."""
     _segment_two_classes(window, monkeypatch)
-
-    class FakeDialog(mw.ModelSegmentationDialog):
-        def exec_(self):
-            self.anchor_strength = 0.5
-            self.anchor_classes = ["Matrix"]
-            self.estimate_scale = False
-            self.beta = 1.0
-            self.sweeps = 3
-            self.memory = 0.5
-            self.outlier_component = True
-            self.reject_margin = None
-            self.detect_mixels = False
-            return QDialog.Accepted
-
-    monkeypatch.setattr(mw, "ModelSegmentationDialog", FakeDialog)
+    _fake_dialog(monkeypatch)
     window._on_model_segmentation()
 
     counts = [
         entry.voxel_counts["Deposit"] for entry in window.model_result.timepoints
     ]
-    # The deposit really does shrink; a frozen T0 box would lose it entirely
     assert counts[0] > counts[-1]
     assert all(count > 0 for count in counts)
 
-    drifts = [
-        entry.drift.magnitude for entry in window.model_result.timepoints
+    # The control material was declared unchanging, and stays so
+    control = [
+        entry.voxel_counts["Matrix"] for entry in window.model_result.timepoints
     ]
-    assert drifts[-1] > drifts[0]
+    assert max(control) - min(control) < 0.25 * max(control)
+
+
+def test_results_are_the_same_run_backwards(window, monkeypatch):
+    """Timepoints are independent, so order cannot matter."""
+    from model import ClassLibrary, LockedSegmenter
+    from model.spatial_prior import ROIDerivedMRF
+    from model.validity import build_valid_mask
+
+    _segment_two_classes(window, monkeypatch)
+    masks = window._model_class_masks(0)
+    neutron, xray = window.dataset.get_volume_at_time(0)
+    valid = build_valid_mask(neutron, xray)
+
+    library = ClassLibrary.from_masks(
+        neutron, xray, masks, valid_mask=valid, inert=["Matrix"]
+    )
+    segmenter = LockedSegmenter(library, prior=ROIDerivedMRF(beta=1.0, n_sweeps=3))
+    segmenter.set_grid(
+        window.global_histogram.x_edges, window.global_histogram.y_edges
+    )
+    order = list(range(window.dataset.num_timepoints))
+    forwards = segmenter.segment_series(window.dataset, timepoints=order)
+    backwards = segmenter.segment_series(
+        window.dataset, timepoints=order[::-1]
+    )
+    for entry in forwards.timepoints:
+        other = next(
+            e for e in backwards.timepoints if e.timepoint == entry.timepoint
+        )
+        assert np.array_equal(entry.labels, other.labels)
 
 
 def test_model_segmentation_needs_classes_first(window, monkeypatch):
@@ -156,7 +195,34 @@ def test_model_segmentation_needs_classes_first(window, monkeypatch):
         staticmethod(lambda *a, **k: shown.append(a[-1])),
     )
     window._on_model_segmentation()
-    assert shown and "Segment the current timepoint first" in shown[-1]
+    assert shown and "Draw and segment at least one material first" in shown[-1]
+
+
+def test_drift_makes_locked_mode_refuse_and_say_why(drifting_window, monkeypatch):
+    """Locked definitions cannot absorb a moving instrument — and say so.
+
+    The refusal is the feature: the alternative is a results screen full of
+    numbers that quietly describe the wrong voxels.
+    """
+    window = drifting_window
+    _segment_two_classes(window, monkeypatch)
+
+    warned = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *a, **k: warned.append(a[-1])),
+    )
+    _fake_dialog(monkeypatch)
+    window._on_model_segmentation()
+
+    assert warned, "a drifting series should not produce a silent result"
+    message = warned[-1]
+    assert "not reliable" in message
+    assert "have not been applied" in message
+    # It must distinguish drift from a missing material, and name the remedy
+    assert "drifted" in message
+    assert "Check Instrument Stability" in message
+    assert window.model_result is None
 
 
 def test_model_run_is_scriptable_without_the_gui(window, monkeypatch):
@@ -223,7 +289,7 @@ def test_drift_needs_anchor_classes(window, monkeypatch):
         staticmethod(lambda *a, **k: shown.append(a[-1])),
     )
     window._on_estimate_drift()
-    assert shown and "chemically inert" in shown[-1]
+    assert shown and "should not change during the experiment" in shown[-1]
 
 
 # ── spatial metrics ──────────────────────────────────────────────────────────
@@ -279,9 +345,37 @@ def test_block_cv_reports_a_lower_number_than_training_accuracy(
 
     assert shown
     message = shown[-1]
-    assert "block CV" in message
-    assert "kappa" in message
-    assert "memorisation" in message
+    assert "never saw during training" in message
+    assert "overlap" in message
+    assert "memorised" in message
+
+
+def test_check_data_reports_field_of_view_overlap(window, monkeypatch):
+    """The fact that broke the previous run has to be visible on load."""
+    shown = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda *a, **k: shown.append(a[-1])),
+    )
+    # Blank the X-ray channel over part of the volume: different fields of view
+    window.dataset.xray_data[:, :, :, :6] = 0.0
+    window._on_check_data()
+
+    assert shown
+    message = shown[-1]
+    assert "only one instrument" in message
+    assert "neutron data but no X-ray data" in message
+    assert "excluded" in message
+
+
+def test_check_data_is_quiet_when_the_views_agree(window, monkeypatch):
+    shown = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda *a, **k: shown.append(a[-1])),
+    )
+    window._on_check_data()
+    assert shown and "only one instrument" not in shown[-1]
 
 
 def test_block_cv_needs_a_trained_model(window, monkeypatch):
