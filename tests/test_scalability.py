@@ -3,7 +3,7 @@ import tifffile
 
 from data.data_loader_4d import TIFF4DLoader
 from histograms.histogram_engine_4d import HistogramEngine4D
-from segmentation.random_forest_4d import RandomForestSegmentation4D
+from segmentation.legacy.random_forest_4d import RandomForestSegmentation4D
 from utils.clustering_3d import KMeans3D
 
 

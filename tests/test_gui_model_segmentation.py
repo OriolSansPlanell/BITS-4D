@@ -99,34 +99,23 @@ def _segment_two_classes(window, monkeypatch):
 
 # ── model-based segmentation ─────────────────────────────────────────────────
 
-def _fake_dialog(monkeypatch, **overrides):
-    """Drive the tracking dialog without a user."""
-    from gui import main_window as mw
-
-    settings = {
-        "control_materials": ["Matrix"],
-        "smoothing_mode": "auto",
-        "smoothing_strength": None,
-        "find_mixed_boundaries": False,
-        "lock_definitions": True,
-    }
-    settings.update(overrides)
-
-    class FakeDialog(mw.MaterialTrackingDialog):
-        def exec_(self):
-            for key, value in settings.items():
-                setattr(self, key, value)
-            return QDialog.Accepted
-
-    monkeypatch.setattr(mw, "MaterialTrackingDialog", FakeDialog)
-    return settings
+def _configure_panel(window, controls=("Matrix",), smoothing="Auto",
+                    mixed=False, locked=True):
+    """Set the panel the way a user would before pressing Run."""
+    window._refresh_material_panel()
+    for name in controls:
+        window.material_panel.set_behaviour(name, "Stays unchanged")
+    window.material_panel.smoothing_combo.setCurrentText(smoothing)
+    window.material_panel.mixed_check.setChecked(mixed)
+    window.material_panel.lock_check.setChecked(locked)
+    return window.material_panel.settings()
 
 
 def test_model_segmentation_labels_every_timepoint(window, monkeypatch):
     names = _segment_two_classes(window, monkeypatch)
     assert len(names) == 2
 
-    _fake_dialog(monkeypatch)
+    _configure_panel(window)
     window._on_model_segmentation()
 
     assert window.model_result is not None
@@ -142,7 +131,7 @@ def test_model_segmentation_labels_every_timepoint(window, monkeypatch):
 def test_model_segmentation_follows_a_shrinking_material(window, monkeypatch):
     """A real change in the sample has to come through as a real change."""
     _segment_two_classes(window, monkeypatch)
-    _fake_dialog(monkeypatch)
+    _configure_panel(window)
     window._on_model_segmentation()
 
     counts = [
@@ -212,7 +201,7 @@ def test_drift_makes_locked_mode_refuse_and_say_why(drifting_window, monkeypatch
         QMessageBox, "warning",
         staticmethod(lambda *a, **k: warned.append(a[-1])),
     )
-    _fake_dialog(monkeypatch)
+    _configure_panel(window)
     window._on_model_segmentation()
 
     assert warned, "a drifting series should not produce a silent result"
@@ -323,67 +312,3 @@ def test_spatial_metrics_need_a_segmentation(window, monkeypatch):
     )
     window._on_export_spatial_metrics()
     assert shown and "Segment at least one timepoint" in shown[-1]
-
-
-# ── block cross-validation ───────────────────────────────────────────────────
-
-def test_block_cv_reports_a_lower_number_than_training_accuracy(
-    window, monkeypatch
-):
-    _segment_two_classes(window, monkeypatch)
-    window.rf_ref_spin.setValue(0)
-    window._rf_train()
-    if window.rf_engine is None or not window.rf_engine.is_trained:
-        pytest.skip("Random Forest training did not run in this environment")
-
-    shown = []
-    monkeypatch.setattr(
-        QMessageBox, "information",
-        staticmethod(lambda *a, **k: shown.append(a[-1])),
-    )
-    window._on_block_cross_validation()
-
-    assert shown
-    message = shown[-1]
-    assert "never saw during training" in message
-    assert "overlap" in message
-    assert "memorised" in message
-
-
-def test_check_data_reports_field_of_view_overlap(window, monkeypatch):
-    """The fact that broke the previous run has to be visible on load."""
-    shown = []
-    monkeypatch.setattr(
-        QMessageBox, "information",
-        staticmethod(lambda *a, **k: shown.append(a[-1])),
-    )
-    # Blank the X-ray channel over part of the volume: different fields of view
-    window.dataset.xray_data[:, :, :, :6] = 0.0
-    window._on_check_data()
-
-    assert shown
-    message = shown[-1]
-    assert "only one instrument" in message
-    assert "neutron data but no X-ray data" in message
-    assert "excluded" in message
-
-
-def test_check_data_is_quiet_when_the_views_agree(window, monkeypatch):
-    shown = []
-    monkeypatch.setattr(
-        QMessageBox, "information",
-        staticmethod(lambda *a, **k: shown.append(a[-1])),
-    )
-    window._on_check_data()
-    assert shown and "only one instrument" not in shown[-1]
-
-
-def test_block_cv_needs_a_trained_model(window, monkeypatch):
-    shown = []
-    monkeypatch.setattr(
-        QMessageBox, "information",
-        staticmethod(lambda *a, **k: shown.append(a[-1])),
-    )
-    window.rf_engine = None
-    window._on_block_cross_validation()
-    assert shown and "Train the Random Forest first" in shown[-1]

@@ -69,8 +69,14 @@ region there and convert it into a histogram region.
 
 ## 4. Mark control materials
 
-In the tracking dialog, tick the materials that **cannot change during the
-experiment** — a casing, a support, a structural metal.
+On the **🧱 Materials** tab every material is listed with where it came from,
+how many voxels it holds, and a setting in the last column. Set the materials
+that **cannot change during the experiment** — a casing, a support, a
+structural metal — to *Stays unchanged*.
+
+Materials copied from a K-means clustering appear here alongside the drawn
+ones and behave identically, so a cluster you recognise as the casing can be
+marked as a control like any other.
 
 One click each, and it buys an independent check on everything else: if a
 control material's volume moves, the segmentation is wrong, not the sample.
@@ -94,8 +100,9 @@ what to do about it. Skipping this costs nothing else.
 
 ## 6. Preview
 
-Run *Track Materials Across Time* with the current timepoint selected and
-look at the result beside the raw slice before committing to the whole series.
+**▶ Preview this timepoint** on the Materials tab runs the current timepoint
+only. Look at the result beside the raw slice before committing to the whole
+series.
 
 Leave **Smoothing strength** on **Auto**. Smoothing uses neighbouring voxels
 to clean up noisy assignments, and it is the one setting that can destroy a
@@ -106,7 +113,7 @@ volume, and shows you the sweep it used.
 
 ## 7. Run the series
 
-Every timepoint is measured against the same fixed material definitions.
+**▶▶ Run all timepoints.** Every timepoint is measured against the same fixed material definitions.
 Voxels move between materials; the definitions do not move.
 
 That is the design decision that makes the results mean something:
@@ -181,11 +188,11 @@ you have three options, in order of preference:
 
 | I want to… | Go to |
 | --- | --- |
+| read about any of this from inside the app | Help → Manual (F1) |
 | see what is actually measurable | Analytics → Time Series Segmentation → Check Data |
-| segment the whole series | Analytics → Time Series Segmentation → Track Materials Across Time |
+| segment the whole series | 🧱 Materials tab → Run all timepoints |
 | find out whether the instrument moved | Analytics → Time Series Segmentation → Check Instrument Stability |
 | measure shape, position, contact area | Analytics → Histogram Time Analysis → Spatial Metrics |
-| get an honest classifier score | Analytics → Time Series Segmentation → Held-Out Accuracy |
 | export volumes and a written report | File → Export |
 
 ## The one-line summary

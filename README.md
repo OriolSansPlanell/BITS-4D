@@ -28,11 +28,13 @@ back to voxels.
 - **Automated segmentation** — multi-level Otsu thresholding and K-means
   clustering (2-D slice, 3-D volume, or hybrid) that generate class masks
   and histogram overlays.
-- **Classifier generalisation (legacy)** — train on the segmented reference
-  timepoint and predict the others. No longer the recommended route: where a
-  material sits on the histogram is fixed by physics, so there is nothing
-  there for a classifier to learn that your own regions do not already state
-  exactly. Kept runnable for reproducing earlier work and for comparison.
+- **Materials panel** — every material, whether drawn on the histogram or
+  copied from a K-means clustering, listed with a per-material toggle:
+  *Changes* or *Stays unchanged*. Marking the second kind gives every other
+  result an independent check. Smoothing, preview, run and the health-check
+  readout are all on the same panel.
+- **Built-in manual** — *Help → Manual* (F1): how to do each operation, and
+  the mathematics behind each one, searchable and exportable as text.
 - **Analysis and export** — per-selection statistics, morphological analysis,
   time-series tracking, histogram-evolution maps, and export to
   TIFF / CSV / Excel / PDF. Exports are named after your classes
@@ -110,10 +112,10 @@ python main.py
    (all named classes **and** the active one) to the current timepoint;
    *✂✂ Segment All* processes the whole series. Each class becomes a coloured
    overlay in the slice viewer.
-4. **Track the series** — *Analytics → Time Series Segmentation → Track
-   Materials Across Time* measures every timepoint against the materials you
-   drew, picks the smoothing strength for you, and checks the result before
-   showing it.
+4. **Track the series** — on the *🧱 Materials* tab, mark anything that
+   cannot change as *Stays unchanged*, then **Preview** one timepoint and
+   **Run all timepoints**. Smoothing is chosen for you and the result is
+   checked before it is shown.
 5. **Export** — masked volumes, binary masks, and label maps as TIFF;
    per-class bimodal histograms and a `segmentation_report.txt`; statistics
    as CSV/Excel; reports as PDF.
@@ -172,7 +174,7 @@ pipelines, cancellation, and data loading.
 main.py                  Application entry point
 data/                    TIFF loading and 4D dataset container
 histograms/              Chunked CPU/GPU 2-D histogram engine
-segmentation/            ROI segmentation, Random Forest, K-means→RF conversion
+segmentation/            ROI segmentation, K-means→material conversion, legacy/
 model/                   Anchored mixture, MRF, drift tracking, sequential segmenter
 utils/                   ROI manager, clustering, region growing, metrics, exports
 gui/                     PyQt5 widgets (main window, histograms, viewers)

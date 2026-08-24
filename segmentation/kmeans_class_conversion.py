@@ -1,4 +1,4 @@
-"""Conversion of 3-D K-means cluster payloads into RF training layers."""
+"""Conversion of 3-D K-means cluster payloads into material layers."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class KMeansClassConversionSummary:
-    """Summary of a K-means-to-RF class conversion."""
+    """Summary of a K-means-to-material conversion."""
 
     cluster_ids: tuple[int, ...]
     covered_voxels: int
@@ -19,12 +19,12 @@ class KMeansClassConversionSummary:
     total_voxels: int
 
 
-def build_rf_layers_from_cluster_selections(
+def build_material_layers_from_cluster_selections(
     cluster_selections: Iterable[Sequence],
     volume_shape: tuple[int, int, int],
 ) -> tuple[list[tuple[np.ndarray, object, str]], KMeansClassConversionSummary]:
     """
-    Convert 3-D K-means cluster payloads into RF-compatible segmentation layers.
+    Convert 3-D K-means cluster payloads into segmentation layers.
 
     Each input payload must use the six-field form emitted by the 3-D
     auto-detection workflow:
@@ -35,9 +35,10 @@ def build_rf_layers_from_cluster_selections(
 
         (mask_3d, color, class_name)
 
-    Classes are ordered by the original K-means cluster id, which makes RF class
-    assignment deterministic. All K-means clusters become RF classes; voxels
-    outside every cluster remain background.
+    Classes are ordered by the original K-means cluster id, so the material
+    order — and therefore every label value downstream — is deterministic.
+    Every cluster becomes a material; voxels outside every cluster remain
+    background.
     """
     shape = tuple(int(value) for value in volume_shape)
     if len(shape) != 3 or any(value <= 0 for value in shape):
@@ -92,3 +93,7 @@ def build_rf_layers_from_cluster_selections(
         total_voxels=total,
     )
     return layers, summary
+
+
+#: Name this function had while the classifier was the destination.
+build_rf_layers_from_cluster_selections = build_material_layers_from_cluster_selections

@@ -1,6 +1,52 @@
 # Bug-fix and cleanup notes
 
-## Locked material definitions, guards and a health check (latest)
+## The classifier removed, a materials panel, and a built-in manual (latest)
+
+**The classifier is gone from the application.** Its tab, menu entries,
+handlers and state are removed; `segmentation.legacy` keeps the module
+importable so earlier figures and method comparisons still run, but nothing
+in the application reaches it. The reason is recorded in
+`segmentation/legacy/__init__.py` and in the manual: its training labels came
+from point-in-polygon tests on the histogram, so every label was already an
+exact function of the two intensities, and no other feature can carry
+information about a target the intensities already determine. Attenuation
+coefficients are material constants, so the boundary did not need learning
+either. What the histogram genuinely cannot supply is spatial information —
+building it discards spatial arrangement by construction — and that is what
+the smoothing term provides.
+
+**The materials panel** replaces it (`gui/material_panel.py`). Every
+material, whether drawn on the histogram or copied from a K-means clustering,
+is listed with its source, its size and a toggle: *Changes* or *Stays
+unchanged*. Marking the second kind is the one judgement the software cannot
+make for the user, and it is what gives every other result an independent
+check. Smoothing, preview, run and the health-check readout are on the same
+panel, which replaces the modal dialog the settings used to live behind.
+
+The panel emits signals and knows nothing about datasets, so it is testable
+without one. `set_materials()` carries an existing behaviour choice across a
+refresh — re-reading the segmentation must not silently discard the control
+setting.
+
+**A built-in manual** (*Help → Manual*, F1). Twenty sections in two groups:
+*How to*, which assumes you know segmentation and nothing else, and
+*Mathematics*, which states what is actually computed — the histogram and its
+sufficient statistics, the winding rule, Mahalanobis distance and the match
+score, the smoothing cost and where its matrix comes from, how the smoothing
+strength is chosen, the validity rule, mean-shift drift estimation, the
+partial-volume model, every metric, and why there is no classifier. Non-modal,
+searchable, and exportable as plain text. `tests/test_ui_language.py` checks
+the complement of the interface rule: the manual is required to *contain*
+the vocabulary the interface hides.
+
+**A regression caught while removing the classifier.**
+`_update_rf_histogram_overlays` was named for the classifier but drew the
+class outlines for *every* segmentation layer. Deleting it with the rest of
+the classifier removed the outlines from the histogram entirely. It is
+restored as `_update_class_histogram_overlays`, with the classifier-specific
+half dropped, and called wherever layers change.
+
+## Locked material definitions, guards and a health check
 
 Implements the revised v17 specification, which withdraws the assumption that
 the class parameters should be fitted. The user-facing result is
