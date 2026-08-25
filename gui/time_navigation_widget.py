@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSlider,
     QSpinBox, QLabel, QCheckBox
 )
+from gui.flow_layout import FlowLayout
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 
 
@@ -31,13 +32,17 @@ class TimeNavigationWidget(QWidget):
         self.init_ui()
     
     def init_ui(self):
-        layout = QVBoxLayout()
-        
+        # One flowing row rather than four stacked ones. This widget lives in
+        # a strip across the bottom of the window, where four rows cost 150
+        # pixels of height that the slice viewer needs — and where the extra
+        # width means everything fits on one line anyway. On a narrow window
+        # it wraps instead of forcing the window wider.
+        layout = FlowLayout(margin=0, h_spacing=6, v_spacing=3)
+
         # Timepoint info label
         self.info_label = QLabel(f"Timepoint: 0 / {self.num_timepoints - 1}")
-        self.info_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.info_label)
-        
+
         # Slider with navigation buttons
         slider_layout = QHBoxLayout()
         

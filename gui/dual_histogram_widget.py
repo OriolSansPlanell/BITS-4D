@@ -7,10 +7,17 @@ Displays global and local histograms side-by-side with ROI drawing capabilities
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton,
     QButtonGroup, QDoubleSpinBox, QListWidget, QListWidgetItem,
-    QInputDialog, QMessageBox, QGroupBox
+    QInputDialog, QMessageBox, QGroupBox, QSplitter
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QSize, pyqtSignal
 from PyQt5.QtGui import QColor
+from gui.flow_layout import FlowLayout
+
+#: How small a histogram canvas may get before it stops being usable.
+#: Deliberately modest: the window's minimum width is the sum of these,
+#: so a generous value here is what makes the application unusable on a
+#: laptop.
+_CANVAS_MINIMUM = (200, 150)
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -400,41 +407,50 @@ class DualHistogramWidget(QWidget):
     def init_ui(self):
         layout = QVBoxLayout()
         
-        # Histogram displays
-        hist_layout = QHBoxLayout()
-        
-        # Global histogram
-        global_layout = QVBoxLayout()
-        global_label = QLabel("<b>Global Histogram (All Timepoints)</b>")
+        # The two histograms live in a splitter rather than a fixed row, so
+        # either can be dragged shut. On a laptop screen there is rarely room
+        # for both, and the local one is only meaningful for a time series.
+        self.hist_splitter = QSplitter(Qt.Horizontal)
+        self.hist_splitter.setChildrenCollapsible(True)
+
+        global_panel = QWidget()
+        global_layout = QVBoxLayout(global_panel)
+        global_layout.setContentsMargins(0, 0, 0, 0)
+        global_layout.setSpacing(2)
+        global_label = QLabel("<b>Global — all timepoints</b>")
         global_layout.addWidget(global_label)
-        
+
         self.global_canvas = HistogramCanvas("Global Histogram")
         self.global_canvas.roi_manager = self.roi_manager
         self.global_canvas.roi_updated.connect(self._on_roi_updated)
-        self.global_canvas.setMinimumSize(400, 300)
+        self.global_canvas.setMinimumSize(*_CANVAS_MINIMUM)
         global_layout.addWidget(self.global_canvas)
-        
+
         self.global_toolbar = NavigationToolbar(self.global_canvas, self)
+        self.global_toolbar.setIconSize(QSize(16, 16))
         global_layout.addWidget(self.global_toolbar)
-        
-        hist_layout.addLayout(global_layout)
-        
-        # Local histogram
-        local_layout = QVBoxLayout()
-        local_label = QLabel("<b>Local Histogram (Current Timepoint)</b>")
+        self.hist_splitter.addWidget(global_panel)
+
+        local_panel = QWidget()
+        local_layout = QVBoxLayout(local_panel)
+        local_layout.setContentsMargins(0, 0, 0, 0)
+        local_layout.setSpacing(2)
+        local_label = QLabel("<b>Local — current timepoint</b>")
         local_layout.addWidget(local_label)
-        
+
         self.local_canvas = HistogramCanvas("Local Histogram")
         self.local_canvas.roi_manager = self.roi_manager
-        self.local_canvas.setMinimumSize(400, 300)
+        self.local_canvas.setMinimumSize(*_CANVAS_MINIMUM)
         local_layout.addWidget(self.local_canvas)
-        
+
         self.local_toolbar = NavigationToolbar(self.local_canvas, self)
+        self.local_toolbar.setIconSize(QSize(16, 16))
         local_layout.addWidget(self.local_toolbar)
-        
-        hist_layout.addLayout(local_layout)
-        
-        layout.addLayout(hist_layout)
+        self.hist_splitter.addWidget(local_panel)
+        self._local_panel = local_panel
+
+        self.hist_splitter.setSizes([500, 500])
+        layout.addWidget(self.hist_splitter, stretch=1)
         
         # Initialize editable ROI handlers
         from utils.editable_roi_handler import EditableROIHandler
@@ -451,8 +467,9 @@ class DualHistogramWidget(QWidget):
             update_callback=self._on_editable_roi_updated
         )
         
-        # Controls
-        controls_layout = QHBoxLayout()
+        # Controls. A flow layout so a narrow window gets three short
+        # rows instead of one row nothing can display.
+        controls_layout = FlowLayout()
         
         # ROI tools
         controls_layout.addWidget(QLabel("<b>ROI Tool:</b>"))
@@ -540,7 +557,7 @@ class DualHistogramWidget(QWidget):
         roi_list_layout.setSpacing(3)
 
         self.roi_list_widget = QListWidget()
-        self.roi_list_widget.setMinimumHeight(110)
+        self.roi_list_widget.setMinimumHeight(64)
         self.roi_list_widget.setToolTip(
             "Every saved selection (class) drawn on the histogram.\n\n"
             "• Untick a row to hide it — hidden selections are not drawn\n"
@@ -557,7 +574,7 @@ class DualHistogramWidget(QWidget):
         )
         roi_list_layout.addWidget(self.roi_list_widget)
 
-        roi_list_btns = QHBoxLayout()
+        roi_list_btns = FlowLayout()
         self.edit_class_btn = QPushButton("✏️ Edit")
         self.edit_class_btn.setEnabled(False)
         self.edit_class_btn.setToolTip(
@@ -580,7 +597,7 @@ class DualHistogramWidget(QWidget):
         roi_list_btns.addWidget(self.clear_all_classes_btn)
         roi_list_layout.addLayout(roi_list_btns)
 
-        vis_btns = QHBoxLayout()
+        vis_btns = FlowLayout()
         self.show_all_classes_btn = QPushButton("👁 Show All")
         self.show_all_classes_btn.setEnabled(False)
         self.show_all_classes_btn.clicked.connect(
@@ -760,16 +777,41 @@ class DualHistogramWidget(QWidget):
                 and row == self._named_count())
 
     @staticmethod
-    def _style_roi_item(item, roi):
-        """Set one row's check state and colour from its ROI entry."""
+    def _colour_swatch(colour, size=14):
+        """A solid square of *colour*, for identifying a class at a glance."""
+        from PyQt5.QtGui import QIcon, QPainter, QPixmap
+
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setBrush(QColor(colour))
+        painter.setPen(QColor('#404040'))
+        painter.drawRect(0, 0, size - 1, size - 1)
+        painter.end()
+        return QIcon(pixmap)
+
+    @classmethod
+    def _style_roi_item(cls, item, roi):
+        """Set one row's check state and colour swatch from its ROI entry.
+
+        The colour is shown as a solid swatch rather than as a tinted row
+        background. A background washed out enough to keep the text readable
+        is washed out enough to read as a different colour — which is how a
+        red class came to look pink in the panel while it was red on the
+        histogram.
+        """
         visible = roi.get('visible', True)
         item.setCheckState(Qt.Checked if visible else Qt.Unchecked)
         try:
-            color = QColor(roi['color'])
-            color.setAlpha(60 if visible else 20)
-            item.setBackground(color)
+            item.setIcon(cls._colour_swatch(roi['color']))
         except Exception:
             pass
+        # Visibility shows in the tick and in the text, not in the hue: a
+        # class has to stay recognisable while it is switched off.
+        font = item.font()
+        font.setItalic(not visible)
+        item.setFont(font)
+        item.setForeground(QColor('#909090' if not visible else '#202020'))
 
     def _update_selection_buttons(self, *_args):
         """Enable the panel's buttons according to the current selection."""
@@ -787,6 +829,27 @@ class DualHistogramWidget(QWidget):
         self.edit_class_btn.setEnabled(on_named)
         self.only_selected_btn.setEnabled(on_named or on_active)
         self.save_class_btn.setEnabled(self.roi_manager.roi_type is not None)
+
+    def set_local_visible(self, visible: bool):
+        """Show or fold away the current-timepoint histogram.
+
+        Folded rather than hidden: the splitter handle stays, so it can be
+        dragged back open without going near a menu.
+        """
+        sizes = self.hist_splitter.sizes()
+        total = sum(sizes) or 800
+        if visible:
+            self._local_panel.setMinimumWidth(_CANVAS_MINIMUM[0])
+            self.hist_splitter.setSizes([total // 2, total - total // 2])
+        else:
+            # A folded panel must also stop demanding width, or the splitter
+            # keeps the whole window as wide as if both were shown.
+            self._local_panel.setMinimumWidth(0)
+            self.hist_splitter.setSizes([total, 0])
+
+    def local_is_visible(self) -> bool:
+        sizes = self.hist_splitter.sizes()
+        return len(sizes) > 1 and sizes[1] > 0
 
     def _refresh_named_roi_overlays(self):
         """Push the visible class ROIs to both canvases as coloured overlays."""

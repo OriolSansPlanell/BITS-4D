@@ -65,6 +65,16 @@ in either channel on its own.</p>
 <li><b>Export</b> volumes, label maps and a written report.</li>
 </ol>
 
+<h2>Fitting your screen</h2>
+<p>The window sizes itself from the screen it finds, and picks one of two
+arrangements. On a 14-inch laptop it opens <b>compact</b>: the
+current-timepoint histogram is folded away and the tool column is narrower.
+On a wide monitor both histograms are shown.</p>
+<p><i>View</i> switches between them at any time, folds the second histogram,
+the tool panel or the time strip away, and re-fits the window
+(<b>Ctrl+0</b>). Nothing is removed by folding — every splitter handle stays
+where it was, so dragging one open brings the panel straight back.</p>
+
 <h2>What the two axes are</h2>
 <p>The horizontal axis is <b>neutron</b> intensity, the vertical is
 <b>X-ray</b>. A region you draw is a set of intensity pairs, so it selects
@@ -96,6 +106,13 @@ _DEFINING = """
 <div class="note">The names you give here are the names in every output, in
 this order, and they set the integer values in the exported label volumes.
 Nothing renames or reorders them later.</div>
+
+<h2>Colours</h2>
+<p>Each material gets a colour when you save it, and keeps it: the same
+colour marks it on the histogram, in the selection panel and in the slice
+viewer. Hiding a material greys its row and clears its tick but does not
+change its colour — it has to stay recognisable while it is switched off.
+The colour is stored with the region, so it survives saving and reloading.</p>
 
 <h2>Editing one afterwards</h2>
 <p>In the selection panel, select a class and press <b>Edit</b>. It returns to
@@ -835,10 +852,10 @@ cross-validation is required for autocorrelated data.</dd>
 SECTIONS: List[Dict[str, str]] = [
     {"id": "start", "group": "How to", "title": "Getting started",
      "body": _GETTING_STARTED,
-     "keywords": "begin first steps overview workflow axes neutron xray"},
+     "keywords": "begin first steps overview workflow axes neutron xray screen layout compact window size laptop"},
     {"id": "define", "group": "How to", "title": "Defining materials",
      "body": _DEFINING,
-     "keywords": "roi region polygon rectangle draw class kmeans cluster edit"},
+     "keywords": "roi region polygon rectangle draw class kmeans cluster edit colour color"},
     {"id": "controls", "group": "How to", "title": "Control materials",
      "body": _CONTROLS,
      "keywords": "inert unchanged null check casing support steel"},

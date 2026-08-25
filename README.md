@@ -35,6 +35,11 @@ back to voxels.
   readout are all on the same panel.
 - **Built-in manual** — *Help → Manual* (F1): how to do each operation, and
   the mathematics behind each one, searchable and exportable as text.
+- **Fits a laptop screen** — the window sizes itself from the screen it finds
+  and needs 1205 × 681 at minimum. *View* switches between a compact
+  arrangement for 14-inch screens and a wide one, folds the
+  current-timepoint histogram or the tool panel away, and re-fits the window
+  with Ctrl+0.
 - **Analysis and export** — per-selection statistics, morphological analysis,
   time-series tracking, histogram-evolution maps, and export to
   TIFF / CSV / Excel / PDF. Exports are named after your classes

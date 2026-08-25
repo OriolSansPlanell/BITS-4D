@@ -1,6 +1,62 @@
 # Bug-fix and cleanup notes
 
-## The classifier removed, a materials panel, and a built-in manual (latest)
+## One colour per material, and a window that fits a laptop (latest)
+
+**A material was three different colours.** It appears in three places — the
+histogram overlay, the selection panel and the slice-viewer highlight — and a
+user reads those as the same object. There were two causes:
+
+* **Two palettes.** `utils/roi_manager._CLASS_COLORS` and
+  `BiTS4DMainWindow._OVERLAY_COLORS` were separate lists whose second entries
+  differ (green versus blue), so a class drawn red on the histogram could be
+  highlighted blue in the viewer. They are now one list: `CLASS_COLORS`, with
+  the overlay palette derived from it by adding transparency.
+* **The colour was resolved from a list position.** Several call sites indexed
+  a palette by where the layer sat among the others. Positions drift —
+  reloading regions from a file, hiding a class, or re-running a segmentation
+  all reorder the layers relative to the saved classes — so the colour drifted
+  with them. `ROIManager.color_for(name)` now resolves it from the class
+  itself, and every layer-creating path goes through
+  `BiTS4DMainWindow._colour_for_layer`. Layers with no class of their own
+  (Otsu, K-means) get a colour derived from their *name*, which is likewise
+  stable.
+
+The panel showed the right hue at alpha 60 as a row background, which is
+washed out enough to read as a different colour — red looked pink. It now
+shows a **solid swatch**, and marks a hidden class by its tick and by greying
+the text rather than by fading its colour: a class has to stay recognisable
+while it is switched off.
+
+**The window demanded a 3839-pixel-wide screen.** Not because anything was
+large: several control rows were long, and a Qt box layout cannot wrap, so
+each row's total width became a hard minimum the whole window inherited. Two
+rows in the slice viewer and one in the histogram widget accounted for most
+of it.
+
+`gui/flow_layout.py` adds a wrapping layout that reports the width of its
+*widest single item* and spends height instead. Applied to those rows, and
+with the two histograms moved into a collapsible splitter and the tool tabs
+made scrollable, the minimum went from **3839 × 1038 to 1205 × 681** — it now
+fits a 1280 × 720 screen with room to spare.
+
+Alongside that:
+
+* **Time navigation moved to a full-width strip** along the bottom and became
+  one flowing row instead of four stacked ones. Stacked in a narrow column it
+  cost 150 px of the height the slice viewer needed, and gave the slider no
+  room to be precise with.
+* **The window sizes itself from the real screen** rather than opening at a
+  fixed 1800 × 960, and picks between two arrangements: compact folds the
+  current-timepoint histogram away and narrows the tool column.
+* **A View menu** switches arrangements, shows or folds the second histogram,
+  the tool panel and the time strip, and re-fits the window (Ctrl+0). Nothing
+  is removed by folding — the splitter handle brings it back.
+
+`tests/test_layout_fits_a_laptop.py` pins the sizes, because one new
+non-wrapping row of buttons is enough to bring the problem back and nothing
+else would notice.
+
+## The classifier removed, a materials panel, and a built-in manual
 
 **The classifier is gone from the application.** Its tab, menu entries,
 handlers and state are removed; `segmentation.legacy` keeps the module

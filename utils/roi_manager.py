@@ -12,14 +12,39 @@ from typing import Optional, Tuple, List
 import json
 
 
-# Tab-10 colours for the first 10 classes, then cycle
-_CLASS_COLORS = [
+#: The one palette. A class appears in three places — the histogram overlay,
+#: the selection panel and the slice-viewer highlight — and a user reads
+#: those as the same object, so they must not be drawn from different
+#: palettes or indexed by different things. Anything that needs a class
+#: colour resolves it through :func:`class_color` or, better, reads the
+#: colour stored on the class itself.
+CLASS_COLORS = [
     '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
     '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990',
 ]
 
+# Retained private alias; new code should use CLASS_COLORS.
+_CLASS_COLORS = CLASS_COLORS
+
+
+def class_color(class_id: int) -> str:
+    """Colour for a class id. Stable: the same id always gives the same hue."""
+    return CLASS_COLORS[int(class_id) % len(CLASS_COLORS)]
+
+
 def _class_color(class_id: int) -> str:
-    return _CLASS_COLORS[class_id % len(_CLASS_COLORS)]
+    return class_color(class_id)
+
+
+def color_for_name(name: str) -> str:
+    """A stable colour for something with no saved class of its own.
+
+    Derived from the name rather than from a position, so an Otsu or K-means
+    layer keeps its colour when the list around it changes.
+    """
+    import zlib
+
+    return CLASS_COLORS[zlib.crc32(str(name).encode()) % len(CLASS_COLORS)]
 
 
 def _segments_cross(p1, p2, p3, p4) -> bool:
@@ -278,6 +303,19 @@ class ROIManager:
     def get_named_rois(self) -> List[dict]:
         """Return a copy of the named ROI list (including hidden ones)."""
         return list(self.named_rois)
+
+    def color_for(self, name: str) -> str:
+        """The colour of the class called *name*.
+
+        Falls back to a colour derived from the name when no class by that
+        name exists — an Otsu, K-means or tracking layer, say. Never depends
+        on where anything sits in a list, because those positions shift when
+        a class is hidden, removed or reloaded from a file.
+        """
+        for roi in self.named_rois:
+            if roi.get('name') == name:
+                return roi.get('color') or class_color(roi.get('class_id', 1) - 1)
+        return color_for_name(name)
 
     def get_visible_named_rois(self) -> List[dict]:
         """Named ROIs that are currently shown and segmented."""

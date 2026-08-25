@@ -12,6 +12,7 @@ main.py
     ├── runtime_fixes.py          Behavioural overrides applied at import time
     ├── dual_histogram_widget.py  Global/local histogram canvases + ROI tools
     ├── material_panel.py         Materials, their behaviour, and the run
+    ├── flow_layout.py            Wrapping layout for long control rows
     ├── manual.py                 The manual window
     ├── manual_content.py         Its text: how-to and mathematics
     ├── selection_manager.py      Saved selections (mask + histogram ROI)
@@ -296,6 +297,38 @@ Two invariants the guards depend on:
 result at the same timepoint**, never against the first timepoint — otherwise
 a genuine change in the sample would read as smoothing damage, and the guard
 would abort on exactly what the software exists to measure.
+
+### Layout, and why it is the way it is
+
+Two rules keep the window usable on a laptop, and both are easy to undo by
+accident:
+
+- **Long control rows use `FlowLayout`, never `QHBoxLayout`.** A box layout
+  cannot wrap, so a row of fifteen controls makes the sum of their widths the
+  window's hard minimum. One new non-wrapping row is enough to push the
+  minimum width back over 2000 px.
+- **Every canvas has an explicit, modest minimum size.** Those minimums add
+  up across the columns to become the window's own, so a generous value in
+  one widget is what makes the application unusable everywhere.
+
+`tests/test_layout_fits_a_laptop.py` asserts the resulting minimum fits a
+14-inch screen. The time strip spans the window rather than sitting in a
+column, and the tool tabs are wrapped in scroll areas so one tall panel
+cannot set the window's minimum height.
+
+### Class colours
+
+A class appears in the histogram overlay, the selection panel and the
+slice-viewer highlight, and a user reads those as one object. There is
+therefore exactly one palette — `utils.roi_manager.CLASS_COLORS`, with
+`BiTS4DMainWindow._OVERLAY_COLORS` derived from it — and the colour is always
+resolved **from the class**, through `ROIManager.color_for(name)` or
+`BiTS4DMainWindow._colour_for_layer`.
+
+Never index a palette by a layer's position in a list. Positions drift:
+reloading regions from a file, hiding a class, or re-running a segmentation
+all reorder the layers relative to the saved classes, and a colour that
+drifts with them stops identifying anything. That was the bug.
 
 ### The materials panel
 

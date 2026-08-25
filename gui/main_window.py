@@ -29,7 +29,21 @@ from utils import (
 )
 from gui.time_navigation_widget import TimeNavigationWidget
 from gui.dual_histogram_widget import DualHistogramWidget
+from gui.flow_layout import FlowLayout
 from gui.material_panel import MaterialPanel, describe_strength
+import matplotlib.colors as _mcolors
+from utils.roi_manager import CLASS_COLORS
+
+#: Slice-viewer highlights are the class palette at a fixed transparency.
+#: Derived, not a second list — see BiTS4DMainWindow._colour_for_layer.
+#: How small the slice canvas may get. See gui/dual_histogram_widget.py —
+#: these minimums add up to the window's own minimum width.
+SLICE_CANVAS_MINIMUM = (240, 200)
+
+OVERLAY_ALPHA = 0.50
+OVERLAY_COLORS = [
+    _mcolors.to_rgba(hex_colour, OVERLAY_ALPHA) for hex_colour in CLASS_COLORS
+]
 
 
 class SliceViewerWidget(QWidget):
@@ -71,9 +85,11 @@ class SliceViewerWidget(QWidget):
     def init_ui(self):
         layout = QVBoxLayout()
         
-        # Controls for axis selection
-        controls_layout = QHBoxLayout()
-        
+        # Controls for axis selection. Flow layouts throughout: these rows
+        # are long, and a non-wrapping row makes its width the window's
+        # minimum width.
+        controls_layout = FlowLayout()
+
         controls_layout.addWidget(QLabel("View Axis:"))
         
         from PyQt5.QtWidgets import QRadioButton, QButtonGroup, QSlider
@@ -155,10 +171,10 @@ class SliceViewerWidget(QWidget):
         controls_layout.addWidget(slice_auto_btn)
         
         layout.addLayout(controls_layout)
-        
+
         # Spatial ROI tools
-        spatial_roi_layout = QHBoxLayout()
-        
+        spatial_roi_layout = FlowLayout()
+
         spatial_roi_layout.addWidget(QLabel("Spatial Selection:"))
         
         self.rect_tool_btn = QPushButton("□ Rectangle")
@@ -259,7 +275,8 @@ class SliceViewerWidget(QWidget):
         self.fig = Figure(figsize=(8, 6))
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
-        layout.addWidget(self.canvas)
+        self.canvas.setMinimumSize(*SLICE_CANVAS_MINIMUM)
+        layout.addWidget(self.canvas, stretch=1)
         
         # Initialize spatial ROI state
         self.spatial_roi_selector = None
@@ -1842,6 +1859,23 @@ class SliceViewerWidget(QWidget):
         self.canvas.draw_idle()
 
 
+def _scrollable(widget):
+    """Wrap a tool panel so a short screen scrolls it instead of growing.
+
+    Without this, a tab's tallest content becomes the window's minimum
+    height, and one long panel makes the whole application unusable on a
+    laptop.
+    """
+    from PyQt5.QtWidgets import QScrollArea
+
+    area = QScrollArea()
+    area.setWidget(widget)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    return area
+
+
 def _plain_validation_summary(validation) -> str:
     """Held-out scores, said without the vocabulary of the method."""
     return (
@@ -2167,7 +2201,8 @@ class BiTS4DMainWindow(QMainWindow):
     def init_ui(self):
         """Initialize the user interface - 3-panel splitter layout."""
         self.setWindowTitle(f"BiTS 3D/4D v{config.APP_VERSION}")
-        self.setGeometry(100, 100, 1800, 960)
+        # Geometry is set once the layout exists — see
+        # _apply_layout_for_screen, which fits the real screen.
 
         # Import extra widgets needed here
         from PyQt5.QtWidgets import (
@@ -2191,8 +2226,10 @@ class BiTS4DMainWindow(QMainWindow):
         left_vbox.setSpacing(4)
 
         # --- Histograms ---
-        hist_group = QGroupBox("2D Histograms")
+        hist_group = QGroupBox("Bivariate histogram")
         hist_layout = QVBoxLayout()
+        hist_layout.setContentsMargins(4, 4, 4, 4)
+        hist_layout.setSpacing(3)
         self.dual_histogram = DualHistogramWidget()
         self.dual_histogram.roi_updated.connect(self._on_roi_updated)
         # The panel owns the ROIs, this window owns the segmentation layers,
@@ -2217,15 +2254,13 @@ class BiTS4DMainWindow(QMainWindow):
         hist_group.setLayout(hist_layout)
         left_vbox.addWidget(hist_group, stretch=4)
 
-        # --- Time navigation ---
-        time_group = QGroupBox("Time Navigation")
-        time_layout = QVBoxLayout()
+        # Time navigation is built here but lives in a full-width strip along
+        # the bottom (see the final assembly). A slider stacked inside a
+        # narrow column wastes the column's height and gives the slider no
+        # room to be precise with.
         self.time_navigation = TimeNavigationWidget(num_timepoints=1)
         self.time_navigation.setEnabled(False)
         self.time_navigation.timepoint_changed.connect(self._on_timepoint_changed)
-        time_layout.addWidget(self.time_navigation)
-        time_group.setLayout(time_layout)
-        left_vbox.addWidget(time_group, stretch=1)
 
         left_widget.setLayout(left_vbox)
         splitter.addWidget(left_widget)
@@ -2238,8 +2273,10 @@ class BiTS4DMainWindow(QMainWindow):
         centre_vbox.setContentsMargins(2, 2, 2, 2)
         centre_vbox.setSpacing(2)
 
-        viewer_group = QGroupBox("Volume Viewer")
+        viewer_group = QGroupBox("Volume viewer")
         viewer_layout = QVBoxLayout()
+        viewer_layout.setContentsMargins(4, 4, 4, 4)
+        viewer_layout.setSpacing(3)
         self.slice_viewer = SliceViewerWidget()
         self.slice_viewer.spatial_roi_to_histogram.connect(
             self._on_create_histogram_roi_from_spatial)
@@ -2256,8 +2293,8 @@ class BiTS4DMainWindow(QMainWindow):
         right_tabs = QTabWidget()
         self.right_tabs = right_tabs
         right_tabs.setTabPosition(QTabWidget.North)
-        right_tabs.setMinimumWidth(320)
-        right_tabs.setMaximumWidth(420)
+        right_tabs.setMinimumWidth(250)
+        right_tabs.setMaximumWidth(460)
 
         # ── Tab 1 : Manual / ROI segmentation ─────────────────────────────────
         tab_manual = QWidget()
@@ -2294,7 +2331,7 @@ class BiTS4DMainWindow(QMainWindow):
         tm_layout.addWidget(stat_group)
 
         tab_manual.setLayout(tm_layout)
-        right_tabs.addTab(tab_manual, "🖊 Manual ROI")
+        right_tabs.addTab(_scrollable(tab_manual), "🖊 Manual ROI")
 
         # ── Tab 2 : Automated segmentation (Otsu / K-means) ───────────────────
         tab_auto = QWidget()
@@ -2391,7 +2428,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         ta_layout.addStretch()
         tab_auto.setLayout(ta_layout)
-        right_tabs.addTab(tab_auto, "⚙ Auto Seg")
+        right_tabs.addTab(_scrollable(tab_auto), "⚙ Auto Seg")
 
         # ── Tab 3 : Materials ─────────────────────────────────────────────
         self.material_panel = MaterialPanel()
@@ -2412,7 +2449,9 @@ class BiTS4DMainWindow(QMainWindow):
         tr_layout.setContentsMargins(0, 0, 0, 0)
         tr_layout.addWidget(self.material_panel)
         tab_materials.setLayout(tr_layout)
-        right_tabs.addTab(tab_materials, "🧱 Materials")
+        self._materials_tab_index = right_tabs.addTab(
+            _scrollable(tab_materials), "🧱 Materials"
+        )
 
         # ── Tab 4 : Export ────────────────────────────────────────────────────
         tab_export = QWidget()
@@ -2455,12 +2494,11 @@ class BiTS4DMainWindow(QMainWindow):
 
         te_layout.addStretch()
         tab_export.setLayout(te_layout)
-        right_tabs.addTab(tab_export, "💾 Export")
+        right_tabs.addTab(_scrollable(tab_export), "💾 Export")
 
         splitter.addWidget(right_tabs)
 
-        # Splitter proportions: left=30%, centre=50%, right=20%
-        splitter.setSizes([540, 900, 360])
+        self.main_splitter = splitter
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 5)
         splitter.setStretchFactor(2, 2)
@@ -2468,10 +2506,19 @@ class BiTS4DMainWindow(QMainWindow):
         # ── Final assembly ─────────────────────────────────────────────────────
         container = QWidget()
         container_layout = QVBoxLayout()
-        container_layout.setContentsMargins(4, 4, 4, 4)
-        container_layout.addWidget(splitter)
+        container_layout.setContentsMargins(4, 4, 4, 2)
+        container_layout.setSpacing(3)
+        container_layout.addWidget(splitter, stretch=1)
+
+        self.time_group = QGroupBox("Time")
+        time_strip = QHBoxLayout(self.time_group)
+        time_strip.setContentsMargins(6, 2, 6, 4)
+        time_strip.addWidget(self.time_navigation)
+        container_layout.addWidget(self.time_group)
+
         container.setLayout(container_layout)
         self.setCentralWidget(container)
+        self._apply_layout_for_screen()
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -2797,6 +2844,54 @@ class BiTS4DMainWindow(QMainWindow):
         settings_menu.addAction(gpu_status_action)
 
         # Help menu
+        # ── View ────────────────────────────────────────────────────────
+        view_menu = menubar.addMenu("View")
+
+        self.compact_action = QAction("Compact layout (laptop screens)", self)
+        self.compact_action.setCheckable(True)
+        self.compact_action.setToolTip(
+            "Folds the current-timepoint histogram away and narrows the tool\n"
+            "column, so the whole window fits a 14-inch screen.\n"
+            "Chosen automatically from your screen size at start-up."
+        )
+        self.compact_action.toggled.connect(self.set_compact_layout)
+        view_menu.addAction(self.compact_action)
+
+        view_menu.addSeparator()
+
+        self.local_hist_action = QAction("Current-timepoint histogram", self)
+        self.local_hist_action.setCheckable(True)
+        self.local_hist_action.setChecked(True)
+        self.local_hist_action.setToolTip(
+            "The second histogram, showing only the timepoint on screen.\n"
+            "Folding it away leaves more room for the one you draw on; the\n"
+            "splitter handle brings it back."
+        )
+        self.local_hist_action.toggled.connect(self.show_local_histogram)
+        view_menu.addAction(self.local_hist_action)
+
+        tool_panel_action = QAction("Tool panel", self)
+        tool_panel_action.setCheckable(True)
+        tool_panel_action.setChecked(True)
+        tool_panel_action.toggled.connect(self.show_tool_panel)
+        view_menu.addAction(tool_panel_action)
+
+        time_strip_action = QAction("Time strip", self)
+        time_strip_action.setCheckable(True)
+        time_strip_action.setChecked(True)
+        time_strip_action.toggled.connect(self.show_time_strip)
+        view_menu.addAction(time_strip_action)
+
+        view_menu.addSeparator()
+
+        fit_action = QAction("Fit window to screen", self)
+        fit_action.setShortcut("Ctrl+0")
+        fit_action.setToolTip(
+            "Resize and re-balance the panels for the screen you are on."
+        )
+        fit_action.triggered.connect(self._apply_layout_for_screen)
+        view_menu.addAction(fit_action)
+
         help_menu = menubar.addMenu("Help")
 
         manual_action = QAction("Manual...", self)
@@ -3883,33 +3978,28 @@ class BiTS4DMainWindow(QMainWindow):
 
     # ── Segmentation colour helpers ───────────────────────────────────────────
 
-    _OVERLAY_COLORS = [
-        (0.93, 0.11, 0.14, 0.50),   # red
-        (0.13, 0.47, 0.71, 0.50),   # blue
-        (0.17, 0.63, 0.17, 0.50),   # green
-        (1.00, 0.50, 0.05, 0.50),   # orange
-        (0.58, 0.40, 0.74, 0.50),   # purple
-        (0.09, 0.75, 0.81, 0.50),   # cyan
-        (0.89, 0.47, 0.76, 0.50),   # pink
-        (0.74, 0.74, 0.13, 0.50),   # yellow-green
-    ]
+    #: The overlay palette is the class palette with an alpha for the slice
+    #: viewer. It must stay derived from it: two palettes is exactly how one
+    #: class ends up two colours.
+    _OVERLAY_ALPHA = OVERLAY_ALPHA
+    _OVERLAY_COLORS = OVERLAY_COLORS
+
+    @staticmethod
+    def _colour_for_layer(roi_manager, name, alpha=OVERLAY_ALPHA):
+        """The RGBA a layer called *name* is drawn with, everywhere.
+
+        Resolved from the class itself, never from where it sits in a list.
+        Positions drift — hiding a class, removing one, or reloading regions
+        from a file all reorder the layers relative to the saved classes —
+        and a colour that drifts with them stops identifying anything.
+        """
+        return _mcolors.to_rgba(roi_manager.color_for(name), alpha)
 
     def _next_roi_color(self, roi_manager, layer_index: int):
-        """Return an RGBA colour for the next segmentation layer.
-
-        Priority:
-          1. The last visible named ROI's colour (if any exist).
-          2. Cycle through the default palette.
-        """
+        """Colour for a layer made from the unsaved active selection."""
         named = roi_manager.get_visible_named_rois()
         if named:
-            hex_color = named[-1].get('color', '#e6194b')
-            try:
-                import matplotlib.colors as mcolors
-                r, g, b, _ = mcolors.to_rgba(hex_color)
-                return (r, g, b, 0.50)
-            except Exception:
-                pass
+            return self._colour_for_layer(roi_manager, named[-1].get('name'))
         return self._OVERLAY_COLORS[layer_index % len(self._OVERLAY_COLORS)]
 
     def _current_roi_name(self, roi_manager) -> str:
@@ -4269,13 +4359,8 @@ class BiTS4DMainWindow(QMainWindow):
             ]
 
             total_voxels = 0
-            for mask, color, name in layers:
-                try:
-                    r, g, b, _ = mcolors.to_rgba(color)
-                    color_rgba = (r, g, b, 0.50)
-                except Exception:
-                    idx = len(kept)
-                    color_rgba = self._OVERLAY_COLORS[idx % len(self._OVERLAY_COLORS)]
+            for mask, _color, name in layers:
+                color_rgba = self._colour_for_layer(roi_manager, name)
                 kept.append((mask, color_rgba, name))
                 total_voxels += int(np.sum(mask))
             self.segmentation_masks[current_t] = kept
@@ -4422,11 +4507,13 @@ class BiTS4DMainWindow(QMainWindow):
             if layer[2] not in otsu_names
         ]
 
-        n_existing = len(kept_layers)
+        roi_manager = self.dual_histogram.get_roi_manager()
         for cls_id in classes:
             mask_3d = (labels == cls_id)
-            color   = self._OVERLAY_COLORS[(n_existing + cls_id - 1) % len(self._OVERLAY_COLORS)]
-            kept_layers.append((mask_3d, color, f"Otsu class {cls_id}"))
+            name = f"Otsu class {cls_id}"
+            kept_layers.append(
+                (mask_3d, self._colour_for_layer(roi_manager, name), name)
+            )
         self.segmentation_masks[current_t] = kept_layers
 
         # Display in viewer and histogram
@@ -4696,6 +4783,76 @@ class BiTS4DMainWindow(QMainWindow):
                 except ImportError:
                     self.histogram_engine.use_gpu = False
     
+    # ── layout ───────────────────────────────────────────────────────────
+    #: Below this width the three-column layout stops being comfortable and
+    #: the second histogram is folded away by default. A 14" laptop is
+    #: typically 1366 or 1440 wide, which lands under it.
+    COMPACT_WIDTH = 1500
+
+    def _screen_size(self):
+        """Usable screen area, or a conservative guess when there is none."""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return 1366, 768
+        available = screen.availableGeometry()
+        return available.width(), available.height()
+
+    def _apply_layout_for_screen(self):
+        """Size the window and the panels to the screen actually present.
+
+        The application used to open at a fixed 1800×960 with a minimum width
+        of nearly 3900, which simply cannot be used on a laptop. Everything
+        here is chosen from the real screen instead, and every choice remains
+        adjustable afterwards — the splitters stay draggable and the View
+        menu switches between the two arrangements.
+        """
+        width, height = self._screen_size()
+        window_width = min(1780, max(1000, int(width * 0.94)))
+        window_height = min(1000, max(620, int(height * 0.92)))
+        self.resize(window_width, window_height)
+        self.move(
+            max(0, (width - window_width) // 2),
+            max(0, (height - window_height) // 2),
+        )
+        self.set_compact_layout(width < self.COMPACT_WIDTH)
+
+    def set_compact_layout(self, compact: bool):
+        """Switch between the laptop and wide-monitor arrangements.
+
+        Compact folds the local histogram away and gives the tool column the
+        narrower of its two widths. Nothing is removed — the local histogram
+        is a splitter handle away, and the View menu toggles it back.
+        """
+        self._compact_layout = bool(compact)
+        self.show_local_histogram(not compact)
+        total = max(self.width(), 1000)
+        if compact:
+            tools = 260
+            histogram = int((total - tools) * 0.46)
+        else:
+            tools = 360
+            histogram = int((total - tools) * 0.44)
+        viewer = max(total - tools - histogram, 260)
+        self.main_splitter.setSizes([histogram, viewer, tools])
+        if hasattr(self, "compact_action"):
+            self.compact_action.blockSignals(True)
+            self.compact_action.setChecked(self._compact_layout)
+            self.compact_action.blockSignals(False)
+
+    def show_local_histogram(self, visible: bool):
+        """Show or fold away the current-timepoint histogram."""
+        self.dual_histogram.set_local_visible(visible)
+        if hasattr(self, "local_hist_action"):
+            self.local_hist_action.blockSignals(True)
+            self.local_hist_action.setChecked(bool(visible))
+            self.local_hist_action.blockSignals(False)
+
+    def show_tool_panel(self, visible: bool):
+        self.right_tabs.setVisible(bool(visible))
+
+    def show_time_strip(self, visible: bool):
+        self.time_group.setVisible(bool(visible))
+
     def _show_manual(self, section=None):
         """Open the manual, optionally at a particular section.
 
@@ -5689,8 +5846,8 @@ class BiTS4DMainWindow(QMainWindow):
     def _on_model_segmentation(self):
         """Menu route: show the materials, then run the series."""
         if hasattr(self, "right_tabs") and hasattr(self, "material_panel"):
-            index = self.right_tabs.indexOf(self.material_panel.parentWidget())
-            if index >= 0:
+            index = self._materials_tab_index
+            if index is not None and index >= 0:
                 self.right_tabs.setCurrentIndex(index)
         self._refresh_material_panel()
         self._run_material_tracking(preview=False)
@@ -5827,12 +5984,14 @@ class BiTS4DMainWindow(QMainWindow):
             timepoint = entry.timepoint
             self.segmentation_masks[timepoint] = []
             self._clear_layer_shapes(timepoint)
-            for index, name in enumerate(entry.class_names):
+            roi_manager = self.dual_histogram.get_roi_manager()
+            for name in entry.class_names:
                 mask = entry.mask_for(name)
                 if not mask.any():
                     continue
-                color = self._OVERLAY_COLORS[index % len(self._OVERLAY_COLORS)]
-                self.segmentation_masks[timepoint].append((mask, color, name))
+                self.segmentation_masks[timepoint].append(
+                    (mask, self._colour_for_layer(roi_manager, name), name)
+                )
 
         current = self.dataset.current_timepoint
         neutron, xray = self.dataset.get_volume_at_time(current)
