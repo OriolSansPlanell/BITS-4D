@@ -157,24 +157,3 @@ def test_named_classes_appear_in_file_names(tmp_path, name):
     stem = sanitize_name(name)
     assert all(stem in filename for filename in written)
     assert "Class" not in " ".join(written)
-
-
-# ── RF predictions inherit the trained class names ───────────────────────────
-
-def test_rf_class_labels_use_the_training_layer_names():
-    pytest.importorskip("PyQt5")
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt5.QtWidgets import QApplication
-    from gui import BiTS4DMainWindow
-
-    app = QApplication.instance() or QApplication([])
-    window = BiTS4DMainWindow()
-
-    # Before training, nothing is known and the fallback is used
-    assert window._rf_class_label(1) == "RF class 1"
-
-    window.rf_class_names = {1: "Lithium", 2: "Electrolyte"}
-    assert window._rf_class_label(1) == "RF: Lithium"
-    assert window._rf_class_label(2) == "RF: Electrolyte"
-    assert window._rf_class_label(3) == "RF class 3"
-    assert sanitize_name(window._rf_class_label(1)) == "RF_Lithium"

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from segmentation.kmeans_class_conversion import (
-    build_rf_layers_from_cluster_selections,
+    build_material_layers_from_cluster_selections,
 )
 
 
@@ -23,7 +23,7 @@ def test_kmeans_clusters_become_sorted_rf_layers():
     cluster_0[:, :, :1] = True
     cluster_1 = ~cluster_0
 
-    layers, summary = build_rf_layers_from_cluster_selections(
+    layers, summary = build_material_layers_from_cluster_selections(
         [_payload(1, cluster_1), _payload(0, cluster_0)],
         shape,
     )
@@ -45,7 +45,7 @@ def test_conversion_reports_overlap_and_uncovered_voxels():
     first = np.array([[[True, True, False], [False, False, False]]])
     second = np.array([[[False, True, False], [False, True, False]]])
 
-    _, summary = build_rf_layers_from_cluster_selections(
+    _, summary = build_material_layers_from_cluster_selections(
         [_payload(0, first), _payload(1, second)],
         shape,
     )
@@ -65,7 +65,7 @@ def test_conversion_requires_3d_payloads():
     )
 
     with pytest.raises(ValueError, match="No 3-D K-means"):
-        build_rf_layers_from_cluster_selections(
+        build_material_layers_from_cluster_selections(
             [five_field_payload],
             (2, 2, 2),
         )
@@ -73,7 +73,7 @@ def test_conversion_requires_3d_payloads():
 
 def test_conversion_rejects_wrong_mask_shape():
     with pytest.raises(ValueError, match="does not match"):
-        build_rf_layers_from_cluster_selections(
+        build_material_layers_from_cluster_selections(
             [_payload(0, np.ones((2, 2, 2), dtype=bool))],
             (3, 2, 2),
         )

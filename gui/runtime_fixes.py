@@ -39,7 +39,7 @@ def _apply_correctness_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> N
         # instead of waiting for the next timepoint change.
         if self.dataset is not None:
             self._refresh_slice_overlays()
-            self._update_rf_histogram_overlays(self.dataset.current_timepoint)
+            self._update_class_histogram_overlays(self.dataset.current_timepoint)
 
         self.segment_current_btn.setEnabled(has_roi)
         self.segment_all_btn.setEnabled(has_roi and self.mode == "4D")
@@ -371,9 +371,7 @@ def apply_runtime_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> None:
         "_segment_current_volume",
         "_segment_all_volumes",
         "_run_otsu_segment",
-        "_rf_train",
-        "_rf_predict_current",
-        "_rf_predict_all",
+        "_run_material_tracking",
     ):
         method = getattr(main_window_cls, name, None)
         if method is not None:

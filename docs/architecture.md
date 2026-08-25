@@ -11,6 +11,9 @@ main.py
     ├── main_window.py            BiTS4DMainWindow + SliceViewerWidget
     ├── runtime_fixes.py          Behavioural overrides applied at import time
     ├── dual_histogram_widget.py  Global/local histogram canvases + ROI tools
+    ├── material_panel.py         Materials, their behaviour, and the run
+    ├── manual.py                 The manual window
+    ├── manual_content.py         Its text: how-to and mathematics
     ├── selection_manager.py      Saved selections (mask + histogram ROI)
     ├── statistics_panel.py       Live per-selection statistics
     └── time_navigation_widget.py Timepoint slider / playback
@@ -22,10 +25,10 @@ Computation layer (GUI-independent, scriptable):
                                   Chunked CPU/GPU 2-D histogram accumulation
     segmentation/segmentation_engine_4d.py
                                   ROI → voxel mask application + statistics
-    segmentation/random_forest_4d.py
-                                  Memory-bounded RF training / prediction
     segmentation/kmeans_class_conversion.py
-                                  K-means clusters → RF training layers
+                                  K-means clusters → material layers
+    segmentation/legacy/          Superseded methods, kept for reproducing
+                                  earlier work; not on any live path
     segmentation/features.py      Composable FeatureSpec (texture ⟂ geometry)
     model/validity.py             Which voxels are measurements at all
     model/likelihood.py           Fixed material classes + the per-bin match table
@@ -293,6 +296,19 @@ Two invariants the guards depend on:
 result at the same timepoint**, never against the first timepoint — otherwise
 a genuine change in the sample would read as smoothing damage, and the guard
 would abort on exactly what the software exists to measure.
+
+### The materials panel
+
+`gui/material_panel.py` is a plain widget: it emits `refresh_requested`,
+`copy_clusters_requested`, `preview_requested` and `run_requested`, and knows
+nothing about datasets. The window connects those to
+`_refresh_material_panel` and `_run_material_tracking`, which is why the panel
+can be tested without a dataset at all.
+
+One invariant worth preserving: `set_materials()` carries a name's existing
+behaviour across a refresh. Re-reading the segmentation must never silently
+discard the control-material choice, because that is the only decision in the
+whole flow the software cannot make for the user.
 
 `segmentation/features.py` decouples texture from frozen geometry. The legacy
 level names produce exactly the columns they always did, in the same order —

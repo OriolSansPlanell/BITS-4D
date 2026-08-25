@@ -30,6 +30,7 @@ FORBIDDEN_TERMS = [
 #: Files whose string literals reach the user.
 USER_FACING = [
     "gui/main_window.py",
+    "gui/material_panel.py",
     "gui/dual_histogram_widget.py",
     "gui/statistics_panel.py",
     "gui/selection_manager.py",
@@ -37,6 +38,11 @@ USER_FACING = [
     "model/health_check.py",
     "model/locked.py",
 ]
+
+#: The manual is the one place the vocabulary belongs: it exists to explain
+#: the method to someone who has chosen to read about it. It is checked for
+#: the opposite property instead — see test_the_manual_explains_the_terms.
+MANUAL = "gui/manual_content.py"
 
 _PATTERN = re.compile(
     r"(?<![A-Za-z])(" + "|".join(re.escape(t) for t in FORBIDDEN_TERMS) + r")(?![A-Za-z])",
@@ -128,9 +134,7 @@ def test_smoothing_strength_is_described_in_words_not_numbers():
     import os
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from gui.main_window import MaterialTrackingDialog
-
-    describe = MaterialTrackingDialog.describe_strength
+    from gui.material_panel import describe_strength as describe
     assert describe(None) == "Off"
     assert describe(0.0) == "Off"
     assert describe(0.25) == "Low"
@@ -139,3 +143,39 @@ def test_smoothing_strength_is_described_in_words_not_numbers():
     # The user-facing value is never the raw number
     for value in (0.0, 0.5, 1.0, 4.0):
         assert not any(char.isdigit() for char in describe(value))
+
+
+# ── the manual is the exception, and has to earn it ──────────────────────────
+
+def test_the_manual_explains_the_terms_the_interface_hides():
+    """The vocabulary has to live somewhere, and this is where.
+
+    A user who wants to know what "smoothing" actually does should be able to
+    find the answer without leaving the application.
+    """
+    from gui import manual_content
+
+    text = manual_content.as_plain_text().lower()
+    for term in ("mahalanobis", "winding rule", "covariance", "eigenvector",
+                 "marginal", "bayes error", "davies", "kappa"):
+        assert term in text, f"the manual never explains {term!r}"
+
+
+def test_the_manual_covers_every_operation_the_menus_offer():
+    from gui import manual_content
+
+    text = manual_content.as_plain_text().lower()
+    for topic in ("check data", "control material", "smoothing",
+                  "instrument stability", "mixed boundaries", "health check",
+                  "export", "spatial metrics"):
+        assert topic in text, f"the manual never mentions {topic!r}"
+
+
+def test_the_manual_says_why_the_classifier_was_removed():
+    from gui import manual_content
+
+    section = manual_content.get_section("m_why")
+    body = section["body"].lower()
+    assert "random forest" in body
+    assert "constants" in body
+    assert "legacy" in body

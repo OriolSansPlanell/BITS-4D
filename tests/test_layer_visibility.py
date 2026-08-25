@@ -122,7 +122,7 @@ def test_second_roi_does_not_resurrect_the_hidden_one(window, monkeypatch):
     np.testing.assert_array_equal(combined, window._blob_b[2])
 
 
-def test_hidden_classes_are_excluded_from_rf_training(window, monkeypatch):
+def test_hidden_classes_are_excluded_from_tracking(window, monkeypatch):
     _save_class(window, monkeypatch, "A", RECT_A)
     _save_class(window, monkeypatch, "B", RECT_B)
     assert len(window._visible_layers(0)) == 2
@@ -137,14 +137,14 @@ def test_hidden_classes_are_excluded_from_rf_training(window, monkeypatch):
 def test_histogram_outlines_drop_hidden_classes(window, monkeypatch):
     _save_class(window, monkeypatch, "A", RECT_A)
     _save_class(window, monkeypatch, "B", RECT_B)
-    window._update_rf_histogram_overlays(0)
+    window._update_class_histogram_overlays(0)
     labels = " ".join(
         name for name, _v, _c in window.dual_histogram.global_canvas.roi_overlays
     )
     assert "A" in labels and "B" in labels
 
     window.dual_histogram.roi_manager.set_named_roi_visible(0, False)
-    window._update_rf_histogram_overlays(0)
+    window._update_class_histogram_overlays(0)
     labels = " ".join(
         name for name, _v, _c in window.dual_histogram.global_canvas.roi_overlays
     )
@@ -155,7 +155,7 @@ def test_histogram_outlines_drop_hidden_classes(window, monkeypatch):
 def test_class_outline_is_not_drawn_twice(window, monkeypatch):
     """A segmented class must not get both a class outline and a hull."""
     _save_class(window, monkeypatch, "A", RECT_A)
-    window._update_rf_histogram_overlays(0)
+    window._update_class_histogram_overlays(0)
     names = [n for n, _v, _c in window.dual_histogram.global_canvas.roi_overlays]
     matching = [n for n in names if "A" in n]
     assert len(matching) == 1, f"duplicate outlines for one class: {matching}"

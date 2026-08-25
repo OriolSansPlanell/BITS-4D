@@ -348,7 +348,7 @@ def test_bootstrap_bands_bracket_the_truth():
 @pytest.mark.parametrize("level", ["basic", "advanced", "expert"])
 def test_legacy_levels_reproduce_the_old_columns_exactly(level):
     """Existing models and notebooks must keep working bit-for-bit."""
-    from segmentation.random_forest_4d import _extract_features_at_indices
+    from segmentation.legacy.random_forest_4d import _extract_features_at_indices
 
     rng = np.random.default_rng(0)
     neutron = rng.normal(500, 80, (5, 9, 11)).astype(np.float32)

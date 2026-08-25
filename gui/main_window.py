@@ -22,13 +22,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data import Dataset4D, TIFF4DLoader
 from histograms import HistogramEngine4D
-from segmentation import SegmentationEngine4D, RandomForestSegmentation4D
+from segmentation import SegmentationEngine4D
 from utils import (
     run_with_progress, show_loading_message, ProgressCallback,
     config
 )
 from gui.time_navigation_widget import TimeNavigationWidget
 from gui.dual_histogram_widget import DualHistogramWidget
+from gui.material_panel import MaterialPanel, describe_strength
 
 
 class SliceViewerWidget(QWidget):
@@ -1917,164 +1918,6 @@ class AnchorSelectionDialog(QDialog):
         self.accept()
 
 
-class MaterialTrackingDialog(QDialog):
-    """Settings for following the drawn materials across the whole series.
-
-    Deliberately plain language throughout: the person using this knows
-    segmentation, and should never need to know how it is implemented to
-    make a good decision here.
-    """
-
-    def __init__(self, class_names, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Track Materials Across Time")
-        self.class_names = list(class_names)
-
-        self.control_materials = []
-        self.smoothing_mode = "auto"
-        self.smoothing_strength = None
-        self.linked_pairs = []
-        self.lock_definitions = True
-        self.find_mixed_boundaries = True
-
-        layout = QVBoxLayout(self)
-        header = QLabel(
-            "Each material you drew becomes a definition that the whole\n"
-            "series is measured against. Voxels move between materials from\n"
-            "one timepoint to the next; the definitions themselves stay put."
-        )
-        header.setWordWrap(True)
-        layout.addWidget(header)
-
-        # ── control materials ────────────────────────────────────────────
-        control_group = QGroupBox("Control materials")
-        control_layout = QVBoxLayout(control_group)
-        control_note = QLabel(
-            "Tick anything that should not change during the experiment — a "
-            "casing, a support, a structural metal. We use these as a check: "
-            "if their volume changes, something is wrong with the "
-            "segmentation rather than with the sample."
-        )
-        control_note.setWordWrap(True)
-        control_layout.addWidget(control_note)
-        self._control_boxes = []
-        for name in self.class_names:
-            box = QCheckBox(name)
-            control_layout.addWidget(box)
-            self._control_boxes.append((name, box))
-        layout.addWidget(control_group)
-
-        # ── smoothing ────────────────────────────────────────────────────
-        smoothing_group = QGroupBox("Spatial smoothing")
-        smoothing_layout = QVBoxLayout(smoothing_group)
-        smoothing_note = QLabel(
-            "Uses neighbouring voxels to clean up noisy assignments. "
-            "Auto is recommended: it picks the strongest setting that does "
-            "not shrink any of your materials."
-        )
-        smoothing_note.setWordWrap(True)
-        smoothing_layout.addWidget(smoothing_note)
-
-        self.smoothing_choice = QComboBox()
-        self.smoothing_choice.addItems(["Auto", "Off", "Low", "Medium", "High"])
-        self.smoothing_choice.setToolTip(
-            "Higher values give smoother regions. Auto is recommended.\n"
-            "Too much smoothing erases a small material entirely, which is\n"
-            "why Auto measures the effect instead of guessing."
-        )
-        smoothing_layout.addWidget(self.smoothing_choice)
-        layout.addWidget(smoothing_group)
-
-        # ── mixed boundaries ─────────────────────────────────────────────
-        boundary_group = QGroupBox("Mixed boundaries (optional)")
-        boundary_layout = QVBoxLayout(boundary_group)
-        boundary_note = QLabel(
-            "Where two materials touch, some voxels contain a bit of both. "
-            "Those voxels have no single correct label, so we can report how "
-            "much of each they contain instead."
-        )
-        boundary_note.setWordWrap(True)
-        boundary_layout.addWidget(boundary_note)
-
-        self.mixed_box = QCheckBox(
-            "Look for boundaries that behave like a mix of two materials"
-        )
-        self.mixed_box.setChecked(True)
-        self.mixed_box.setToolTip(
-            "Flags a material that is really the boundary between two\n"
-            "others. You will be told which, and can decide what to do."
-        )
-        boundary_layout.addWidget(self.mixed_box)
-        layout.addWidget(boundary_group)
-
-        # ── advanced ─────────────────────────────────────────────────────
-        advanced_group = QGroupBox("Advanced")
-        advanced_layout = QVBoxLayout(advanced_group)
-        self.lock_box = QCheckBox("Lock material definitions")
-        self.lock_box.setChecked(True)
-        self.lock_box.setToolTip(
-            "Material properties do not change during an experiment, so we\n"
-            "keep the definitions fixed and let voxels move between them.\n"
-            "Recommended.\n\n"
-            "Unticking this lets the definitions themselves drift, which is\n"
-            "only appropriate when the instrument is known to drift — and it\n"
-            "can turn a real change in the sample into an apparent one in\n"
-            "the definitions."
-        )
-        advanced_layout.addWidget(self.lock_box)
-        self.advanced_warning = QLabel("")
-        self.advanced_warning.setWordWrap(True)
-        self.advanced_warning.setStyleSheet("color: #b35c00;")
-        advanced_layout.addWidget(self.advanced_warning)
-        self.lock_box.toggled.connect(self._on_lock_toggled)
-        layout.addWidget(advanced_group)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self
-        )
-        buttons.button(QDialogButtonBox.Ok).setText("Run")
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _on_lock_toggled(self, checked):
-        self.advanced_warning.setText(
-            "" if checked else
-            "Material definitions will be allowed to move. Check the control "
-            "materials carefully in the results — this setting can absorb a "
-            "real change in the sample."
-        )
-
-    _STRENGTHS = {"Off": 0.0, "Low": 0.5, "Medium": 1.0, "High": 3.0}
-
-    def _accept(self):
-        self.control_materials = [
-            name for name, box in self._control_boxes if box.isChecked()
-        ]
-        choice = self.smoothing_choice.currentText()
-        if choice == "Auto":
-            self.smoothing_mode = "auto"
-            self.smoothing_strength = None
-        else:
-            self.smoothing_mode = "manual"
-            self.smoothing_strength = self._STRENGTHS[choice]
-        self.find_mixed_boundaries = self.mixed_box.isChecked()
-        self.lock_definitions = self.lock_box.isChecked()
-        self.accept()
-
-    @staticmethod
-    def describe_strength(value) -> str:
-        """A number the software chose, said in words."""
-        if value is None or value <= 0:
-            return "Off"
-        if value < 0.75:
-            return "Low"
-        if value < 2.0:
-            return "Medium"
-        return "High"
-
-
-
 class ExportOptionsDialog(QDialog):
     """
     Dialog that lets the user choose which segmentation layers and which
@@ -2282,21 +2125,15 @@ class BiTS4DMainWindow(QMainWindow):
         self.histogram_engine = None
         self.segmentation_engine = SegmentationEngine4D()
 
-        # Random Forest segmentation
-        self.rf_engine = RandomForestSegmentation4D(n_estimators=100)
-        self.rf_masks = {}           # {timepoint -> (Z,Y,X) int32 label array}
-        self.rf_confidence = {}      # {timepoint -> (Z,Y,X) float32}
-        # {class id -> the training layer's name}, so predictions inherit the
-        # names given in the selection panel instead of "RF class 1"
-        self.rf_class_names = {}
-        self._rf_cluster_map = None  # Last k-means cluster map (for RF training)
+        # Latest 3-D K-means result, available to copy in as materials
         self._last_kmeans_cluster_selections = []
-        self._rf_cluster_timepoint = None
+        self._cluster_timepoint = None
 
         # Current state
         self.global_histogram = None
         # Result of the last model-based run, kept for inspection/export
         self.model_result = None
+        self._manual_window = None
         # segmentation_masks: {timepoint -> [(mask_3d, color, name), ...]}
         # Each entry is one coloured segmentation layer for that timepoint.
         self.segmentation_masks = {}
@@ -2417,6 +2254,7 @@ class BiTS4DMainWindow(QMainWindow):
         # RIGHT PANEL — tabbed workflow tools
         # ══════════════════════════════════════════════════════════════════════
         right_tabs = QTabWidget()
+        self.right_tabs = right_tabs
         right_tabs.setTabPosition(QTabWidget.North)
         right_tabs.setMinimumWidth(320)
         right_tabs.setMaximumWidth(420)
@@ -2523,19 +2361,21 @@ class BiTS4DMainWindow(QMainWindow):
         km_info.setStyleSheet("color: #555; font-size: 9pt;")
         km_layout.addWidget(km_info)
 
-        self.kmeans_to_rf_btn = QPushButton(
-            "⚡ Convert K-means Clusters to RF Classes"
+        self.copy_clusters_btn = QPushButton(
+            "⚡ Copy K-means Clusters to Materials"
         )
-        self.kmeans_to_rf_btn.setEnabled(False)
-        self.kmeans_to_rf_btn.setToolTip(
-            "Create one RF training layer per 3-D K-means cluster.\n"
-            "Existing manual and Otsu layers are preserved.\n"
-            "Repeated conversion replaces earlier K-means-derived layers."
+        self.copy_clusters_btn.setEnabled(False)
+        self.copy_clusters_btn.setToolTip(
+            "Turn each 3-D K-means cluster into a material.\n"
+            "Existing drawn and Otsu materials are kept.\n"
+            "Copying again replaces the earlier cluster-derived ones.\n"
+            "They appear on the Materials tab, where each one can be set\n"
+            "to change or to stay unchanged like any other material."
         )
-        self.kmeans_to_rf_btn.clicked.connect(
-            self._convert_kmeans_clusters_to_rf_classes
+        self.copy_clusters_btn.clicked.connect(
+            self._convert_kmeans_clusters_to_materials
         )
-        km_layout.addWidget(self.kmeans_to_rf_btn)
+        km_layout.addWidget(self.copy_clusters_btn)
 
         self.kmeans_status_label = QLabel(
             "Status: run 3-D Auto-Detect first"
@@ -2553,123 +2393,26 @@ class BiTS4DMainWindow(QMainWindow):
         tab_auto.setLayout(ta_layout)
         right_tabs.addTab(tab_auto, "⚙ Auto Seg")
 
-        # ── Tab 3 : Random Forest ─────────────────────────────────────────────
-        tab_rf = QWidget()
+        # ── Tab 3 : Materials ─────────────────────────────────────────────
+        self.material_panel = MaterialPanel()
+        self.material_panel.refresh_requested.connect(
+            self._refresh_material_panel
+        )
+        self.material_panel.copy_clusters_requested.connect(
+            self._convert_kmeans_clusters_to_materials
+        )
+        self.material_panel.preview_requested.connect(
+            lambda: self._run_material_tracking(preview=True)
+        )
+        self.material_panel.run_requested.connect(
+            lambda: self._run_material_tracking(preview=False)
+        )
+        tab_materials = QWidget()
         tr_layout = QVBoxLayout()
-        tr_layout.setSpacing(6)
-
-        rf_notice = QLabel(
-            "<b>No longer the recommended route.</b> "
-            "Neutron and X-ray attenuation are material constants, so where a "
-            "material sits on the histogram is fixed by physics — there is "
-            "nothing there for a classifier to learn that your own regions do "
-            "not already state exactly.<br><br>"
-            "Use <i>Analytics → Time Series Segmentation → Track Materials "
-            "Across Time</i> instead. This tab is kept so earlier work stays "
-            "reproducible and so the two can be compared."
-        )
-        rf_notice.setWordWrap(True)
-        rf_notice.setStyleSheet(
-            "color: #8a4b00; background: #fff6e5; border: 1px solid #e8c88a;"
-            " padding: 6px; font-size: 9pt;"
-        )
-        tr_layout.addWidget(rf_notice)
-
-        rf_info = QLabel(
-            "<b>Classifier Segmentation (legacy)</b><br>"
-            "Workflow: <i>draw regions → segment → train → predict all "
-            "timepoints</i><br><br>"
-            "Trains on the <b>3-D voxel masks</b> already computed by "
-            "'✂ Segment Current'. After prediction each class is shown as an "
-            "outline on the histogram, so you can see how the learned "
-            "boundaries differ from the ones you drew."
-        )
-        rf_info.setWordWrap(True)
-        rf_info.setStyleSheet("color: #555; font-size: 9pt;")
-        tr_layout.addWidget(rf_info)
-
-        # Training parameters
-        train_group = QGroupBox("Training")
-        train_form = QFormLayout()
-        train_form.setLabelAlignment(Qt.AlignRight)
-
-        self.rf_feature_combo = QComboBox()
-        self.rf_feature_combo.addItems(["basic", "advanced", "expert"])
-        self.rf_feature_combo.setToolTip(
-            "basic   – intensity + ratio/sum/diff  (fast)\n"
-            "advanced – + spatial Z/Y/X coordinates\n"
-            "expert  – + local statistics + Laplacian  (slowest)"
-        )
-        train_form.addRow("Features:", self.rf_feature_combo)
-
-        self.rf_ref_spin = QSpinBox()
-        self.rf_ref_spin.setRange(0, 0)
-        self.rf_ref_spin.setValue(0)
-        self.rf_ref_spin.setToolTip(
-            "Timepoint that has been manually segmented.\n"
-            "Its 3-D masks are used as training labels for the RF."
-        )
-        train_form.addRow("Reference T:", self.rf_ref_spin)
-
-        train_group.setLayout(train_form)
-        tr_layout.addWidget(train_group)
-
-        # Dummy attributes for backward compatibility (no longer shown in UI)
-        self.rf_source_combo     = QComboBox()   # hidden, kept so code refs don't crash
-        self.rf_otsu_classes_spin = QSpinBox()
-        self.rf_otsu_row_widget   = QWidget()
-
-        self.rf_train_btn = QPushButton("🎓 Train RF on Current Segmentation")
-        self.rf_train_btn.setEnabled(False)
-        self.rf_train_btn.setToolTip(
-            "Train the RF on the 3-D segmentation masks for the reference timepoint.\n"
-            "Create masks with manual segmentation, Otsu, or the K-means conversion."
-        )
-        self.rf_train_btn.clicked.connect(self._rf_train)
-        tr_layout.addWidget(self.rf_train_btn)
-
-        # Prediction
-        pred_group = QGroupBox("Prediction")
-        pred_layout = QVBoxLayout()
-
-        self.rf_predict_current_btn = QPushButton("▶ Predict Current Timepoint")
-        self.rf_predict_current_btn.setEnabled(False)
-        self.rf_predict_current_btn.setToolTip("Predict labels for the current timepoint and show in viewer")
-        self.rf_predict_current_btn.clicked.connect(self._rf_predict_current)
-        pred_layout.addWidget(self.rf_predict_current_btn)
-
-        self.rf_predict_all_btn = QPushButton("▶▶ Predict All Timepoints")
-        self.rf_predict_all_btn.setEnabled(False)
-        self.rf_predict_all_btn.setToolTip("Run RF prediction on every timepoint")
-        self.rf_predict_all_btn.clicked.connect(self._rf_predict_all)
-        pred_layout.addWidget(self.rf_predict_all_btn)
-
-        pred_group.setLayout(pred_layout)
-        tr_layout.addWidget(pred_group)
-
-        # Confidence display
-        conf_group = QGroupBox("Last Prediction")
-        conf_layout = QVBoxLayout()
-        self.rf_status_label = QLabel("Status: untrained")
-        self.rf_status_label.setWordWrap(True)
-        self.rf_status_label.setStyleSheet("color: gray; font-style: italic; font-size: 9pt;")
-        conf_layout.addWidget(self.rf_status_label)
-        conf_group.setLayout(conf_layout)
-        tr_layout.addWidget(conf_group)
-
-        # Export
-        self.rf_export_btn = QPushButton("💾 Export RF Labels")
-        self.rf_export_btn.setEnabled(False)
-        self.rf_export_btn.setToolTip(
-            "Export RF label volumes as 4-D TIFF (integer class ids)\n"
-            "plus a confidence map TIFF."
-        )
-        self.rf_export_btn.clicked.connect(self._rf_export_labels)
-        tr_layout.addWidget(self.rf_export_btn)
-
-        tr_layout.addStretch()
-        tab_rf.setLayout(tr_layout)
-        right_tabs.addTab(tab_rf, "🌳 Classifier (legacy)")
+        tr_layout.setContentsMargins(0, 0, 0, 0)
+        tr_layout.addWidget(self.material_panel)
+        tab_materials.setLayout(tr_layout)
+        right_tabs.addTab(tab_materials, "🧱 Materials")
 
         # ── Tab 4 : Export ────────────────────────────────────────────────────
         tab_export = QWidget()
@@ -3006,17 +2749,6 @@ class BiTS4DMainWindow(QMainWindow):
         drift_action.triggered.connect(self._on_estimate_drift)
         model_menu.addAction(drift_action)
 
-        model_menu.addSeparator()
-
-        block_cv_action = QAction("Held-Out Accuracy (Classifier)...", self)
-        block_cv_action.setToolTip(
-            "Scores the classifier on regions it never saw during training.\n"
-            "Neighbouring voxels are near-copies of each other, so a score\n"
-            "measured on the training data mostly measures memorisation.\n"
-            "Expect a lower — and more honest — number."
-        )
-        block_cv_action.triggered.connect(self._on_block_cross_validation)
-        model_menu.addAction(block_cv_action)
 
         analytics_menu.addSeparator()
         
@@ -3066,6 +2798,51 @@ class BiTS4DMainWindow(QMainWindow):
 
         # Help menu
         help_menu = menubar.addMenu("Help")
+
+        manual_action = QAction("Manual...", self)
+        manual_action.setShortcut("F1")
+        manual_action.setToolTip(
+            "How to do each operation, and the mathematics behind it."
+        )
+        manual_action.triggered.connect(self._show_manual)
+        help_menu.addAction(manual_action)
+
+        for label, section in (
+            ("Getting Started", "start"),
+            ("Defining Materials", "define"),
+            ("Control Materials", "controls"),
+            ("The Health Check", "health"),
+            ("If Something Looks Wrong", "trouble"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda _checked=False, target=section: self._show_manual(target)
+            )
+            help_menu.addAction(action)
+
+        help_menu.addSeparator()
+
+        maths_menu = help_menu.addMenu("Mathematics")
+        for label, section in (
+            ("The Bivariate Histogram", "m_hist"),
+            ("Region Containment", "m_contain"),
+            ("Material Definitions and the Match Score", "m_material"),
+            ("Spatial Smoothing", "m_smooth"),
+            ("Choosing the Smoothing Strength", "m_auto"),
+            ("Which Voxels Count", "m_valid"),
+            ("Instrument Drift", "m_drift"),
+            ("Mixed Boundaries", "m_partial"),
+            ("The Metrics", "m_metrics"),
+            ("Why There Is No Classifier", "m_why"),
+            ("References", "refs"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda _checked=False, target=section: self._show_manual(target)
+            )
+            maths_menu.addAction(action)
+
+        help_menu.addSeparator()
 
         about_action = QAction("About BiTS 4D", self)
         about_action.triggered.connect(self._show_about)
@@ -3223,26 +3000,17 @@ class BiTS4DMainWindow(QMainWindow):
         self.dataset = dataset
         self.segmentation_masks.clear()  # Clear any previous segmentation masks
         self._clear_layer_shapes()
-        # Reset RF state for new dataset
-        self.rf_engine = RandomForestSegmentation4D(n_estimators=100)
-        self.rf_masks.clear()
-        self.rf_confidence.clear()
-        self.rf_class_names.clear()
-        self._rf_cluster_map = None
+        self.model_result = None
         self._last_kmeans_cluster_selections = []
-        self._rf_cluster_timepoint = None
-        self.kmeans_to_rf_btn.setEnabled(False)
+        self._cluster_timepoint = None
+        self.copy_clusters_btn.setEnabled(False)
+        self.material_panel.set_clusters_available(False)
+        self.material_panel.clear_result()
+        self.material_panel.set_materials([])
         self.kmeans_status_label.setText("Status: run 3-D Auto-Detect first")
         self.kmeans_status_label.setStyleSheet(
             "color: gray; font-style: italic; font-size: 9pt;"
         )
-        self.rf_train_btn.setEnabled(True)
-        self.rf_predict_current_btn.setEnabled(False)
-        self.rf_predict_all_btn.setEnabled(False)
-        self.rf_export_btn.setEnabled(False)
-        self.rf_status_label.setText("Status: untrained  (load complete)")
-        self.rf_ref_spin.setRange(0, max(0, dataset.num_timepoints - 1))
-        self.rf_ref_spin.setValue(0)
         self.otsu_run_btn.setEnabled(True)
         self.otsu_status_label.setText("Status: ready")
         self.status_bar.showMessage(
@@ -3480,7 +3248,6 @@ class BiTS4DMainWindow(QMainWindow):
         self._apply_segmentation_overlays(timepoint)
 
         # Update histogram overlays to show RF class distributions for this timepoint
-        self._update_rf_histogram_overlays(timepoint)
 
         self.status_bar.showMessage(f"Viewing timepoint {timepoint}")
     
@@ -3745,19 +3512,19 @@ class BiTS4DMainWindow(QMainWindow):
         ]
         if received_3d_clusters:
             self._last_kmeans_cluster_selections = received_3d_clusters
-            self._rf_cluster_timepoint = (
+            self._cluster_timepoint = (
                 self.dataset.current_timepoint
                 if self.dataset is not None
                 else 0
             )
 
-            if hasattr(self, "kmeans_to_rf_btn"):
-                self.kmeans_to_rf_btn.setEnabled(True)
+            if hasattr(self, "copy_clusters_btn"):
+                self.copy_clusters_btn.setEnabled(True)
 
             if hasattr(self, "kmeans_status_label"):
                 self.kmeans_status_label.setText(
                     f"Status: {len(received_3d_clusters)} cluster(s) ready "
-                    f"from T={self._rf_cluster_timepoint}"
+                    f"from T={self._cluster_timepoint}"
                 )
                 self.kmeans_status_label.setStyleSheet(
                     "color: green; font-style: italic; font-size: 9pt;"
@@ -3812,13 +3579,12 @@ class BiTS4DMainWindow(QMainWindow):
                 # Replace any uncovered voxel with the modal cluster id (shouldn't happen)
                 if np.any(cluster_map < 0):
                     cluster_map[cluster_map < 0] = 0
-                self._rf_cluster_map = cluster_map
                 self._last_kmeans_cluster_selections = list(three_d_clusters)
-                self._rf_cluster_timepoint = self.dataset.current_timepoint
-                self.kmeans_to_rf_btn.setEnabled(True)
+                self._cluster_timepoint = self.dataset.current_timepoint
+                self.copy_clusters_btn.setEnabled(True)
                 self.kmeans_status_label.setText(
                     f"Status: {len(three_d_clusters)} cluster(s) ready "
-                    f"from T={self._rf_cluster_timepoint}"
+                    f"from T={self._cluster_timepoint}"
                 )
                 self.kmeans_status_label.setStyleSheet(
                     "color: green; font-style: italic; font-size: 9pt;"
@@ -3834,7 +3600,7 @@ class BiTS4DMainWindow(QMainWindow):
         print(f"  All clusters saved to selection manager", file=sys.stderr)
     
     @pyqtSlot()
-    def _convert_kmeans_clusters_to_rf_classes(self):
+    def _convert_kmeans_clusters_to_materials(self):
         """
         Convert the most recent 3-D K-means result into RF training classes.
 
@@ -3849,7 +3615,7 @@ class BiTS4DMainWindow(QMainWindow):
             return
 
         payloads = list(self._last_kmeans_cluster_selections)
-        source_t = self._rf_cluster_timepoint
+        source_t = self._cluster_timepoint
 
         if not payloads or source_t is None:
             QMessageBox.warning(
@@ -3861,7 +3627,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         try:
             from segmentation.kmeans_class_conversion import (
-                build_rf_layers_from_cluster_selections,
+                build_material_layers_from_cluster_selections,
             )
             from utils.display_downsampler import DisplayDownsampler
 
@@ -3879,7 +3645,7 @@ class BiTS4DMainWindow(QMainWindow):
                     upscaled.append(tuple(payload))
                 payloads = upscaled
 
-            new_layers, summary = build_rf_layers_from_cluster_selections(
+            new_layers, summary = build_material_layers_from_cluster_selections(
                 payloads,
                 neutron_vol.shape,
             )
@@ -3943,8 +3709,6 @@ class BiTS4DMainWindow(QMainWindow):
             existing_selection_keys.add(key)
             added_selections += 1
 
-        self.rf_ref_spin.setValue(source_t)
-        self.rf_train_btn.setEnabled(True)
         self.export_current_btn.setEnabled(True)
         self.export_all_btn.setEnabled(True)
 
@@ -3952,12 +3716,11 @@ class BiTS4DMainWindow(QMainWindow):
             self._apply_segmentation_overlays(
                 source_t, neutron_vol, xray_vol
             )
-        self._update_rf_histogram_overlays(
-            source_t, neutron_vol, xray_vol
-        )
+        self._update_class_histogram_overlays(source_t, neutron_vol, xray_vol)
+        self._refresh_material_panel()
 
         self.kmeans_status_label.setText(
-            f"Status: {len(new_layers)} RF class(es) created at T={source_t}"
+            f"Status: {len(new_layers)} material(s) copied from T={source_t}"
         )
         self.kmeans_status_label.setStyleSheet(
             "color: green; font-style: italic; font-size: 9pt;"
@@ -4118,114 +3881,6 @@ class BiTS4DMainWindow(QMainWindow):
         self._derived_outline_cache[key] = (mask_3d, vertices)
         return vertices
 
-    def _update_rf_histogram_overlays(self, timepoint, neutron_vol=None, xray_vol=None):
-        """
-        Update both histogram canvases with two layers of overlays:
-
-        1. **Original selection** (dashed outline) — convex hull of the 3-D
-           segmentation masks used for training (from segmentation_masks[ref_t]).
-           These are the boundaries the user drew / the initial segmentation chose.
-
-        2. **RF prediction** (solid filled polygon, semi-transparent) — convex hull
-           of each RF-predicted class for the *current* timepoint.
-
-        Showing both together lets you see exactly how the RF has refined or shifted
-        the class boundaries compared to the original selection.
-
-        If no RF prediction exists yet for this timepoint, only the original
-        selection hulls are shown (or nothing if no segmentation exists either).
-        """
-        if neutron_vol is None or xray_vol is None:
-            try:
-                neutron_vol, xray_vol = self.dataset.get_volume_at_time(timepoint)
-            except Exception:
-                return
-
-        try:
-            from utils.clustering_3d import KMeans3D
-        except ImportError:
-            return
-
-        # This method owns the histogram overlay list while a dataset is
-        # loaded, so it must include the saved class ROIs as well — otherwise
-        # it would wipe the outlines the selection panel just drew.
-        roi_manager = self.dual_histogram.get_roi_manager()
-        overlays = list(roi_manager.get_named_roi_overlays())
-        # Layers created from one of those classes repeat its exact shape, so
-        # only add an outline for layers that show something new (RF, Otsu,
-        # K-means, or the unsaved active ROI).
-        class_names = {roi['name'] for roi in roi_manager.get_visible_named_rois()}
-
-        # ── Layer 1: original segmentation hulls (dashed, used as training) ───
-        # Use the training reference timepoint's masks for comparison context
-        # (also shown on the current timepoint for reference)
-        # Layers of unticked classes are left out here too, so hiding a class
-        # removes its outline from the histogram as well as its highlight.
-        ref_t    = self.rf_ref_spin.value() if hasattr(self, 'rf_ref_spin') else 0
-        ref_masks = self._visible_layers(ref_t)
-        if ref_masks and ref_t != timepoint:
-            # Show as a visual reference using the ref timepoint volumes
-            try:
-                import matplotlib.colors as mcolors
-                ref_n, ref_x = self.dataset.get_volume_at_time(ref_t)
-                for mask_3d, color, name in ref_masks:
-                    if name in class_names:
-                        continue    # already drawn as a class ROI
-                    try:
-                        verts = self._layer_outline(
-                            ref_t, name, mask_3d, ref_n, ref_x
-                        )
-                        if verts is None:
-                            continue
-                        # Lighter/faded version of the colour for "reference" look
-                        r, g, b, _ = mcolors.to_rgba(color)
-                        ref_color = (r, g, b, 0.25)
-                        overlays.append((f"Ref: {name}", verts, ref_color))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # Current timepoint segmentation masks (solid outline for "manual here")
-        cur_masks = self._visible_layers(timepoint)
-        for mask_3d, color, name in cur_masks:
-            if name in class_names:
-                continue    # already drawn as a class ROI
-            try:
-                verts = self._layer_outline(
-                    timepoint, name, mask_3d, neutron_vol, xray_vol
-                )
-                if verts is not None:
-                    overlays.append((f"Seg: {name}", verts, color))
-            except Exception:
-                pass
-
-        # ── Layer 2: RF prediction hulls (brighter / same hue, solid fill) ────
-        if timepoint in self.rf_masks:
-            lbl = self.rf_masks[timepoint]
-            classes = [c for c in np.unique(lbl) if c != 0]
-            for cls_id in classes:
-                mask = (lbl == cls_id)
-                n_vals = neutron_vol[mask].astype(np.float64)
-                x_vals = xray_vol[mask].astype(np.float64)
-                if len(n_vals) < 4:
-                    continue
-                try:
-                    verts = KMeans3D.create_convex_hull_roi_3d(
-                        n_vals, x_vals, percentile=99, density_aware=True)
-                    # Brighter, more opaque version of the class colour
-                    base_color = self._OVERLAY_COLORS[(cls_id - 1) % len(self._OVERLAY_COLORS)]
-                    import matplotlib.colors as mcolors
-                    r, g, b, _ = mcolors.to_rgba(base_color)
-                    rf_color = (r, g, b, 0.70)   # more opaque = RF result
-                    overlays.append((f"RF T={timepoint} class {cls_id}", verts, rf_color))
-                except Exception as e:
-                    print(f"  Hull failed for RF class {cls_id}: {e}", file=sys.stderr)
-
-        # Push to both canvases (replaces any previous overlay set)
-        self.dual_histogram.global_canvas.set_roi_overlays(overlays)
-        self.dual_histogram.local_canvas.set_roi_overlays(overlays)
-
     # ── Segmentation colour helpers ───────────────────────────────────────────
 
     _OVERLAY_COLORS = [
@@ -4282,16 +3937,6 @@ class BiTS4DMainWindow(QMainWindow):
             for roi in dual_histogram.get_roi_manager().named_rois
             if not roi.get('visible', True)
         }
-
-    def _rf_class_label(self, class_id):
-        """Name for an RF-predicted class.
-
-        Uses the name of the training layer that became this class (so a
-        class called "Lithium" stays "Lithium" through prediction and
-        export) and falls back to the class number when unknown.
-        """
-        name = self.rf_class_names.get(int(class_id))
-        return f"RF: {name}" if name else f"RF class {int(class_id)}"
 
     def _count_layers_for_class(self, name):
         """How many stored segmentation layers came from class *name*."""
@@ -4400,6 +4045,54 @@ class BiTS4DMainWindow(QMainWindow):
             self.slice_viewer.set_mask_overlays(overlays)
         else:
             self.slice_viewer.clear_mask_overlays()
+
+    def _update_class_histogram_overlays(self, timepoint, neutron_vol=None,
+                                         xray_vol=None):
+        """Redraw the class outlines on both histogram canvases.
+
+        Two things are shown together:
+
+        1. the regions you drew, exactly as drawn, and
+        2. an outline around any segmentation layer that is *not* one of them
+           — from Otsu, from K-means, or from a material-tracking run — so you
+           can see where those boundaries fall relative to your own.
+
+        A layer produced by a drawn region repeats that region's shape exactly,
+        so it is skipped: drawing both would put two outlines on one class and
+        make the second look like a disagreement.
+
+        This method owns the overlay list while a dataset is loaded, which is
+        why it re-adds the saved class regions every time — otherwise it would
+        wipe the outlines the selection panel had just drawn.
+        """
+        if neutron_vol is None or xray_vol is None:
+            try:
+                neutron_vol, xray_vol = self.dataset.get_volume_at_time(timepoint)
+            except Exception:
+                return
+
+        roi_manager = self.dual_histogram.get_roi_manager()
+        overlays = list(roi_manager.get_named_roi_overlays())
+        class_names = {
+            roi['name'] for roi in roi_manager.get_visible_named_rois()
+        }
+
+        # Layers of unticked classes are left out, so hiding a class removes
+        # its outline from the histogram as well as its highlight.
+        for mask_3d, color, name in self._visible_layers(timepoint):
+            if name in class_names:
+                continue
+            try:
+                verts = self._layer_outline(
+                    timepoint, name, mask_3d, neutron_vol, xray_vol
+                )
+                if verts is not None:
+                    overlays.append((f"Seg: {name}", verts, color))
+            except Exception:
+                pass
+
+        self.dual_histogram.global_canvas.set_roi_overlays(overlays)
+        self.dual_histogram.local_canvas.set_roi_overlays(overlays)
 
     def _apply_segmentation_overlays(self, timepoint, neutron_vol=None, xray_vol=None):
         """Show *timepoint*'s display volumes with all of its highlights.
@@ -4664,7 +4357,7 @@ class BiTS4DMainWindow(QMainWindow):
         self.export_current_btn.setEnabled(True)
         self.export_all_btn.setEnabled(True)
         self._apply_segmentation_overlays(current_t, neutron_vol, xray_vol)
-        self._update_rf_histogram_overlays(current_t, neutron_vol, xray_vol)
+        self._update_class_histogram_overlays(current_t, neutron_vol, xray_vol)
 
     def _run_otsu_segment(self):
         """
@@ -4738,7 +4431,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         # Display in viewer and histogram
         self._apply_segmentation_overlays(current_t, neutron_vol, xray_vol)
-        self._update_rf_histogram_overlays(current_t, neutron_vol, xray_vol)
+        self._update_class_histogram_overlays(current_t, neutron_vol, xray_vol)
 
         self.export_current_btn.setEnabled(True)
         self.export_all_btn.setEnabled(True)
@@ -4763,448 +4456,6 @@ class BiTS4DMainWindow(QMainWindow):
     # ─────────────────────────────────────────────────────────
 
     @pyqtSlot()
-    def _rf_train(self):
-        """
-        Train the Random Forest from the 3-D segmentation masks stored for the
-        reference timepoint.
-
-        The histogram ROI (manual polygon / k-means / Otsu) is only a *tool* for
-        creating the initial 3-D masks.  Once those masks exist in
-        ``self.segmentation_masks[ref_t]``, the RF trains on the actual 3-D voxel
-        class assignments — not on intensity membership in the histogram space.
-
-        This means the RF learns spatial and textural context, not just intensity
-        thresholds, and can generalise that context to other timepoints.  The
-        resulting predictions are then shown back on the histogram as convex-hull
-        overlays so you can see how the RF-segmented regions differ from the
-        original manual selection.
-        """
-        if not self.dataset:
-            QMessageBox.warning(self, "No Dataset", "Please load a dataset first.")
-            return
-
-        feature_lvl = self.rf_feature_combo.currentText()
-        ref_t       = self.rf_ref_spin.value()
-
-        neutron_vol, xray_vol = (
-            self.dataset.neutron_data[ref_t],
-            self.dataset.xray_data[ref_t],
-        )
-
-        # ── Validate: need at least one visible segmentation layer for ref_t ──
-        # Classes unticked in the selection panel are not part of the current
-        # segmentation, so the RF must not be trained on them either.
-        layers = self._visible_layers(ref_t)
-        hidden_count = len(self.segmentation_masks.get(ref_t, [])) - len(layers)
-        if not layers:
-            stored = len(self.segmentation_masks.get(ref_t, []))
-            extra = (
-                f"\n\n{stored} layer(s) exist for this timepoint but their "
-                "classes are unticked in the selection panel — tick them to "
-                "train on them."
-                if stored else ""
-            )
-            QMessageBox.warning(
-                self, "No Segmentation for Reference Timepoint",
-                f"No segmentation masks available for timepoint {ref_t}.{extra}\n\n"
-                "Workflow:\n"
-                "  1. Draw ROIs on the histogram\n"
-                "  2. Click '✂ Segment Current' to create the 3-D masks\n"
-                "  3. Return here to train the RF on those masks\n\n"
-                "The RF trains on the actual 3-D voxel class assignments, not\n"
-                "on histogram intensity membership — this lets it learn spatial\n"
-                "and textural context that generalises across timepoints."
-            )
-            return
-
-        # ── Build multi-class label array from stored 3-D masks ───────────────
-        # Each entry in layers is (mask_3d, color, name).
-        # Class ids: 1, 2, 3 … in list order; background = 0.
-        def _build_labels(layers, shape):
-            labels = np.zeros(shape, dtype=np.int32)
-            for cls_id, (mask_3d, _color, _name) in enumerate(layers, start=1):
-                labels[mask_3d.astype(bool)] = cls_id
-            return labels
-
-        # Remember which training layer each class id came from, so
-        # predictions and their exported files keep the user's class names.
-        self.rf_class_names = {
-            cls_id: layer[2] for cls_id, layer in enumerate(layers, start=1)
-        }
-
-        # ── Run training ──────────────────────────────────────────────────────
-        self.rf_status_label.setText("Status: training …")
-        self.rf_status_label.setStyleSheet("color: orange; font-style: italic;")
-        self.rf_train_btn.setEnabled(False)
-        QApplication.processEvents()
-
-        def _train_op(progress_callback):
-            progress_callback(5, "Building label array from 3-D masks …")
-            labels_3d = _build_labels(layers, neutron_vol.shape)
-
-            unique, counts = np.unique(labels_3d, return_counts=True)
-            print(f"\n[RF] Training from 3-D masks — ref T={ref_t}", file=sys.stderr)
-            for lbl, cnt in zip(unique, counts):
-                name = ("Background" if lbl == 0
-                        else layers[lbl-1][2] if lbl-1 < len(layers)
-                        else f"Class {lbl}")
-                print(f"    {name}: {cnt:,} voxels", file=sys.stderr)
-
-            progress_callback(15, "Extracting features …")
-            stats = self.rf_engine._fit(
-                neutron_vol, xray_vol,
-                labels_3d,
-                feature_lvl,
-                verbose=True,
-            )
-            progress_callback(100, "Training complete")
-            return stats
-
-        stats = run_with_progress(
-            self,
-            "Training Random Forest",
-            "Training Random Forest classifier …",
-            _train_op,
-        )
-
-        self.rf_train_btn.setEnabled(True)
-
-        if stats is None:
-            self.rf_status_label.setText("Status: training failed")
-            self.rf_status_label.setStyleSheet("color: red; font-style: italic;")
-            return
-
-        acc_pct     = stats.get("training_accuracy", 0) * 100
-        layer_names = ", ".join(lyr[2] for lyr in layers)
-        if hidden_count:
-            layer_names += f"  ({hidden_count} hidden class(es) excluded)"
-
-        self.rf_status_label.setText(
-            f"Status: trained ✓  |  {len(layers)} class(es)  |  "
-            f"acc {acc_pct:.1f}%  |  [{feature_lvl}]"
-        )
-        self.rf_status_label.setStyleSheet("color: green; font-style: italic;")
-        self.rf_predict_current_btn.setEnabled(True)
-        self.rf_predict_all_btn.setEnabled(True)
-
-        QMessageBox.information(
-            self, "RF Training Complete",
-            f"Random Forest trained on 3-D segmentation masks.\n\n"
-            f"  Reference timepoint : {ref_t}\n"
-            f"  Layers used         : {layer_names}\n"
-            f"  Feature level       : {feature_lvl}\n"
-            f"  Classes (incl. bg)  : {stats.get('classes', [])}\n"
-            f"  Training accuracy   : {acc_pct:.2f}%\n\n"
-            "Run 'Predict' — RF results will be shown on the slice viewer\n"
-            "and histogram so you can compare with the original selection."
-        )
-
-    def _rf_predict_current(self):
-        """Predict RF labels for the currently displayed timepoint."""
-        if not self.dataset:
-            return
-        if not self.rf_engine.is_trained:
-            QMessageBox.warning(self, "Not Trained", "Please train the RF first.")
-            return
-
-        t = self.dataset.current_timepoint
-        neutron_vol, xray_vol = self.dataset.get_current_volume()
-
-        self.rf_status_label.setText(f"Status: predicting T={t} …")
-        self.rf_status_label.setStyleSheet("color: orange; font-style: italic;")
-        QApplication.processEvents()
-
-        def _predict_op(progress_callback):
-            progress_callback(10, f"Predicting timepoint {t} …")
-            lbl, conf = self.rf_engine.predict_timepoint(
-                neutron_vol, xray_vol, return_confidence=True
-            )
-            progress_callback(100, "Done")
-            return lbl, conf
-
-        result = run_with_progress(
-            self,
-            "RF Prediction",
-            f"Predicting timepoint {t} …",
-            _predict_op,
-        )
-
-        if result is None:
-            return
-
-        lbl, conf = result
-        self.rf_masks[t]      = lbl
-        self.rf_confidence[t] = conf
-
-        mean_conf = float(np.mean(conf)) * 100
-        unc_frac  = float(np.sum(conf < 0.70) / conf.size) * 100
-        classes   = [c for c in np.unique(lbl) if c != 0]  # skip background
-
-        # --- Build one coloured segmentation layer per non-background class ---
-        self.segmentation_masks[t] = []          # replace any previous RF result
-        self._clear_layer_shapes(t)
-        for cls_id in classes:
-            mask_cls = (lbl == cls_id)
-            color    = self._OVERLAY_COLORS[(cls_id - 1) % len(self._OVERLAY_COLORS)]
-            name     = self._rf_class_label(cls_id)
-            self.segmentation_masks[t].append((mask_cls, color, name))
-
-        # Show in viewer + update histograms
-        self._apply_segmentation_overlays(t, neutron_vol, xray_vol)
-        self._update_rf_histogram_overlays(t, neutron_vol, xray_vol)
-        self.rf_export_btn.setEnabled(True)
-
-        status = (
-            f"Status: predicted T={t}  |  "
-            f"{len(classes)} classes  |  "
-            f"conf {mean_conf:.1f}%  |  uncertain {unc_frac:.1f}%"
-        )
-        self.rf_status_label.setText(status)
-        self.rf_status_label.setStyleSheet("color: green; font-style: italic;")
-        self.status_bar.showMessage(
-            f"RF T={t}: {len(classes)} classes | confidence {mean_conf:.1f}%"
-        )
-
-        if unc_frac > 10.0:
-            QMessageBox.warning(
-                self, "Low Confidence",
-                f"Timepoint {t} has {unc_frac:.1f}% uncertain voxels (< 70%).\n\n"
-                "Consider retraining with 'advanced' or 'expert' features,\n"
-                "or adding more labelled training data."
-            )
-
-    @pyqtSlot()
-    def _rf_predict_all(self):
-        """Predict RF labels for every timepoint and cache results."""
-        if not self.dataset:
-            return
-        if not self.rf_engine.is_trained:
-            QMessageBox.warning(self, "Not Trained", "Please train the RF first.")
-            return
-
-        T = self.dataset.num_timepoints
-        reply = QMessageBox.question(
-            self,
-            "Confirm RF Batch Prediction",
-            f"Run RF prediction on all {T} timepoints?\n\n"
-            "This may take several minutes for large datasets.",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        self.rf_status_label.setText("Status: predicting all timepoints …")
-        self.rf_status_label.setStyleSheet("color: orange; font-style: italic;")
-        QApplication.processEvents()
-
-        def _predict_all_op(progress_callback):
-            return self.rf_engine.predict_all_timepoints(
-                self.dataset.neutron_data,
-                self.dataset.xray_data,
-                confidence_threshold=0.70,
-                progress_callback=progress_callback,
-                verbose=True,
-            )
-
-        results = run_with_progress(
-            self,
-            "RF Batch Prediction",
-            f"Predicting {T} timepoints …",
-            _predict_all_op,
-        )
-
-        if results is None:
-            return
-
-        for t, r in results.items():
-            self.rf_masks[t]      = r["labels"]
-            self.rf_confidence[t] = r["confidence"]
-
-            # One coloured layer per non-background class
-            lbl     = r["labels"]
-            classes = [c for c in np.unique(lbl) if c != 0]
-            self.segmentation_masks[t] = []
-            self._clear_layer_shapes(t)
-            for cls_id in classes:
-                mask_cls = (lbl == cls_id)
-                color    = self._OVERLAY_COLORS[(cls_id - 1) % len(self._OVERLAY_COLORS)]
-                self.segmentation_masks[t].append(
-                    (mask_cls, color, self._rf_class_label(cls_id))
-                )
-
-        # Refresh viewer for the currently displayed timepoint
-        cur_t = self.dataset.current_timepoint
-        if cur_t in self.segmentation_masks:
-            self._apply_segmentation_overlays(cur_t)
-
-        avg_conf = np.mean([r["mean_confidence"] for r in results.values()]) * 100
-        n_review = sum(1 for r in results.values() if r["needs_review"])
-
-        summary = (
-            f"Status: all {T} timepoints predicted  |  "
-            f"avg conf {avg_conf:.1f}%  |  "
-            f"{n_review} flagged for review"
-        )
-        self.rf_status_label.setText(summary)
-        self.rf_status_label.setStyleSheet("color: green; font-style: italic;")
-        self.rf_export_btn.setEnabled(True)
-
-        self.status_bar.showMessage(
-            f"RF batch complete: {T} timepoints | avg confidence {avg_conf:.1f}%"
-        )
-
-        msg = (
-            f"RF batch prediction complete!\n\n"
-            f"  Timepoints        : {T}\n"
-            f"  Average confidence: {avg_conf:.1f}%\n"
-            f"  Flagged for review: {n_review}\n"
-        )
-        if n_review > 0:
-            msg += (
-                "\nTimepoints flagged have >10% uncertain voxels.\n"
-                "Consider retraining with more features or more training data."
-            )
-        QMessageBox.information(self, "RF Batch Prediction Complete", msg)
-
-    @pyqtSlot()
-    def _rf_export_labels(self):
-        """Export RF predictions with user-chosen label / modality options."""
-        if not self.rf_masks:
-            QMessageBox.warning(self, "No RF Results", "No RF predictions to export.")
-            return
-
-        # Build a representative layer list from the first predicted timepoint
-        first_t = min(self.rf_masks.keys())
-        lbl_ref  = self.rf_masks[first_t]
-        classes  = [c for c in np.unique(lbl_ref) if c != 0]
-        ref_layers = [
-            (lbl_ref == c,
-             self._OVERLAY_COLORS[(c - 1) % len(self._OVERLAY_COLORS)],
-             self._rf_class_label(c))
-            for c in classes
-        ]
-
-        # ── Export options dialog ────────────────────────────────────────────
-        dlg = ExportOptionsDialog(ref_layers, parent=self)
-        dlg.setWindowTitle("RF Export Options")
-        if dlg.exec_() != QDialog.Accepted:
-            return
-
-        sel_names    = {name for _, _, name in dlg.selected_layers}
-        do_mask      = dlg.export_mask
-        do_neutron   = dlg.export_neutron
-        do_xray      = dlg.export_xray
-        do_labels    = dlg.export_labels
-        do_histogram = dlg.export_histogram
-
-        if not sel_names:
-            QMessageBox.warning(self, "Nothing selected", "No classes were selected.")
-            return
-        if not (do_mask or do_neutron or do_xray or do_labels or do_histogram):
-            QMessageBox.warning(self, "Nothing selected", "No output modalities were selected.")
-            return
-
-        # Also offer to include the confidence map (always written as a bonus)
-        output_dir = QFileDialog.getExistingDirectory(
-            self, "Select Output Directory for RF Export", "", QFileDialog.ShowDirsOnly
-        )
-        if not output_dir:
-            return
-
-        try:
-            import os, tifffile
-            from PyQt5.QtWidgets import QProgressDialog
-            from PyQt5.QtCore import Qt
-            from utils.histogram_export import sanitize_name, save_bin_edges
-
-            if do_histogram and self.global_histogram is not None:
-                save_bin_edges(self.global_histogram, output_dir)
-
-            T_list = sorted(self.rf_masks.keys())
-            progress = QProgressDialog(
-                "Exporting RF predictions…", "Cancel", 0, len(T_list), self
-            )
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
-
-            total_files = 0
-
-            for i, t in enumerate(T_list):
-                if progress.wasCanceled():
-                    break
-                progress.setLabelText(f"Exporting RF timepoint {t}…  ({i+1}/{len(T_list)})")
-                progress.setValue(i)
-                QApplication.processEvents()
-
-                lbl = self.rf_masks[t]
-                t_classes = [c for c in np.unique(lbl) if c != 0
-                              and self._rf_class_label(c) in sel_names]
-                if not t_classes:
-                    continue
-
-                base = f"timepoint_{t:03d}"
-                try:
-                    neutron_vol, xray_vol = self.dataset.get_volume_at_time(t)
-                    has_volumes = True
-                except Exception:
-                    has_volumes = False
-
-                for cls_id in t_classes:
-                    mask_bool = (lbl == cls_id)
-                    # Carries the class name given in the selection panel
-                    label = self._rf_class_label(cls_id)
-                    pfx = os.path.join(
-                        output_dir, f"{base}_{sanitize_name(label)}"
-                    )
-
-                    if do_mask:
-                        tifffile.imwrite(f"{pfx}_mask.tif",
-                                         mask_bool.astype(np.uint8) * 255)
-                        total_files += 1
-                    if do_neutron and has_volumes:
-                        vol = neutron_vol.copy(); vol[~mask_bool] = 0
-                        tifffile.imwrite(f"{pfx}_neutron.tif", vol)
-                        total_files += 1
-                    if do_xray and has_volumes:
-                        vol = xray_vol.copy(); vol[~mask_bool] = 0
-                        tifffile.imwrite(f"{pfx}_xray.tif", vol)
-                        total_files += 1
-                    if do_histogram and has_volumes:
-                        total_files += len(self._export_class_histogram(
-                            t, label, mask_bool, output_dir, pfx
-                        ))
-
-                if do_labels:
-                    label_vol = np.zeros(lbl.shape, dtype=np.uint8)
-                    for cls_id in t_classes:
-                        label_vol[lbl == cls_id] = cls_id
-                    tifffile.imwrite(
-                        os.path.join(output_dir, f"{base}_RF_labels.tif"), label_vol
-                    )
-                    total_files += 1
-
-                # Confidence map (always, if available)
-                if t in self.rf_confidence:
-                    tifffile.imwrite(
-                        os.path.join(output_dir, f"{base}_RF_confidence.tif"),
-                        self.rf_confidence[t]
-                    )
-                    total_files += 1
-
-            progress.setValue(len(T_list))
-
-            QMessageBox.information(
-                self, "RF Export Complete",
-                f"Exported {total_files} file(s) for {len(T_list)} timepoint(s).\n\n"
-                f"Saved to: {output_dir}"
-            )
-            self.status_bar.showMessage(f"RF export: {total_files} files → {output_dir}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to export RF results:\n{e}")
-            import traceback; traceback.print_exc()
-
     # ─────────────────────────────────────────────────────────
     #  End Random Forest slots
     # ─────────────────────────────────────────────────────────
@@ -5445,6 +4696,23 @@ class BiTS4DMainWindow(QMainWindow):
                 except ImportError:
                     self.histogram_engine.use_gpu = False
     
+    def _show_manual(self, section=None):
+        """Open the manual, optionally at a particular section.
+
+        Kept non-modal and reused across calls, so it can stay open beside
+        the application while you work through it.
+        """
+        from gui.manual import ManualWindow
+
+        if getattr(self, "_manual_window", None) is None:
+            self._manual_window = ManualWindow(self)
+        if isinstance(section, str):
+            self._manual_window.show_section(section)
+        self._manual_window.show()
+        self._manual_window.raise_()
+        self._manual_window.activateWindow()
+        return self._manual_window
+
     def _show_about(self):
         """Show about dialog"""
         QMessageBox.about(
@@ -5517,17 +4785,13 @@ class BiTS4DMainWindow(QMainWindow):
             settings["X-ray range"] = (
                 f"[{xray_range[0]:.6g}, {xray_range[1]:.6g}]"
             )
-        if self.rf_engine is not None and self.rf_engine.is_trained:
-            stats = self.rf_engine.get_train_stats()
-            settings["Random Forest"] = (
-                f"trained, features '{stats.get('feature_level')}', "
-                f"accuracy {100 * stats.get('training_accuracy', 0):.2f}%"
+        if getattr(self, "model_result", None) is not None:
+            settings["spatial smoothing"] = describe_strength(
+                getattr(self.model_result, "smoothing", None)
             )
-            if self.rf_class_names:
-                settings["RF class names"] = ", ".join(
-                    f"{cid}={cname}"
-                    for cid, cname in sorted(self.rf_class_names.items())
-                )
+            library = getattr(self.model_result, "library", None)
+            if library is not None and library.inert_names:
+                settings["control materials"] = ", ".join(library.inert_names)
         if self.display_bin_factor > 1:
             settings["display binning"] = (
                 f"x{self.display_bin_factor} (median) — display only; "
@@ -6380,8 +5644,59 @@ class BiTS4DMainWindow(QMainWindow):
             QMessageBox.information(self, "Data Check", message)
         return reports
 
+    _CLUSTER_PREFIXES = ("K-means cluster", "3D Cluster", "Cluster ")
+
+    def _material_source(self, name: str) -> str:
+        """Where a material came from, for the panel's second column."""
+        if any(name.startswith(prefix) for prefix in self._CLUSTER_PREFIXES):
+            return "K-means"
+        if name.startswith("Otsu"):
+            return "Otsu"
+        return "drawn"
+
+    def _material_reference_timepoint(self) -> int:
+        """The timepoint the material definitions are taken from."""
+        if not self.dataset:
+            return 0
+        current = self.dataset.current_timepoint
+        if self._model_class_masks(current):
+            return current
+        for timepoint in range(self.dataset.num_timepoints):
+            if self._model_class_masks(timepoint):
+                return timepoint
+        return current
+
+    def _refresh_material_panel(self):
+        """Re-read the materials from whatever is currently segmented."""
+        if not self.dataset:
+            self.material_panel.set_materials([])
+            return []
+        reference = self._material_reference_timepoint()
+        materials = [
+            {
+                "name": name,
+                "source": self._material_source(name),
+                "voxels": int(np.count_nonzero(mask)),
+            }
+            for mask, _color, name in self._visible_layers(reference)
+        ]
+        self.material_panel.set_materials(materials)
+        self.material_panel.set_clusters_available(
+            bool(self._last_kmeans_cluster_selections)
+        )
+        return materials
+
     def _on_model_segmentation(self):
-        """Follow the drawn materials across the whole series."""
+        """Menu route: show the materials, then run the series."""
+        if hasattr(self, "right_tabs") and hasattr(self, "material_panel"):
+            index = self.right_tabs.indexOf(self.material_panel.parentWidget())
+            if index >= 0:
+                self.right_tabs.setCurrentIndex(index)
+        self._refresh_material_panel()
+        self._run_material_tracking(preview=False)
+
+    def _run_material_tracking(self, preview=False):
+        """Measure every timepoint (or just this one) against the materials."""
         from utils.cancellation import OperationCancelled, OperationFailed
 
         if not self.dataset or self.global_histogram is None:
@@ -6391,31 +5706,35 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        reference = self.dataset.current_timepoint
+        reference = self._material_reference_timepoint()
         masks = self._model_class_masks(reference)
-        if len(masks) < 1:
+        if not masks:
             QMessageBox.information(
                 self, "No Materials",
                 "Draw and segment at least one material first. The materials "
-                "you define here are what the whole series is measured "
-                "against."
+                "you define are what the whole series is measured against."
             )
             return
 
-        dialog = MaterialTrackingDialog(sorted(masks), self)
-        if dialog.exec_() != QDialog.Accepted:
+        self._refresh_material_panel()
+        settings = self.material_panel.settings()
+        # Only materials still on screen can be controls
+        settings["control_materials"] = [
+            name for name in settings["control_materials"] if name in masks
+        ]
+
+        if not settings["lock_definitions"]:
+            self._run_adaptive_tracking(settings, reference, masks)
             return
 
-        if not dialog.lock_definitions:
-            self._run_adaptive_tracking(dialog, reference, masks)
-            return
-
-        from model import ClassLibrary, LockedSegmenter, SegmentationRefused
+        from model import ClassLibrary, LockedSegmenter
         from model.spatial_prior import ROIDerivedMRF
         from model.validity import build_valid_mask
 
+        timepoints = (
+            [self.dataset.current_timepoint] if preview else None
+        )
         neutron_reference, xray_reference = self.dataset.get_volume_at_time(reference)
-        ordered = [name for name in masks]
 
         def operation(progress_callback=None, cancel_check=None):
             if progress_callback:
@@ -6423,11 +5742,11 @@ class BiTS4DMainWindow(QMainWindow):
             valid = build_valid_mask(neutron_reference, xray_reference)
             library = ClassLibrary.from_masks(
                 neutron_reference, xray_reference, masks,
-                valid_mask=valid, inert=dialog.control_materials,
+                valid_mask=valid, inert=settings["control_materials"],
             )
-            smoother = ROIDerivedMRF(beta=1.0, n_sweeps=6)
             segmenter = LockedSegmenter(
-                library, prior=smoother, bins=self.histogram_engine.bins
+                library, prior=ROIDerivedMRF(beta=1.0, n_sweeps=6),
+                bins=self.histogram_engine.bins,
             )
             segmenter.set_grid(
                 self.global_histogram.x_edges, self.global_histogram.y_edges
@@ -6439,7 +5758,7 @@ class BiTS4DMainWindow(QMainWindow):
             segmenter.learn_boundaries(reference_labels, valid_mask=valid)
 
             sweep = None
-            if dialog.smoothing_mode == "auto":
+            if settings["smoothing_mode"] == "auto":
                 if progress_callback:
                     progress_callback(8, "Choosing the smoothing strength...")
 
@@ -6452,24 +5771,27 @@ class BiTS4DMainWindow(QMainWindow):
                     progress_callback=sweep_progress, cancel_check=cancel_check,
                 )
             else:
-                strength = dialog.smoothing_strength
+                strength = settings["smoothing_strength"]
 
             def run_progress(value, message):
                 if progress_callback:
                     progress_callback(35 + int(0.6 * value), message)
 
             outcome = segmenter.segment_series(
-                self.dataset, beta=strength,
+                self.dataset, timepoints=timepoints, beta=strength,
                 progress_callback=run_progress, cancel_check=cancel_check,
                 enforce_guards=False,
             )
             outcome.smoothing_sweep = sweep
             return segmenter, outcome, library
 
+        title = "Preview" if preview else "Track Materials"
         try:
             result = run_with_progress(
-                self, "Track Materials",
-                "Following your materials through the series...", operation,
+                self, title,
+                "Measuring the materials at this timepoint..." if preview
+                else "Measuring the materials through the series...",
+                operation,
             )
         except (OperationCancelled, OperationFailed):
             return
@@ -6477,8 +5799,17 @@ class BiTS4DMainWindow(QMainWindow):
             return
 
         segmenter, outcome, library = result
+        self.material_panel.set_smoothing_result(
+            outcome.smoothing, settings["smoothing_mode"] == "auto"
+        )
+
         refusals = segmenter.check_guards(outcome)
         if refusals:
+            self.material_panel.set_status(
+                "These results are not reliable, so they have not been "
+                "applied.", "fail",
+            )
+            self.material_panel.set_findings(refusals)
             QMessageBox.warning(
                 self, "Segmentation Problem",
                 "These results are not reliable, so they have not been "
@@ -6488,7 +5819,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         self._apply_locked_result(outcome)
         self.model_result = outcome
-        self._show_health_check(outcome, library, dialog)
+        self._show_health_check(outcome, library, settings, preview=preview)
 
     def _apply_locked_result(self, outcome):
         """Put the result into the slice viewer as ordinary layers."""
@@ -6506,14 +5837,15 @@ class BiTS4DMainWindow(QMainWindow):
         current = self.dataset.current_timepoint
         neutron, xray = self.dataset.get_volume_at_time(current)
         self._apply_segmentation_overlays(current, neutron, xray)
+        self._update_class_histogram_overlays(current, neutron, xray)
 
-    def _show_health_check(self, outcome, library, dialog=None):
+    def _show_health_check(self, outcome, library, settings=None,
+                           preview=False):
         """Step 8: check the run before its numbers are used."""
         from model import Status, run_health_check
-        from model.partial_volume import MixelComponent, verify_mixels
 
         mixing_report = None
-        if dialog is not None and dialog.find_mixed_boundaries:
+        if settings and settings.get("find_mixed_boundaries"):
             mixing_report = self._suggest_mixed_boundaries(library)
 
         report = run_health_check(
@@ -6523,15 +5855,23 @@ class BiTS4DMainWindow(QMainWindow):
         )
         self.health_report = report
 
+        self.material_panel.show_health_report(report)
+
         lines = [report.headline(), ""]
         for finding in report.findings:
             lines.append(str(finding))
         if outcome.smoothing_sweep is not None:
             lines += [
                 "",
-                "Smoothing strength: "
-                + MaterialTrackingDialog.describe_strength(outcome.smoothing)
+                "Smoothing: " + describe_strength(outcome.smoothing)
                 + " (chosen automatically).",
+            ]
+        if preview:
+            lines += [
+                "",
+                "This was one timepoint only. Some checks — control "
+                "materials, and whether the usable data changes — need the "
+                "whole series to mean anything.",
             ]
 
         show = (
@@ -6558,7 +5898,7 @@ class BiTS4DMainWindow(QMainWindow):
             return None
         return verify_mixels(_Fitted(), suggestions)
 
-    def _run_adaptive_tracking(self, dialog, reference, masks):
+    def _run_adaptive_tracking(self, settings, reference, masks):
         """The advanced path: definitions allowed to move.
 
         Only appropriate when the instrument is known to drift. The dialog
@@ -6573,12 +5913,12 @@ class BiTS4DMainWindow(QMainWindow):
 
         neutron_reference, xray_reference = self.dataset.get_volume_at_time(reference)
         tracker = (
-            DriftTracker(anchor_classes=dialog.control_materials)
-            if dialog.control_materials else None
+            DriftTracker(anchor_classes=settings["control_materials"])
+            if settings["control_materials"] else None
         )
         strength = (
-            1.0 if dialog.smoothing_strength is None
-            else dialog.smoothing_strength
+            1.0 if settings["smoothing_strength"] is None
+            else settings["smoothing_strength"]
         )
 
         def operation(progress_callback=None, cancel_check=None):
@@ -6620,7 +5960,7 @@ class BiTS4DMainWindow(QMainWindow):
             if entry.fit is None:
                 continue
             for name, distance in entry.fit.moved_sigma().items():
-                if distance > 0.5 and name in dialog.control_materials:
+                if distance > 0.5 and name in settings["control_materials"]:
                     moved.append(name)
         message = [
             f"{len(outcome)} timepoint(s) segmented with the material "
@@ -6831,127 +6171,6 @@ class BiTS4DMainWindow(QMainWindow):
             message += "\n\n(No evolution plot — it needs at least 2 timepoints.)"
         self.status_bar.showMessage(f"Spatial metrics saved: {filepath}")
         QMessageBox.information(self, "Spatial Metrics Saved", message)
-
-    def _on_block_cross_validation(self):
-        """Score the Random Forest on held-out contiguous blocks."""
-        from utils.cancellation import OperationCancelled, OperationFailed
-
-        if self.rf_engine is None or not self.rf_engine.is_trained:
-            QMessageBox.information(
-                self, "No Model",
-                "Train the Random Forest first — this re-scores that model's "
-                "configuration on held-out spatial blocks."
-            )
-            return
-
-        reference = (
-            self.rf_ref_spin.value() if hasattr(self, "rf_ref_spin") else 0
-        )
-        masks = self._model_class_masks(reference)
-        if len(masks) < 2:
-            QMessageBox.information(
-                self, "Not Enough Classes",
-                "Cross-validation needs at least two classes at the "
-                "timepoint the model was trained on."
-            )
-            return
-
-        neutron, xray = self.dataset.get_volume_at_time(reference)
-
-        def operation(progress_callback=None, cancel_check=None):
-            from sklearn.ensemble import RandomForestClassifier
-
-            from segmentation.features import extract_features_at_indices, resolve_spec
-            from segmentation.random_forest_4d import labels_from_manual
-            from utils.validation import block_cross_validation, block_ids_for_volume
-
-            spec = resolve_spec(self.rf_engine.feature_level)
-            label_volume = labels_from_manual(
-                np.zeros(neutron.shape, dtype=bool),
-                {index: mask for index, mask in enumerate(masks.values(), start=1)},
-            )
-            blocks = block_ids_for_volume(neutron.shape)
-            labelled = np.flatnonzero(label_volume.reshape(-1) > 0)
-            if labelled.size == 0:
-                raise ValueError("No labelled voxels to validate on")
-
-            rng = np.random.default_rng(0)
-            cap = 200_000
-            if labelled.size > cap:
-                labelled = rng.choice(labelled, cap, replace=False)
-
-            if progress_callback:
-                progress_callback(15, "Extracting features...")
-            features = extract_features_at_indices(neutron, xray, labelled, spec)
-            targets = label_volume.reshape(-1)[labelled]
-            groups = blocks.reshape(-1)[labelled]
-
-            engine = self.rf_engine
-
-            def factory():
-                return RandomForestClassifier(
-                    n_estimators=engine.n_estimators,
-                    min_samples_leaf=max(engine.min_samples_leaf, 1),
-                    max_depth=engine.max_depth,
-                    class_weight="balanced_subsample",
-                    random_state=engine.random_state,
-                    n_jobs=-1,
-                )
-
-            return block_cross_validation(
-                features, targets, groups, factory,
-                n_folds=8, progress_callback=progress_callback,
-            ), spec
-
-        try:
-            result = run_with_progress(
-                self, "Held-Out Accuracy",
-                "Holding out contiguous blocks...", operation,
-            )
-        except (OperationCancelled, OperationFailed):
-            return
-        if result is None:
-            return
-
-        validation, spec = result
-        names = list(masks)
-        lines = [_plain_validation_summary(validation), ""]
-        for index, name in enumerate(names, start=1):
-            value = validation.iou.get(index)
-            if value is not None and np.isfinite(value):
-                lines.append(f"  {name}: {100 * value:.1f}% overlap")
-
-        training = self.rf_engine.get_train_stats().get("training_accuracy")
-        if training is not None:
-            lines.append("")
-            lines.append(
-                f"Scored on its own training data the same model gets "
-                f"{100 * training:.1f}%. The gap is expected, not a fault: "
-                f"neighbouring voxels are near-copies, so training-data "
-                f"accuracy mostly measures how well it memorised them. The "
-                f"held-out figure is the one to report."
-            )
-        anchoring = self.rf_engine.get_train_stats().get("anchoring_index", 0.0)
-        if anchoring and anchoring > 0.20:
-            lines.append("")
-            lines.append(
-                f"About {100 * anchoring:.0f}% of this classifier's decision "
-                f"rests on where a voxel sits in the volume rather than on "
-                f"what it looks like. Those positions are the same at every "
-                f"timepoint, so it is partly remembering the layout of the "
-                f"first one. Choose a feature set without position to avoid "
-                f"that."
-            )
-        lines.append("")
-        lines.append(f"Features used: {spec.describe()}")
-
-        QMessageBox.information(
-            self, "Held-Out Accuracy", "\n".join(lines)
-        )
-        self.status_bar.showMessage(
-            f"Held-out score: agreement {validation.kappa:.3f}, "
-            f"mean overlap {validation.mean_iou:.3f}"
-        )
 
     def _on_export_histogram_evolution(self):
         """Save each timepoint's log-histogram change against T0."""
