@@ -44,6 +44,11 @@ back to voxels.
   **`segmentation_report.txt`** recording each class's name, its integer
   value in the exported label volumes, its voxel count at every timepoint,
   and the settings the segmentation was made with.
+- **Histogram + slice figure** — *File → Export Histogram + Slice Figure*
+  (Ctrl+Shift+F) saves a two-panel figure: on the left the local bimodal
+  histogram with every label's selection drawn on top, on the right the slice
+  currently displayed with the same labels highlighted in the same colours.
+  PNG, PDF, SVG or TIFF, at the resolution you choose.
 - **Quality metrics** — *Analytics → Histogram Time Analysis → Histogram &
   Segmentation Metrics* writes a CSV of every ground-truth-free metric
   (streak and smear scores, marginal asymmetry and drift, Davies–Bouldin
@@ -118,7 +123,8 @@ python main.py
    checked before it is shown.
 5. **Export** — masked volumes, binary masks, and label maps as TIFF;
    per-class bimodal histograms and a `segmentation_report.txt`; statistics
-   as CSV/Excel; reports as PDF.
+   as CSV/Excel; reports as PDF; and a histogram + slice figure of what is on
+   screen (*File → Export Histogram + Slice Figure*).
 6. **Measure (optional)** — *Analytics → Histogram Time Analysis →
    Histogram & Segmentation Metrics* for the metrics CSV and evolution plot.
 

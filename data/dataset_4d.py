@@ -7,7 +7,7 @@ Manages 4D multivariate tomography data with temporal evolution
 import numpy as np
 from typing import Tuple, Optional, Dict
 from pathlib import Path
-import tifffile
+from data.tiff_io import write_volume_tiff
 
 
 class Dataset4D:
@@ -240,8 +240,8 @@ class Dataset4D:
         neutron_path = output_dir / f"{prefix}_t{timepoint:04d}_neutron.tif"
         xray_path = output_dir / f"{prefix}_t{timepoint:04d}_xray.tif"
         
-        tifffile.imwrite(neutron_path, neutron_vol)
-        tifffile.imwrite(xray_path, xray_vol)
+        write_volume_tiff(neutron_path, neutron_vol)
+        write_volume_tiff(xray_path, xray_vol)
     
     def __repr__(self) -> str:
         return (
