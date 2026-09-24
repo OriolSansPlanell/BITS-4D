@@ -65,6 +65,22 @@ in either channel on its own.</p>
 <li><b>Export</b> volumes, label maps and a written report.</li>
 </ol>
 
+<h2>On a laptop screen</h2>
+<p>The window opens at a size that fits your screen and rearranges itself as
+it gets smaller, so it works on a 14" or 16" laptop:</p>
+<ul>
+<li>When the histogram column is narrow, the global and local histograms
+    become two tabs above one plot instead of sitting side by side.</li>
+<li>Rows of buttons wrap onto extra lines instead of pushing the window
+    wider, and a column that still does not fit scrolls.</li>
+<li>The histogram's display settings (log scale, ROI visibility, colour
+    range) are in the <b>Display ▾</b> drop-down.</li>
+<li>The spatial selection tools under the slice can be folded away with
+    <b>🛠 Spatial tools</b>; on a small screen they start folded.</li>
+<li>Time navigation is one bar along the bottom of the window.</li>
+</ul>
+<p>Every divider between panels can be dragged.</p>
+
 <h2>What the two axes are</h2>
 <p>The horizontal axis is <b>neutron</b> intensity, the vertical is
 <b>X-ray</b>. A region you draw is a set of intensity pairs, so it selects
@@ -89,7 +105,10 @@ _DEFINING = """
     the global histogram.</li>
 <li>Press <b>Save as class</b> and name it — <i>Lithium</i>,
     <i>Separator</i>, <i>Aluminium</i>.</li>
-<li>Repeat for every material.</li>
+<li>Repeat for every material. You can also draw several regions first and
+    save them together: each region you draw stays on the histogram in its
+    own colour, and <b>Save as class</b> then asks for one name per region
+    and makes one class each.</li>
 <li>Press <b>✂ Segment Current</b> to see them in the slice viewer.</li>
 </ol>
 
@@ -97,9 +116,25 @@ _DEFINING = """
 this order, and they set the integer values in the exported label volumes.
 Nothing renames or reorders them later.</div>
 
+<h2>Moving and removing a region with the keyboard</h2>
+<p>Click inside any region on either histogram — saved or not — to select it;
+it gets a black-and-white dashed outline, and its row is highlighted in the
+selection panel. Then:</p>
+<table>
+<tr><th>Key</th><th>Effect</th></tr>
+<tr><td>← → ↑ ↓</td><td>Move the region by one histogram bin.</td></tr>
+<tr><td>Shift + arrow</td><td>Move it by ten bins.</td></tr>
+<tr><td>Backspace or Delete</td><td>Remove it. Removing a saved class asks
+    first, and asks what to do with any segmentation made from it.</td></tr>
+</table>
+<p>Click an empty part of the histogram to deselect. Moving a saved class
+changes its definition; segmentation already computed from it keeps the
+outline it was made with until you segment again.</p>
+
 <h2>Editing one afterwards</h2>
 <p>In the selection panel, select a class and press <b>Edit</b>. It returns to
-the canvas with draggable vertices. Save it again when you are done. Untick a
+the canvas with draggable vertices (anything you were drawing stays, as its
+own unsaved region). Save it again when you are done. Untick a
 class to hide it — a hidden class is excluded from segmentation too, so what
 you see on the histogram is always exactly what gets segmented.</p>
 
@@ -327,9 +362,13 @@ image of what is on screen:</p>
 </ul>
 <p>Choose the timepoint, plane and slice before exporting, and untick any
 material you want left out — hidden materials are left out of both panels.
-You can also include the selection you are still drawing, set the resolution,
-and turn the legends and the outlines around the highlights on or off. Save
-as PNG or TIFF for images, PDF or SVG for figures you will edit.</p>
+You can also include the regions you have drawn but not saved, set the
+resolution, and turn the legends and the outlines around the highlights on or
+off.</p>
+<p>The figure is saved as <b>SVG</b>: outlines, text and legends stay vector
+graphics, and the text stays editable in Inkscape or Illustrator. The
+resolution you choose applies to the two images inside it (the histogram and
+the slice). PDF, PNG and TIFF can still be picked in the save dialog.</p>
 
 <h2>Quality metrics</h2>
 <p><i>Analytics → Histogram Time Analysis</i>:</p>
@@ -855,7 +894,8 @@ SECTIONS: List[Dict[str, str]] = [
      "keywords": "begin first steps overview workflow axes neutron xray"},
     {"id": "define", "group": "How to", "title": "Defining materials",
      "body": _DEFINING,
-     "keywords": "roi region polygon rectangle draw class kmeans cluster edit"},
+     "keywords": "roi region polygon rectangle draw class kmeans cluster edit "
+                 "select move arrow keys keyboard backspace delete several"},
     {"id": "controls", "group": "How to", "title": "Control materials",
      "body": _CONTROLS,
      "keywords": "inert unchanged null check casing support steel"},
@@ -874,7 +914,7 @@ SECTIONS: List[Dict[str, str]] = [
     {"id": "export", "group": "How to", "title": "Exporting and measuring",
      "body": _EXPORT,
      "keywords": "save tiff csv label map report metrics figure image png pdf "
-                 "svg histogram slice side by side"},
+                 "svg vector histogram slice side by side"},
     {"id": "trouble", "group": "How to", "title": "If something looks wrong",
      "body": _TROUBLE,
      "keywords": "problem troubleshoot speckle vanished slow jump"},

@@ -25,7 +25,11 @@ from matplotlib.patches import Polygon as MplPolygon
 
 #: File types the figure can be saved as (matplotlib picks the writer from
 #: the extension).
-SUPPORTED_FORMATS = (".png", ".pdf", ".svg", ".tif", ".tiff", ".jpg", ".jpeg")
+SUPPORTED_FORMATS = (".svg", ".png", ".pdf", ".tif", ".tiff", ".jpg", ".jpeg")
+
+#: What the figure is saved as unless another format is asked for: SVG keeps
+#: every outline, label and legend as editable vector graphics.
+DEFAULT_FORMAT = ".svg"
 
 
 @dataclass
@@ -222,13 +226,17 @@ def save_histogram_slice_figure(
     """Render and save the figure; returns the path written.
 
     The format follows the extension; a path without a supported extension
-    gets ``.png``.
+    gets ``.svg``. In SVG the text is kept as text (not outlines), so labels
+    stay editable in Inkscape or Illustrator; *dpi* sets the resolution of
+    the two embedded images (histogram and slice).
     """
     path = Path(path)
     if path.suffix.lower() not in SUPPORTED_FORMATS:
-        path = path.with_name(path.name + ".png")
+        path = path.with_name(path.name + DEFAULT_FORMAT)
     path.parent.mkdir(parents=True, exist_ok=True)
     figure = render_histogram_slice_figure(histogram, slice_panel, **kwargs)
-    figure.savefig(path, dpi=dpi, bbox_inches="tight")
+    import matplotlib
+    with matplotlib.rc_context({"svg.fonttype": "none"}):
+        figure.savefig(path, dpi=dpi, bbox_inches="tight")
     return path
 

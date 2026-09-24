@@ -30,6 +30,36 @@ from utils import (
 from gui.time_navigation_widget import TimeNavigationWidget
 from gui.dual_histogram_widget import DualHistogramWidget
 from gui.material_panel import MaterialPanel, describe_strength
+from gui.responsive import fit_to_screen, flow_row, scrollable
+
+
+def _group_labelled(widgets, max_follow=2):
+    """Join each bare QLabel to (at most *max_follow*) controls after it.
+
+    The result goes into a wrapping row: a label and the control it names
+    then move to the next line together instead of being split, while long
+    runs of buttons after a label can still wrap.
+    """
+    from gui.responsive import group
+
+    grouped, current = [], []
+
+    def flush():
+        if current:
+            grouped.append(group(*current) if len(current) > 1 else current[0])
+            current.clear()
+
+    for widget in widgets:
+        if isinstance(widget, QLabel):
+            flush()
+            current.append(widget)
+        elif current and len(current) <= max_follow:
+            current.append(widget)
+        else:
+            flush()
+            grouped.append(widget)
+    flush()
+    return grouped
 
 
 class SliceViewerWidget(QWidget):
@@ -72,9 +102,9 @@ class SliceViewerWidget(QWidget):
         layout = QVBoxLayout()
         
         # Controls for axis selection
-        controls_layout = QHBoxLayout()
+        controls = []
         
-        controls_layout.addWidget(QLabel("View Axis:"))
+        controls.append(QLabel("View Axis:"))
         
         from PyQt5.QtWidgets import QRadioButton, QButtonGroup, QSlider
         from PyQt5.QtCore import Qt
@@ -85,37 +115,36 @@ class SliceViewerWidget(QWidget):
         self.z_axis_btn.setChecked(True)
         self.z_axis_btn.toggled.connect(lambda: self._on_axis_changed('z'))
         self.axis_group.addButton(self.z_axis_btn)
-        controls_layout.addWidget(self.z_axis_btn)
+        controls.append(self.z_axis_btn)
         
         self.y_axis_btn = QRadioButton("XZ (Y-slice)")
         self.y_axis_btn.toggled.connect(lambda: self._on_axis_changed('y'))
         self.axis_group.addButton(self.y_axis_btn)
-        controls_layout.addWidget(self.y_axis_btn)
+        controls.append(self.y_axis_btn)
         
         self.x_axis_btn = QRadioButton("YZ (X-slice)")
         self.x_axis_btn.toggled.connect(lambda: self._on_axis_changed('x'))
         self.axis_group.addButton(self.x_axis_btn)
-        controls_layout.addWidget(self.x_axis_btn)
+        controls.append(self.x_axis_btn)
         
-        controls_layout.addStretch()
         
         # Slice index slider
-        controls_layout.addWidget(QLabel("Slice:"))
+        controls.append(QLabel("Slice:"))
         self.slice_slider = QSlider(Qt.Horizontal)
         self.slice_slider.setMinimum(0)
         self.slice_slider.setMaximum(100)
         self.slice_slider.setValue(50)
         self.slice_slider.valueChanged.connect(self._on_slice_changed)
         self.slice_slider.setEnabled(False)
-        controls_layout.addWidget(self.slice_slider)
+        self.slice_slider.setMinimumWidth(120)
+        controls.append(self.slice_slider)
         
         self.slice_label = QLabel("0")
-        controls_layout.addWidget(self.slice_label)
+        controls.append(self.slice_label)
         
-        controls_layout.addStretch()
         
         # View mode selection
-        controls_layout.addWidget(QLabel("Data:"))
+        controls.append(QLabel("Data:"))
         
         self.view_group = QButtonGroup()
         
@@ -123,55 +152,72 @@ class SliceViewerWidget(QWidget):
         self.neutron_view_btn.setChecked(True)
         self.neutron_view_btn.toggled.connect(lambda: self._on_view_mode_changed('neutron'))
         self.view_group.addButton(self.neutron_view_btn)
-        controls_layout.addWidget(self.neutron_view_btn)
+        controls.append(self.neutron_view_btn)
         
         self.xray_view_btn = QRadioButton("X-ray")
         self.xray_view_btn.toggled.connect(lambda: self._on_view_mode_changed('xray'))
         self.view_group.addButton(self.xray_view_btn)
-        controls_layout.addWidget(self.xray_view_btn)
+        controls.append(self.xray_view_btn)
         
-        controls_layout.addStretch()
         
         # Dynamic range controls
         from PyQt5.QtWidgets import QDoubleSpinBox
         
-        controls_layout.addWidget(QLabel("Range:"))
+        controls.append(QLabel("Range:"))
         self.slice_vmin = QDoubleSpinBox()
         self.slice_vmin.setRange(0, 1e10)
         self.slice_vmin.setValue(0)
         self.slice_vmin.setPrefix("Min: ")
+        self.slice_vmin.setMaximumWidth(130)
         self.slice_vmin.valueChanged.connect(self._on_range_changed)
-        controls_layout.addWidget(self.slice_vmin)
+        controls.append(self.slice_vmin)
         
         self.slice_vmax = QDoubleSpinBox()
         self.slice_vmax.setRange(0, 1e10)
         self.slice_vmax.setValue(65535)
         self.slice_vmax.setPrefix("Max: ")
+        self.slice_vmax.setMaximumWidth(130)
         self.slice_vmax.valueChanged.connect(self._on_range_changed)
-        controls_layout.addWidget(self.slice_vmax)
+        controls.append(self.slice_vmax)
         
         slice_auto_btn = QPushButton("Auto Range")
         slice_auto_btn.clicked.connect(self._auto_range_slice)
-        controls_layout.addWidget(slice_auto_btn)
+        controls.append(slice_auto_btn)
         
-        layout.addLayout(controls_layout)
+        # Show/hide the spatial-selection row: on a short screen the slice
+        # needs that height more than tools that are not always in use.
+        from PyQt5.QtWidgets import QToolButton
+        self.spatial_tools_btn = QToolButton()
+        self.spatial_tools_btn.setText("🛠 Spatial tools")
+        self.spatial_tools_btn.setCheckable(True)
+        self.spatial_tools_btn.setChecked(True)
+        self.spatial_tools_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.spatial_tools_btn.setToolTip(
+            "Show or hide the spatial selection tools (rectangle, region\n"
+            "growing, auto-detect) to give the slice more room."
+        )
+        controls.append(self.spatial_tools_btn)
+
+        # Group each label with what it names, so they wrap as a unit
+        controls = _group_labelled(controls)
+        layout.addWidget(flow_row(*controls))
         
         # Spatial ROI tools
-        spatial_roi_layout = QHBoxLayout()
+        spatial = []
         
-        spatial_roi_layout.addWidget(QLabel("Spatial Selection:"))
+        spatial.append(QLabel("Spatial Selection:"))
         
         self.rect_tool_btn = QPushButton("□ Rectangle")
         self.rect_tool_btn.setCheckable(True)
         self.rect_tool_btn.setToolTip("Draw rectangle on slice to select spatial region")
         self.rect_tool_btn.clicked.connect(self._on_rect_tool_clicked)
-        spatial_roi_layout.addWidget(self.rect_tool_btn)
+        spatial.append(self.rect_tool_btn)
         
         self.region_grow_btn = QPushButton("🪄 Region Grow")
         self.region_grow_btn.setCheckable(True)
         self.region_grow_btn.setToolTip("Click a seed point to grow connected region")
         self.region_grow_btn.clicked.connect(self._on_region_grow_clicked)
-        spatial_roi_layout.addWidget(self.region_grow_btn)
+        spatial.append(self.region_grow_btn)
         
         # Bivariate mode checkbox
         self.bivariate_cb = QCheckBox("Bivariate")
@@ -179,17 +225,17 @@ class SliceViewerWidget(QWidget):
         self.bivariate_cb.setChecked(False)
         self.bivariate_cb.stateChanged.connect(self._on_bivariate_changed)
         self.bivariate_cb.setEnabled(False)
-        spatial_roi_layout.addWidget(self.bivariate_cb)
+        spatial.append(self.bivariate_cb)
         
         # 3D mode checkbox (NEW for v15.0)
         self.mode_3d_cb = QCheckBox("3D Volume")
         self.mode_3d_cb.setToolTip("Apply to entire 3D volume instead of current slice")
         self.mode_3d_cb.setChecked(False)
         self.mode_3d_cb.setEnabled(False)
-        spatial_roi_layout.addWidget(self.mode_3d_cb)
+        spatial.append(self.mode_3d_cb)
         
         # Tolerance control for region growing
-        spatial_roi_layout.addWidget(QLabel("Tol:"))
+        spatial.append(QLabel("Tol:"))
         self.tolerance_spinbox = QDoubleSpinBox()
         self.tolerance_spinbox.setRange(1, 10000)
         self.tolerance_spinbox.setValue(1000)
@@ -197,13 +243,13 @@ class SliceViewerWidget(QWidget):
         self.tolerance_spinbox.setToolTip("Intensity tolerance for region growing")
         self.tolerance_spinbox.setEnabled(False)
         self.tolerance_spinbox.setMaximumWidth(80)
-        spatial_roi_layout.addWidget(self.tolerance_spinbox)
+        spatial.append(self.tolerance_spinbox)
         
         # Second tolerance (for bivariate mode)
         self.tolerance2_label = QLabel("Tol2:")
         self.tolerance2_label.setToolTip("Tolerance for other modality (bivariate mode)")
         self.tolerance2_label.setVisible(False)
-        spatial_roi_layout.addWidget(self.tolerance2_label)
+        spatial.append(self.tolerance2_label)
         
         self.tolerance2_spinbox = QDoubleSpinBox()
         self.tolerance2_spinbox.setRange(1, 10000)
@@ -213,7 +259,7 @@ class SliceViewerWidget(QWidget):
         self.tolerance2_spinbox.setEnabled(False)
         self.tolerance2_spinbox.setVisible(False)
         self.tolerance2_spinbox.setMaximumWidth(80)
-        spatial_roi_layout.addWidget(self.tolerance2_spinbox)
+        spatial.append(self.tolerance2_spinbox)
         
         # Show/hide mask toggle
         self.show_mask_cb = QCheckBox("Show Mask")
@@ -221,19 +267,19 @@ class SliceViewerWidget(QWidget):
         self.show_mask_cb.setToolTip("Toggle region growing mask overlay")
         self.show_mask_cb.stateChanged.connect(self._on_show_mask_changed)
         self.show_mask_cb.setEnabled(False)
-        spatial_roi_layout.addWidget(self.show_mask_cb)
+        spatial.append(self.show_mask_cb)
         
         # Auto-detect features button
         self.auto_detect_btn = QPushButton("🔍 Auto-Detect")
         self.auto_detect_btn.setToolTip("Automatically detect features in slice")
         self.auto_detect_btn.clicked.connect(self._on_auto_detect)
-        spatial_roi_layout.addWidget(self.auto_detect_btn)
+        spatial.append(self.auto_detect_btn)
         
         self.clear_spatial_roi_btn = QPushButton("✕ Clear")
         self.clear_spatial_roi_btn.setToolTip("Clear spatial ROI")
         self.clear_spatial_roi_btn.clicked.connect(self._clear_spatial_roi)
         self.clear_spatial_roi_btn.setEnabled(False)
-        spatial_roi_layout.addWidget(self.clear_spatial_roi_btn)
+        spatial.append(self.clear_spatial_roi_btn)
 
         self.clear_highlight_btn = QPushButton("🧹 Clear Highlight")
         self.clear_highlight_btn.setToolTip(
@@ -243,23 +289,29 @@ class SliceViewerWidget(QWidget):
         )
         self.clear_highlight_btn.setEnabled(False)
         self.clear_highlight_btn.clicked.connect(self._clear_highlight)
-        spatial_roi_layout.addWidget(self.clear_highlight_btn)
+        spatial.append(self.clear_highlight_btn)
         
-        spatial_roi_layout.addStretch()
         
-        self.create_hist_roi_btn = QPushButton("→ Create Histogram ROI from Selection")
-        self.create_hist_roi_btn.setToolTip("Extract values from spatial ROI and create histogram ROI")
+        self.create_hist_roi_btn = QPushButton("→ Histogram ROI")
+        self.create_hist_roi_btn.setToolTip(
+            "Create Histogram ROI from Selection: extract the values inside\n"
+            "the spatial selection and turn them into a histogram ROI."
+        )
         self.create_hist_roi_btn.clicked.connect(self._create_histogram_roi_from_spatial)
         self.create_hist_roi_btn.setEnabled(False)
-        spatial_roi_layout.addWidget(self.create_hist_roi_btn)
+        spatial.append(self.create_hist_roi_btn)
         
-        layout.addLayout(spatial_roi_layout)
+        spatial = _group_labelled(spatial)
+        self.spatial_tools_row = flow_row(*spatial)
+        layout.addWidget(self.spatial_tools_row)
+        self.spatial_tools_btn.toggled.connect(self.set_spatial_tools_visible)
         
         # Create matplotlib figure
         self.fig = Figure(figsize=(8, 6))
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
-        layout.addWidget(self.canvas)
+        self.canvas.setMinimumSize(240, 200)
+        layout.addWidget(self.canvas, stretch=1)
         
         # Initialize spatial ROI state
         self.spatial_roi_selector = None
@@ -308,6 +360,13 @@ class SliceViewerWidget(QWidget):
         self.setLayout(layout)
         self._setup_plot()
     
+    def set_spatial_tools_visible(self, visible):
+        """Show or hide the spatial-selection tool row."""
+        visible = bool(visible)
+        self.spatial_tools_row.setVisible(visible)
+        if self.spatial_tools_btn.isChecked() != visible:
+            self.spatial_tools_btn.setChecked(visible)
+
     def _setup_plot(self):
         """Setup the plot appearance"""
         self.ax.set_title("Volume Slice")
@@ -318,6 +377,15 @@ class SliceViewerWidget(QWidget):
         
         # Connect scroll event for zoom
         self.cid_scroll = self.canvas.mpl_connect('scroll_event', self._on_scroll_zoom)
+
+        # Keep the title inside the canvas when it is resized
+        self.canvas.mpl_connect('resize_event', self._on_canvas_resize)
+
+    def _on_canvas_resize(self, _event=None):
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
     
     def _on_mouse_move(self, event):
         """Display pixel value under cursor"""
@@ -2167,7 +2235,10 @@ class FigureExportDialog(QDialog):
         self._dpi_spin.setRange(72, 1200)
         self._dpi_spin.setSingleStep(50)
         self._dpi_spin.setValue(300)
-        self._dpi_spin.setToolTip("Ignored for vector formats (PDF, SVG).")
+        self._dpi_spin.setToolTip(
+            "Resolution of the histogram and slice images. In an SVG or PDF\n"
+            "the outlines, text and legends stay vector graphics."
+        )
         dpi_row.addWidget(self._dpi_spin)
         dpi_row.addStretch()
         layout.addLayout(dpi_row)
@@ -2184,7 +2255,7 @@ class FigureExportDialog(QDialog):
         )
         layout.addWidget(self._outline_cb)
 
-        self._active_cb = QCheckBox("Include the unsaved (active) ROI")
+        self._active_cb = QCheckBox("Include ROIs drawn but not saved")
         self._active_cb.setChecked(has_active_roi)
         self._active_cb.setEnabled(has_active_roi)
         layout.addWidget(self._active_cb)
@@ -2259,7 +2330,9 @@ class BiTS4DMainWindow(QMainWindow):
     def init_ui(self):
         """Initialize the user interface - 3-panel splitter layout."""
         self.setWindowTitle(f"BiTS 3D/4D v{config.APP_VERSION}")
-        self.setGeometry(100, 100, 1800, 960)
+        # Open at a size that fits the screen (laptops included); the panels
+        # scroll or wrap rather than forcing the window wider than that.
+        window_size = fit_to_screen(self)
 
         # Import extra widgets needed here
         from PyQt5.QtWidgets import (
@@ -2307,20 +2380,26 @@ class BiTS4DMainWindow(QMainWindow):
         seg_btns.addWidget(self.segment_all_btn)
         hist_layout.addLayout(seg_btns)
         hist_group.setLayout(hist_layout)
-        left_vbox.addWidget(hist_group, stretch=4)
+        left_vbox.addWidget(hist_group)
 
-        # --- Time navigation ---
-        time_group = QGroupBox("Time Navigation")
+        # --- Time navigation: a full-width bar along the bottom of the
+        # window (added in the final assembly), so the histogram column keeps
+        # its height for the plots.
+        time_group = QGroupBox()
+        time_group.setToolTip("Time navigation")
         time_layout = QVBoxLayout()
+        time_layout.setContentsMargins(4, 2, 4, 2)
         self.time_navigation = TimeNavigationWidget(num_timepoints=1)
         self.time_navigation.setEnabled(False)
         self.time_navigation.timepoint_changed.connect(self._on_timepoint_changed)
         time_layout.addWidget(self.time_navigation)
         time_group.setLayout(time_layout)
-        left_vbox.addWidget(time_group, stretch=1)
 
         left_widget.setLayout(left_vbox)
-        splitter.addWidget(left_widget)
+        # Width floor only: below the content's own minimum height the
+        # column scrolls instead of squashing the plots.
+        left_widget.setMinimumWidth(300)
+        splitter.addWidget(scrollable(left_widget))
 
         # ══════════════════════════════════════════════════════════════════════
         # CENTRE PANEL — slice viewer (always visible)
@@ -2340,7 +2419,8 @@ class BiTS4DMainWindow(QMainWindow):
         viewer_group.setLayout(viewer_layout)
         centre_vbox.addWidget(viewer_group)
         centre_widget.setLayout(centre_vbox)
-        splitter.addWidget(centre_widget)
+        centre_widget.setMinimumWidth(320)
+        splitter.addWidget(scrollable(centre_widget))
 
         # ══════════════════════════════════════════════════════════════════════
         # RIGHT PANEL — tabbed workflow tools
@@ -2348,8 +2428,9 @@ class BiTS4DMainWindow(QMainWindow):
         right_tabs = QTabWidget()
         self.right_tabs = right_tabs
         right_tabs.setTabPosition(QTabWidget.North)
-        right_tabs.setMinimumWidth(320)
-        right_tabs.setMaximumWidth(420)
+        right_tabs.setMinimumWidth(240)
+        right_tabs.setMaximumWidth(440)
+        right_tabs.setUsesScrollButtons(True)
 
         # ── Tab 1 : Manual / ROI segmentation ─────────────────────────────────
         tab_manual = QWidget()
@@ -2386,7 +2467,7 @@ class BiTS4DMainWindow(QMainWindow):
         tm_layout.addWidget(stat_group)
 
         tab_manual.setLayout(tm_layout)
-        right_tabs.addTab(tab_manual, "🖊 Manual ROI")
+        right_tabs.addTab(scrollable(tab_manual, horizontal=False), "🖊 Manual ROI")
 
         # ── Tab 2 : Automated segmentation (Otsu / K-means) ───────────────────
         tab_auto = QWidget()
@@ -2483,7 +2564,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         ta_layout.addStretch()
         tab_auto.setLayout(ta_layout)
-        right_tabs.addTab(tab_auto, "⚙ Auto Seg")
+        right_tabs.addTab(scrollable(tab_auto, horizontal=False), "⚙ Auto Seg")
 
         # ── Tab 3 : Materials ─────────────────────────────────────────────
         self.material_panel = MaterialPanel()
@@ -2504,7 +2585,7 @@ class BiTS4DMainWindow(QMainWindow):
         tr_layout.setContentsMargins(0, 0, 0, 0)
         tr_layout.addWidget(self.material_panel)
         tab_materials.setLayout(tr_layout)
-        right_tabs.addTab(tab_materials, "🧱 Materials")
+        right_tabs.addTab(scrollable(tab_materials, horizontal=False), "🧱 Materials")
 
         # ── Tab 4 : Export ────────────────────────────────────────────────────
         tab_export = QWidget()
@@ -2547,12 +2628,15 @@ class BiTS4DMainWindow(QMainWindow):
 
         te_layout.addStretch()
         tab_export.setLayout(te_layout)
-        right_tabs.addTab(tab_export, "💾 Export")
+        right_tabs.addTab(scrollable(tab_export, horizontal=False), "💾 Export")
 
         splitter.addWidget(right_tabs)
 
-        # Splitter proportions: left=30%, centre=50%, right=20%
-        splitter.setSizes([540, 900, 360])
+        # Splitter proportions: left=34%, centre=44%, right=22%
+        total = max(window_size.width() - 20, 600)
+        splitter.setSizes([int(total * 0.34), int(total * 0.44),
+                           int(total * 0.22)])
+        splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 5)
         splitter.setStretchFactor(2, 2)
@@ -2561,7 +2645,8 @@ class BiTS4DMainWindow(QMainWindow):
         container = QWidget()
         container_layout = QVBoxLayout()
         container_layout.setContentsMargins(4, 4, 4, 4)
-        container_layout.addWidget(splitter)
+        container_layout.addWidget(splitter, stretch=1)
+        container_layout.addWidget(time_group)
         container.setLayout(container_layout)
         self.setCentralWidget(container)
 
@@ -2570,6 +2655,11 @@ class BiTS4DMainWindow(QMainWindow):
         self.status_bar.showMessage(
             "Ready — load a dataset to begin  (Settings → Data Mode to switch 3D/4D)"
         )
+        # On a laptop-sized screen start with the spatial tools folded away;
+        # the "🛠 Spatial tools" button brings them back.
+        if getattr(self, "_bits_small_screen", False):
+            self.slice_viewer.set_spatial_tools_visible(False)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setMaximumWidth(200)
@@ -2616,9 +2706,9 @@ class BiTS4DMainWindow(QMainWindow):
         export_figure_action = QAction("Export Histogram + Slice Figure...", self)
         export_figure_action.setShortcut("Ctrl+Shift+F")
         export_figure_action.setToolTip(
-            "Save a two-panel figure: the local histogram with every label's\n"
-            "selection on top, and the slice on screen with the same labels\n"
-            "highlighted (PNG, PDF, SVG or TIFF)."
+            "Save a two-panel SVG figure: the local histogram with every\n"
+            "label's selection on top, and the slice on screen with the same\n"
+            "labels highlighted. PDF, PNG and TIFF can be chosen instead."
         )
         export_figure_action.triggered.connect(
             self._on_export_histogram_slice_figure
@@ -4254,10 +4344,11 @@ class BiTS4DMainWindow(QMainWindow):
     def _enumerate_roi_specs(roi_manager):
         """Return every ROI to segment as a list of uniform spec dicts.
 
-        Includes every *visible* named class ROI plus the active (unsaved)
-        ROI, so segmentation always covers exactly the selection displayed on
-        the histogram canvases. Classes hidden in the selection panel are
-        neither drawn nor segmented.
+        Includes every *visible* named class ROI plus every unsaved ROI, so
+        segmentation always covers exactly the selection displayed on the
+        histogram canvases. Classes hidden in the selection panel are
+        neither drawn nor segmented. A single unsaved ROI is called
+        "Active ROI"; several are numbered, each in the colour it is drawn in.
         """
         specs = []
         for roi in roi_manager.get_visible_named_rois():
@@ -4275,18 +4366,18 @@ class BiTS4DMainWindow(QMainWindow):
                 spec['rectangle'] = tuple(roi['rectangle'])
             specs.append(spec)
 
-        if roi_manager.roi_type is not None:
+        unsaved = roi_manager.get_unsaved_rois()
+        for number, roi in enumerate(unsaved, start=1):
             spec = {
-                'name': 'Active ROI',
-                'roi_type': roi_manager.roi_type,
-                'color': config.ROI_COLOR,
+                'name': ('Active ROI' if len(unsaved) == 1
+                         else f'Unsaved ROI {number}'),
+                'roi_type': roi['roi_type'],
+                'color': roi['color'],
             }
-            if roi_manager.roi_type == 'polygon':
-                spec['points'] = np.array(
-                    roi_manager.polygon_points, dtype=float
-                )
+            if roi['roi_type'] == 'polygon':
+                spec['points'] = np.array(roi['points'], dtype=float)
             else:
-                spec['rectangle'] = tuple(roi_manager.rectangle)
+                spec['rectangle'] = tuple(roi['rectangle'])
             specs.append(spec)
         return specs
 
@@ -4359,7 +4450,7 @@ class BiTS4DMainWindow(QMainWindow):
         # ── Multi-class path: one mask per ROI shown on the histogram ─────────
         # This includes the active (unsaved) ROI so the segmented layers always
         # match the selection displayed on the histogram.
-        if roi_manager.has_named_rois():
+        if roi_manager.has_named_rois() or roi_manager.unsaved_count() > 1:
             roi_specs = self._enumerate_roi_specs(roi_manager)
 
             def multi_segment_op(progress_callback):
@@ -4895,8 +4986,10 @@ class BiTS4DMainWindow(QMainWindow):
                 f"{roi['roi_type']} ROI, class id {roi['class_id']}"
                 + ("" if roi.get('visible', True) else "  (hidden)")
             )
-        if roi_manager.roi_type is not None:
-            roi_info["Active ROI"] = f"{roi_manager.roi_type} (unsaved)"
+        unsaved = roi_manager.get_unsaved_rois()
+        for number, roi in enumerate(unsaved, start=1):
+            label = "Active ROI" if len(unsaved) == 1 else f"Unsaved ROI {number}"
+            roi_info[label] = f"{roi['roi_type']} (unsaved)"
 
         settings = {
             "histogram bins": str(self.histogram_engine.bins)
@@ -5293,9 +5386,14 @@ class BiTS4DMainWindow(QMainWindow):
         ]
         roi_manager = self.dual_histogram.get_roi_manager()
         if include_active_roi:
-            active = roi_manager.get_active_vertices()
-            if active is not None:
-                overlays.append(("Active ROI (unsaved)", active, "lime"))
+            unsaved = roi_manager.get_unsaved_rois()
+            for number, roi in enumerate(unsaved, start=1):
+                label = ("Unsaved ROI" if len(unsaved) == 1
+                         else f"Unsaved ROI {number}")
+                overlays.append((
+                    label, roi_manager.target_vertices(roi['target']),
+                    roi['color'],
+                ))
 
         slice_overlays = []
         for entry in viewer.mask_overlays:
@@ -5359,10 +5457,10 @@ class BiTS4DMainWindow(QMainWindow):
         timepoint = self.dataset.current_timepoint
         axis = self.slice_viewer.current_axis
         index = self.slice_viewer.current_slice_index
-        default_name = f"histogram_slice_T{timepoint:03d}_{axis}{index}.png"
+        default_name = f"histogram_slice_T{timepoint:03d}_{axis}{index}.svg"
         path, _filter = QFileDialog.getSaveFileName(
             self, "Save Histogram + Slice Figure", default_name,
-            "PNG image (*.png);;PDF document (*.pdf);;SVG vector (*.svg);;"
+            "SVG vector (*.svg);;PDF document (*.pdf);;PNG image (*.png);;"
             "TIFF image (*.tif *.tiff);;All files (*)",
         )
         if not path:
@@ -5952,9 +6050,11 @@ class BiTS4DMainWindow(QMainWindow):
     def _on_model_segmentation(self):
         """Menu route: show the materials, then run the series."""
         if hasattr(self, "right_tabs") and hasattr(self, "material_panel"):
-            index = self.right_tabs.indexOf(self.material_panel.parentWidget())
-            if index >= 0:
-                self.right_tabs.setCurrentIndex(index)
+            # Tab pages are scroll areas, so look for the page holding it
+            for index in range(self.right_tabs.count()):
+                if self.right_tabs.widget(index).isAncestorOf(self.material_panel):
+                    self.right_tabs.setCurrentIndex(index)
+                    break
         self._refresh_material_panel()
         self._run_material_tracking(preview=False)
 

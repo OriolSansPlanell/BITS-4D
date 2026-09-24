@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QButtonGroup, QDoubleSpinBox, QListWidget, QListWidgetItem,
     QInputDialog, QMessageBox, QGroupBox
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -28,7 +28,16 @@ class HistogramCanvas(FigureCanvas):
     """
     
     roi_updated = pyqtSignal()
-    
+    # The selected ROI changed (clicked, or cleared) — redraw only
+    selection_changed = pyqtSignal()
+    # Backspace/Delete on the selected ROI; the panel decides what that means
+    # (a saved class may have segmentation to ask about)
+    remove_requested = pyqtSignal()
+
+    #: Arrow-key step in histogram bins; Shift moves ten times as far
+    KEY_STEP_BINS = 1
+    KEY_STEP_FAST = 10
+
     def __init__(self, title="Histogram", parent=None):
         self.fig = Figure(figsize=(6, 5))
         self.ax = self.fig.add_subplot(111)
@@ -58,7 +67,13 @@ class HistogramCanvas(FigureCanvas):
         self.mpl_connect('button_press_event', self.on_mouse_press)
         self.mpl_connect('motion_notify_event', self.on_mouse_move)
         self.mpl_connect('button_release_event', self.on_mouse_release)
-        
+        self.mpl_connect('key_press_event', self.on_key_press)
+        # Keep labels inside the canvas when it is resized (small screens)
+        self.mpl_connect('resize_event', self._on_resize)
+
+        # Arrow keys only reach the canvas when it can take keyboard focus
+        self.setFocusPolicy(Qt.StrongFocus)
+
         self._setup_plot()
     
     def _setup_plot(self):
@@ -113,48 +128,63 @@ class HistogramCanvas(FigureCanvas):
             self._colorbar.update_normal(im)
 
         if self.show_roi:
-            if self.roi_manager and self.roi_manager.has_roi():
-                self._draw_roi()
             if self.roi_overlays:
                 self._draw_roi_overlays()
+            if self.roi_manager and self.roi_manager.has_roi():
+                self._draw_roi()
+                self._draw_selection()
 
         self.fig.tight_layout()
         self.draw_idle()
 
+    def _on_resize(self, _event=None):
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+
     def _draw_roi(self):
-        """Draw the current ROI on the plot"""
+        """Draw every unsaved ROI, each in the colour it will have as a class.
+
+        ROIs are drawn *filled* as well as outlined. Matplotlib fills with the
+        same winding rule that decides containment, so the shaded area is
+        exactly the region that will be segmented. With an outline alone, a
+        polygon whose edges cross itself looks like it encloses more than it
+        actually selects.
+        """
         if not self.roi_manager:
             return
+        import matplotlib.colors as mcolors
 
-        # ROIs are drawn *filled* as well as outlined. Matplotlib fills with
-        # the same winding rule that decides containment, so the shaded area
-        # is exactly the region that will be segmented. With an outline alone,
-        # a polygon whose edges cross itself looks like it encloses more than
-        # it actually selects.
-        if self.roi_manager.roi_type == 'polygon':
-            polygon = MplPolygon(
-                self.roi_manager.polygon_points,
+        for roi in self.roi_manager.get_unsaved_rois():
+            vertices = self.roi_manager.target_vertices(roi['target'])
+            if vertices is None:
+                continue
+            red, green, blue, _ = mcolors.to_rgba(roi['color'])
+            self.ax.add_patch(MplPolygon(
+                vertices,
                 closed=True,
                 fill=True,
-                facecolor=(0.0, 1.0, 0.0, 0.18),
-                edgecolor='lime',
-                linewidth=2
-            )
-            self.ax.add_patch(polygon)
+                facecolor=(red, green, blue, 0.18),
+                edgecolor=(red, green, blue, 1.0),
+                linewidth=2,
+            ))
 
-        elif self.roi_manager.roi_type == 'rectangle':
-            x_min, y_min, x_max, y_max = self.roi_manager.rectangle
-            rect = MplRectangle(
-                (x_min, y_min),
-                x_max - x_min,
-                y_max - y_min,
-                fill=True,
-                facecolor=(0.0, 1.0, 0.0, 0.18),
-                edgecolor='lime',
-                linewidth=2
-            )
-            self.ax.add_patch(rect)
-    
+    def _draw_selection(self):
+        """Mark the selected ROI with a heavy black-and-white outline."""
+        if not self.roi_manager:
+            return
+        vertices = self.roi_manager.target_vertices(
+            self.roi_manager.get_selected()
+        )
+        if vertices is None:
+            return
+        for color, width, style in (('white', 4.0, '-'), ('black', 1.6, '--')):
+            self.ax.add_patch(MplPolygon(
+                vertices, closed=True, fill=False,
+                edgecolor=color, linewidth=width, linestyle=style, zorder=20,
+            ))
+
     def set_drawing_mode(self, mode: str):
         """Set ROI drawing mode"""
         self.drawing_mode = mode
@@ -253,8 +283,11 @@ class HistogramCanvas(FigureCanvas):
         return bool(widgetlock is not None and widgetlock.locked())
 
     def on_mouse_press(self, event):
-        """Handle mouse press for ROI drawing"""
-        if event.inaxes != self.ax or not self.drawing_mode:
+        """Place ROI vertices while drawing; otherwise select the ROI clicked."""
+        if event.inaxes != self.ax:
+            return
+        if not self.drawing_mode:
+            self._select_at(event)
             return
         # Only a plain left-click places/starts an ROI; ignore other buttons
         # and any click that belongs to the pan/zoom tools.
@@ -335,8 +368,17 @@ class HistogramCanvas(FigureCanvas):
         if self.drawing_mode == 'rectangle' and self.rect_start:
             x1, y1 = self.rect_start
             x2, y2 = event.xdata, event.ydata
+            if x2 is None or y2 is None or x1 == x2 or y1 == y2:
+                # A click without a drag encloses nothing; keep waiting for
+                # a real rectangle instead of raising.
+                self.rect_start = None
+                self._clear_temp_artists()
+                self.draw_idle()
+                return
 
             if self.roi_manager:
+                # Drawing another ROI keeps the previous unsaved one
+                self.roi_manager.stash_active()
                 self.roi_manager.set_rectangle_roi(
                     min(x1, x2), min(y1, y2),
                     max(x1, x2), max(y1, y2)
@@ -350,12 +392,66 @@ class HistogramCanvas(FigureCanvas):
         """Finalise polygon ROI"""
         if self.drawing_mode == 'polygon' and len(self.polygon_points) >= 3:
             if self.roi_manager:
+                # Drawing another ROI keeps the previous unsaved one
+                self.roi_manager.stash_active()
                 self.roi_manager.set_polygon_roi(np.array(self.polygon_points))
                 self._clear_temp_artists()
                 self.clear_drawing_mode()
                 # roi_updated listeners redraw both canvases
                 self.roi_updated.emit()
     
+    # ── selecting, moving and removing with the keyboard ─────────────────
+
+    def _select_at(self, event):
+        """Select the topmost ROI under a plain left-click (or none)."""
+        if event.button != 1 or self._navigation_active():
+            return
+        if event.xdata is None or event.ydata is None or not self.roi_manager:
+            return
+        if not self.show_roi:
+            return
+        # Grab the keyboard so the arrow keys move what was just picked
+        self.setFocus(Qt.MouseFocusReason)
+        target = self.roi_manager.hit_test(event.xdata, event.ydata)
+        if target == self.roi_manager.get_selected():
+            return
+        self.roi_manager.select(target)
+        self.selection_changed.emit()
+
+    def key_step(self, fast=False):
+        """(dx, dy) moved by one arrow-key press: one histogram bin."""
+        bins = self.KEY_STEP_FAST if fast else self.KEY_STEP_BINS
+        data = self.histogram_data
+        if data is not None and len(data.x_edges) > 1 and len(data.y_edges) > 1:
+            return (bins * float(data.x_edges[1] - data.x_edges[0]),
+                    bins * float(data.y_edges[1] - data.y_edges[0]))
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        return bins * abs(x1 - x0) / 256.0, bins * abs(y1 - y0) / 256.0
+
+    _KEY_DIRECTIONS = {
+        'left': (-1, 0), 'right': (1, 0), 'up': (0, 1), 'down': (0, -1),
+    }
+
+    def on_key_press(self, event):
+        """Arrow keys move the selected ROI; Backspace/Delete remove it."""
+        if not self.roi_manager or not event.key:
+            return
+        target = self.roi_manager.get_selected()
+        if target is None:
+            return
+        key = event.key
+        fast = key.startswith('shift+')
+        if fast:
+            key = key[len('shift+'):]
+        if key in self._KEY_DIRECTIONS:
+            sx, sy = self._KEY_DIRECTIONS[key]
+            dx, dy = self.key_step(fast)
+            if self.roi_manager.translate(target, sx * dx, sy * dy):
+                self.roi_updated.emit()
+        elif key in ('backspace', 'delete'):
+            self.remove_requested.emit()
+
     def set_log_scale(self, use_log: bool):
         """Toggle log scale"""
         self.use_log_scale = use_log
@@ -398,43 +494,62 @@ class DualHistogramWidget(QWidget):
         self.init_ui()
     
     def init_ui(self):
+        from PyQt5.QtWidgets import QSplitter, QSizePolicy
+        from gui.responsive import PlotPanes, flow_row, group
+
         layout = QVBoxLayout()
-        
-        # Histogram displays
-        hist_layout = QHBoxLayout()
-        
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Histogram displays: side by side when there is room, as tabs on a
+        # narrow or short panel (a laptop screen), so neither plot is
+        # squeezed flat.
+        self.plot_panes = PlotPanes()
+
+        def plot_column(title, canvas):
+            column = QWidget()
+            column_layout = QVBoxLayout(column)
+            column_layout.setContentsMargins(0, 0, 0, 0)
+            column_layout.setSpacing(2)
+            heading = QLabel(title)
+            heading.setWordWrap(True)
+            column_layout.addWidget(heading)
+            column_layout.addWidget(canvas, stretch=1)
+            toolbar = NavigationToolbar(canvas, self)
+            toolbar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            toolbar.setIconSize(QSize(16, 16))
+            column_layout.addWidget(toolbar)
+            return column, toolbar, heading
+
         # Global histogram
-        global_layout = QVBoxLayout()
-        global_label = QLabel("<b>Global Histogram (All Timepoints)</b>")
-        global_layout.addWidget(global_label)
-        
         self.global_canvas = HistogramCanvas("Global Histogram")
         self.global_canvas.roi_manager = self.roi_manager
         self.global_canvas.roi_updated.connect(self._on_roi_updated)
-        self.global_canvas.setMinimumSize(400, 300)
-        global_layout.addWidget(self.global_canvas)
-        
-        self.global_toolbar = NavigationToolbar(self.global_canvas, self)
-        global_layout.addWidget(self.global_toolbar)
-        
-        hist_layout.addLayout(global_layout)
-        
+        self.global_canvas.setMinimumSize(200, 200)
+        global_column, self.global_toolbar, heading = plot_column(
+            "<b>Global Histogram (All Timepoints)</b>", self.global_canvas
+        )
+        self.plot_panes.add_pane(global_column, "Global (all timepoints)",
+                                 heading)
+
         # Local histogram
-        local_layout = QVBoxLayout()
-        local_label = QLabel("<b>Local Histogram (Current Timepoint)</b>")
-        local_layout.addWidget(local_label)
-        
         self.local_canvas = HistogramCanvas("Local Histogram")
         self.local_canvas.roi_manager = self.roi_manager
-        self.local_canvas.setMinimumSize(400, 300)
-        local_layout.addWidget(self.local_canvas)
-        
-        self.local_toolbar = NavigationToolbar(self.local_canvas, self)
-        local_layout.addWidget(self.local_toolbar)
-        
-        hist_layout.addLayout(local_layout)
-        
-        layout.addLayout(hist_layout)
+        self.local_canvas.roi_updated.connect(self._on_roi_updated)
+        self.local_canvas.setMinimumSize(200, 200)
+        local_column, self.local_toolbar, heading = plot_column(
+            "<b>Local Histogram (Current Timepoint)</b>", self.local_canvas
+        )
+        self.plot_panes.add_pane(local_column, "Local (this timepoint)",
+                                 heading)
+
+        for canvas in (self.global_canvas, self.local_canvas):
+            canvas.selection_changed.connect(self._on_canvas_selection_changed)
+            canvas.remove_requested.connect(self._remove_selected_roi)
+
+        plots_and_controls = QWidget()
+        plots_layout = QVBoxLayout(plots_and_controls)
+        plots_layout.setContentsMargins(0, 0, 0, 0)
+        plots_layout.addWidget(self.plot_panes, stretch=1)
         
         # Initialize editable ROI handlers
         from utils.editable_roi_handler import EditableROIHandler
@@ -451,11 +566,11 @@ class DualHistogramWidget(QWidget):
             update_callback=self._on_editable_roi_updated
         )
         
-        # Controls
-        controls_layout = QHBoxLayout()
-        
+        # Controls — wrap onto several lines on a narrow panel
+        controls = []
+
         # ROI tools
-        controls_layout.addWidget(QLabel("<b>ROI Tool:</b>"))
+        controls.append(QLabel("<b>ROI Tool:</b>"))
         
         self.roi_button_group = QButtonGroup()
         
@@ -463,84 +578,105 @@ class DualHistogramWidget(QWidget):
         self.polygon_btn.setCheckable(True)
         self.polygon_btn.clicked.connect(self._on_polygon_clicked)
         self.roi_button_group.addButton(self.polygon_btn)
-        controls_layout.addWidget(self.polygon_btn)
+        controls.append(self.polygon_btn)
         
         self.rectangle_btn = QPushButton("▭ Rectangle")
         self.rectangle_btn.setCheckable(True)
         self.rectangle_btn.clicked.connect(self._on_rectangle_clicked)
         self.roi_button_group.addButton(self.rectangle_btn)
-        controls_layout.addWidget(self.rectangle_btn)
+        controls.append(self.rectangle_btn)
         
         self.finalize_btn = QPushButton("✓ Finish Polygon")
         self.finalize_btn.setEnabled(False)
         self.finalize_btn.clicked.connect(self._finalize_polygon)
-        controls_layout.addWidget(self.finalize_btn)
+        controls.append(self.finalize_btn)
 
         self.save_class_btn = QPushButton("➕ Save as Class")
         self.save_class_btn.setEnabled(False)
         self.save_class_btn.setToolTip(
-            "Save the current ROI as a named class for multi-class segmentation.\n"
-            "You can then draw another ROI for the next class.\n"
-            "All saved classes are used together for Random Forest training."
+            "Save every unsaved ROI as a named class — two ROIs drawn make\n"
+            "two classes, each keeping the colour it was drawn in.\n"
+            "You can then draw more ROIs for further classes."
         )
         self.save_class_btn.clicked.connect(self._save_current_as_class)
-        controls_layout.addWidget(self.save_class_btn)
+        controls.append(self.save_class_btn)
 
-        self.clear_roi_btn = QPushButton("Clear Active ROI")
-        self.clear_roi_btn.setToolTip("Clear the current (unsaved) active ROI only.")
+        self.clear_roi_btn = QPushButton("Clear Unsaved")
+        self.clear_roi_btn.setToolTip(
+            "Clear every ROI drawn but not saved. Saved classes are kept.\n"
+            "To remove just one, click it on the histogram and press\n"
+            "Backspace."
+        )
         self.clear_roi_btn.clicked.connect(self.clear_roi)
-        controls_layout.addWidget(self.clear_roi_btn)
-
-        controls_layout.addStretch()
+        controls.append(self.clear_roi_btn)
 
         # Display options
         self.log_scale_cb = QCheckBox("Log scale")
         self.log_scale_cb.stateChanged.connect(self._on_log_scale_changed)
-        controls_layout.addWidget(self.log_scale_cb)
+        display = [self.log_scale_cb]
 
         self.show_roi_cb = QCheckBox("Show ROI")
         self.show_roi_cb.setChecked(True)
         self.show_roi_cb.stateChanged.connect(self._on_show_roi_changed)
-        controls_layout.addWidget(self.show_roi_cb)
+        display.append(self.show_roi_cb)
 
         self.editable_roi_cb = QCheckBox("✏️ Editable ROI")
         self.editable_roi_cb.setChecked(False)
         self.editable_roi_cb.setToolTip("Enable dragging ROI vertices to fine-tune selection")
         self.editable_roi_cb.stateChanged.connect(self._on_editable_roi_changed)
-        controls_layout.addWidget(self.editable_roi_cb)
+        controls.append(self.editable_roi_cb)
 
         # Add dynamic range controls
-        controls_layout.addWidget(QLabel("Range:"))
         self.vmin_spinbox = QDoubleSpinBox()
         self.vmin_spinbox.setRange(0, 1e10)
         self.vmin_spinbox.setValue(0)
         self.vmin_spinbox.setPrefix("Min: ")
+        self.vmin_spinbox.setMaximumWidth(130)
         self.vmin_spinbox.valueChanged.connect(self._update_all_histograms)
-        controls_layout.addWidget(self.vmin_spinbox)
 
         self.vmax_spinbox = QDoubleSpinBox()
         self.vmax_spinbox.setRange(0, 1e10)
         self.vmax_spinbox.setValue(0)
         self.vmax_spinbox.setPrefix("Max: ")
+        self.vmax_spinbox.setMaximumWidth(130)
         self.vmax_spinbox.valueChanged.connect(self._update_all_histograms)
-        controls_layout.addWidget(self.vmax_spinbox)
 
         auto_range_btn = QPushButton("Auto Range")
         auto_range_btn.clicked.connect(self._auto_range)
-        controls_layout.addWidget(auto_range_btn)
+        display.append(group(QLabel("Range:"), self.vmin_spinbox,
+                             self.vmax_spinbox, auto_range_btn))
 
-        layout.addLayout(controls_layout)
+        # Display settings live in a drop-down, so on a short screen the
+        # rows under the plot go to the tools you use while drawing.
+        from PyQt5.QtWidgets import QMenu, QToolButton, QWidgetAction
+        display_panel = QWidget()
+        display_layout = QVBoxLayout(display_panel)
+        display_layout.setContentsMargins(8, 6, 8, 6)
+        for widget in display:
+            display_layout.addWidget(widget)
+        display_menu = QMenu(self)
+        display_action = QWidgetAction(display_menu)
+        display_action.setDefaultWidget(display_panel)
+        display_menu.addAction(display_action)
+        self.display_btn = QToolButton()
+        self.display_btn.setText("Display ▾")
+        self.display_btn.setToolTip("Log scale, ROI visibility and colour range")
+        self.display_btn.setPopupMode(QToolButton.InstantPopup)
+        self.display_btn.setMenu(display_menu)
+        controls.append(self.display_btn)
+
+        plots_layout.addWidget(flow_row(*controls))
 
         # ── Selection panel: manage the histogram selections ──────────────────
         roi_list_group = QGroupBox(
-            "Histogram Selections  (classes for multi-class RF training)"
+            "Histogram Selections  (classes)"
         )
         roi_list_layout = QVBoxLayout()
         roi_list_layout.setContentsMargins(4, 4, 4, 4)
         roi_list_layout.setSpacing(3)
 
         self.roi_list_widget = QListWidget()
-        self.roi_list_widget.setMinimumHeight(110)
+        self.roi_list_widget.setMinimumHeight(60)
         self.roi_list_widget.setToolTip(
             "Every saved selection (class) drawn on the histogram.\n\n"
             "• Untick a row to hide it — hidden selections are not drawn\n"
@@ -548,16 +684,22 @@ class DualHistogramWidget(QWidget):
             "• 'Edit' moves a selection back to the active ROI so you can\n"
             "  reshape it, then save it as a class again.\n"
             "• Double-click a row to rename it.\n"
-            "• 'Remove' deletes the highlighted selection."
+            "• 'Remove' deletes the highlighted selection.\n\n"
+            "On the histogram: click a selection to pick it, move it with\n"
+            "the arrow keys (Shift for bigger steps), remove it with\n"
+            "Backspace."
         )
         self.roi_list_widget.itemDoubleClicked.connect(self._rename_roi_item)
         self.roi_list_widget.itemChanged.connect(self._on_roi_item_changed)
         self.roi_list_widget.currentRowChanged.connect(
             self._update_selection_buttons
         )
+        self.roi_list_widget.currentRowChanged.connect(
+            self._on_list_row_changed
+        )
         roi_list_layout.addWidget(self.roi_list_widget)
 
-        roi_list_btns = QHBoxLayout()
+        roi_list_btns = []
         self.edit_class_btn = QPushButton("✏️ Edit")
         self.edit_class_btn.setEnabled(False)
         self.edit_class_btn.setToolTip(
@@ -565,28 +707,25 @@ class DualHistogramWidget(QWidget):
             "reshape or re-segment it. Save it as a class again when done."
         )
         self.edit_class_btn.clicked.connect(self._edit_selected_class)
-        roi_list_btns.addWidget(self.edit_class_btn)
+        roi_list_btns.append(self.edit_class_btn)
 
         self.remove_class_btn = QPushButton("🗑 Remove")
         self.remove_class_btn.setEnabled(False)
         self.remove_class_btn.setToolTip("Delete the highlighted selection.")
         self.remove_class_btn.clicked.connect(self._remove_selected_class)
-        roi_list_btns.addWidget(self.remove_class_btn)
+        roi_list_btns.append(self.remove_class_btn)
 
         self.clear_all_classes_btn = QPushButton("🗑 Clear All")
         self.clear_all_classes_btn.setEnabled(False)
         self.clear_all_classes_btn.setToolTip("Delete every saved selection.")
         self.clear_all_classes_btn.clicked.connect(self._clear_all_classes)
-        roi_list_btns.addWidget(self.clear_all_classes_btn)
-        roi_list_layout.addLayout(roi_list_btns)
-
-        vis_btns = QHBoxLayout()
+        roi_list_btns.append(self.clear_all_classes_btn)
         self.show_all_classes_btn = QPushButton("👁 Show All")
         self.show_all_classes_btn.setEnabled(False)
         self.show_all_classes_btn.clicked.connect(
             lambda: self._set_all_classes_visible(True)
         )
-        vis_btns.addWidget(self.show_all_classes_btn)
+        roi_list_btns.append(self.show_all_classes_btn)
 
         self.hide_all_classes_btn = QPushButton("🚫 Hide All")
         self.hide_all_classes_btn.setEnabled(False)
@@ -597,7 +736,7 @@ class DualHistogramWidget(QWidget):
         self.hide_all_classes_btn.clicked.connect(
             lambda: self._set_all_classes_visible(False)
         )
-        vis_btns.addWidget(self.hide_all_classes_btn)
+        roi_list_btns.append(self.hide_all_classes_btn)
 
         self.only_selected_btn = QPushButton("🎯 Only This")
         self.only_selected_btn.setEnabled(False)
@@ -606,12 +745,21 @@ class DualHistogramWidget(QWidget):
             "segmentation works with that one alone."
         )
         self.only_selected_btn.clicked.connect(self._isolate_selected_class)
-        vis_btns.addWidget(self.only_selected_btn)
-        roi_list_layout.addLayout(vis_btns)
+        roi_list_btns.append(self.only_selected_btn)
+        roi_list_layout.addWidget(flow_row(*roi_list_btns))
 
         roi_list_group.setLayout(roi_list_layout)
-        layout.addWidget(roi_list_group)
         # ── End selection panel ───────────────────────────────────────────────
+
+        # Plots above, class list below; the divider can be dragged, which
+        # matters on a short (laptop) screen.
+        self.panel_splitter = QSplitter(Qt.Vertical)
+        self.panel_splitter.setChildrenCollapsible(False)
+        self.panel_splitter.addWidget(plots_and_controls)
+        self.panel_splitter.addWidget(roi_list_group)
+        self.panel_splitter.setStretchFactor(0, 4)
+        self.panel_splitter.setStretchFactor(1, 1)
+        layout.addWidget(self.panel_splitter)
 
         self.setLayout(layout)
     
@@ -645,7 +793,7 @@ class DualHistogramWidget(QWidget):
         self.polygon_btn.setChecked(False)
         self.finalize_btn.setEnabled(False)
         # Enable saving as a named class now that the polygon is closed
-        self.save_class_btn.setEnabled(self.roi_manager.roi_type is not None)
+        self.save_class_btn.setEnabled(self.roi_manager.unsaved_count() > 0)
 
         # A crossing outline selects less than it appears to, so say so
         # rather than letting the segmentation quietly come out wrong.
@@ -662,7 +810,7 @@ class DualHistogramWidget(QWidget):
                 )
 
     def clear_roi(self):
-        """Clear the current active (unsaved) ROI only. Named class ROIs are kept."""
+        """Clear every unsaved ROI. Saved classes are kept."""
         if self.editable_roi_cb.isChecked():
             self.editable_roi_cb.setChecked(False)
         self.roi_manager.clear_roi()
@@ -673,45 +821,52 @@ class DualHistogramWidget(QWidget):
     # ── Named / multi-class ROI management ───────────────────────────────────
 
     def _save_current_as_class(self):
-        """Prompt the user for a name and save the active ROI to the named list."""
-        if not self.roi_manager.roi_type:
+        """Save every unsaved ROI as its own named class.
+
+        With two ROIs drawn, two classes are made — one name is asked for
+        each, and each keeps the colour it was drawn in.
+        """
+        unsaved = self.roi_manager.get_unsaved_rois()
+        if not unsaved:
             QMessageBox.warning(self, "No ROI",
                                 "Draw and finish an ROI before saving it as a class.")
             return
 
-        # A class pulled back with 'Edit' keeps its identity by default
+        # A class pulled back with 'Edit' is the active ROI (the last one)
+        # and keeps its identity by default.
         editing = self._editing_class
-        if editing is not None:
-            default_name = editing['name']
-        else:
-            default_name = f"Class {len(self.roi_manager.named_rois) + 1}"
-
-        name, ok = QInputDialog.getText(
-            self, "Name this class",
-            "Enter a label for this ROI (e.g. 'Lithium', 'Electrolyte'):",
-            text=default_name
-        )
-        if not ok or not name.strip():
-            return
-        name = name.strip()
-
-        if editing is not None:
-            self.roi_manager.add_named_roi(
-                name, class_id=editing['class_id'], color=editing['color']
+        names, colors, class_ids = [], [], []
+        next_number = len(self.roi_manager.named_rois) + 1
+        for position, roi in enumerate(unsaved):
+            is_edited = editing is not None and roi['target'] == ('active', 0)
+            if is_edited:
+                default_name = editing['name']
+            else:
+                default_name = f"Class {next_number}"
+                next_number += 1
+            prompt = "Enter a label for this ROI (e.g. 'Lithium', 'Electrolyte'):"
+            if len(unsaved) > 1:
+                prompt = (f"ROI {position + 1} of {len(unsaved)} "
+                          f"(drawn in {roi['color']}).\n" + prompt)
+            name, ok = QInputDialog.getText(
+                self, "Name this class", prompt, text=default_name
             )
-            self._editing_class = None
-        else:
-            self.roi_manager.add_named_roi(name)
+            if not ok or not name.strip():
+                # Nothing is saved unless every ROI got a name
+                return
+            names.append(name.strip())
+            colors.append(editing['color'] if is_edited else roi['color'])
+            class_ids.append(editing['class_id'] if is_edited else None)
 
-        # Clear the active ROI so the canvas is ready for the next one
-        self.roi_manager.clear_roi()
+        self.roi_manager.save_unsaved_as_classes(names, colors, class_ids)
+        self._editing_class = None
         self.save_class_btn.setEnabled(False)
 
         self._update_roi_list()
         self._apply_roi_change()
 
     def _update_roi_list(self):
-        """Rebuild the QListWidget from roi_manager.named_rois."""
+        """Rebuild the QListWidget: saved classes, then every unsaved ROI."""
         # Repopulating fires itemChanged for every row; ignore those so the
         # rebuild cannot be mistaken for the user toggling visibility.
         previous_row = self.roi_list_widget.currentRow()
@@ -726,38 +881,61 @@ class DualHistogramWidget(QWidget):
             self._style_roi_item(item, roi)
             self.roi_list_widget.addItem(item)
 
-        # The ROI currently drawn but not yet saved is listed too, so every
-        # selection is visible in one place. It has no class id or visibility
-        # toggle until it is saved.
-        if self.roi_manager.roi_type is not None:
+        # ROIs drawn but not yet saved are listed too, so every selection is
+        # visible in one place. They have no class id or visibility toggle
+        # until they are saved.
+        for roi in self.roi_manager.get_unsaved_rois():
             item = QListWidgetItem(
-                f"✎ (unsaved selection)  [{self.roi_manager.roi_type}]"
+                f"✎ (unsaved selection)  [{roi['roi_type']}]"
             )
             item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
             font = item.font()
             font.setItalic(True)
             item.setFont(font)
+            color = QColor(roi['color'])
+            color.setAlpha(45)
+            item.setBackground(color)
             item.setToolTip(
-                "The selection you are drawing or editing.\n"
-                "Click 'Save as Class' (or double-click this row) to keep it\n"
-                "as a named class for Random Forest training."
+                "A selection you have drawn but not saved.\n"
+                "Click 'Save as Class' (or double-click this row) to keep\n"
+                "every unsaved selection, each as its own class."
             )
             self.roi_list_widget.addItem(item)
 
+        # Keep the row of the ROI selected on the histogram; rows shift when
+        # ROIs are added or saved, so a bare row number could point elsewhere.
+        row = self._row_for_target(self.roi_manager.get_selected())
+        if row < 0 and 0 <= previous_row < self.roi_list_widget.count():
+            row = previous_row
+        self.roi_list_widget.setCurrentRow(row)
         self.roi_list_widget.blockSignals(False)
-
-        if 0 <= previous_row < self.roi_list_widget.count():
-            self.roi_list_widget.setCurrentRow(previous_row)
         self._update_selection_buttons()
 
     def _named_count(self) -> int:
-        """Number of saved class rows (the unsaved row, if any, comes after)."""
+        """Number of saved class rows (the unsaved rows come after)."""
         return len(self.roi_manager.named_rois)
 
+    def _unsaved_target_for_row(self, row: int):
+        """The unsaved ROI a list row shows, or None for a class row."""
+        index = row - self._named_count()
+        unsaved = self.roi_manager.get_unsaved_rois()
+        if 0 <= index < len(unsaved):
+            return unsaved[index]['target']
+        return None
+
+    def _row_for_target(self, target):
+        if target is None:
+            return -1
+        if target[0] == 'named':
+            return target[1]
+        for offset, roi in enumerate(self.roi_manager.get_unsaved_rois()):
+            if roi['target'] == target:
+                return self._named_count() + offset
+        return -1
+
     def _is_active_row(self, row: int) -> bool:
-        """True when *row* is the unsaved active-selection row."""
-        return (self.roi_manager.roi_type is not None
-                and row == self._named_count())
+        """True when *row* shows an unsaved selection."""
+        return self._unsaved_target_for_row(row) is not None
 
     @staticmethod
     def _style_roi_item(item, roi):
@@ -781,12 +959,42 @@ class DualHistogramWidget(QWidget):
         self.clear_all_classes_btn.setEnabled(named > 0)
         self.show_all_classes_btn.setEnabled(named > 0)
         self.hide_all_classes_btn.setEnabled(named > 0)
-        # Remove works on a saved class or on the unsaved selection
+        # Remove works on a saved class or on an unsaved selection
         self.remove_class_btn.setEnabled(on_named or on_active)
-        # The unsaved selection is already the one being edited
+        # An unsaved selection is already editable
         self.edit_class_btn.setEnabled(on_named)
         self.only_selected_btn.setEnabled(on_named or on_active)
-        self.save_class_btn.setEnabled(self.roi_manager.roi_type is not None)
+        self.save_class_btn.setEnabled(self.roi_manager.unsaved_count() > 0)
+
+    def _on_list_row_changed(self, row):
+        """Picking a row selects that ROI on the histograms too."""
+        target = (('named', row) if 0 <= row < self._named_count()
+                  else self._unsaved_target_for_row(row))
+        if target != self.roi_manager.get_selected():
+            self.roi_manager.select(target)
+            self.global_canvas.update_plot()
+            self.local_canvas.update_plot()
+
+    def _on_canvas_selection_changed(self):
+        """An ROI was clicked on a histogram: show it on both, and in the list."""
+        row = self._row_for_target(self.roi_manager.get_selected())
+        self.roi_list_widget.blockSignals(True)
+        self.roi_list_widget.setCurrentRow(row)
+        self.roi_list_widget.blockSignals(False)
+        self._update_selection_buttons()
+        self.global_canvas.update_plot()
+        self.local_canvas.update_plot()
+
+    def _remove_selected_roi(self):
+        """Backspace/Delete on a histogram: remove the selected ROI."""
+        target = self.roi_manager.get_selected()
+        if target is None:
+            return
+        row = self._row_for_target(target)
+        if row < 0:
+            return
+        self.roi_list_widget.setCurrentRow(row)
+        self._remove_selected_class()
 
     def _refresh_named_roi_overlays(self):
         """Push the visible class ROIs to both canvases as coloured overlays."""
@@ -848,21 +1056,14 @@ class DualHistogramWidget(QWidget):
         self._apply_roi_change()
 
     def _edit_selected_class(self):
-        """Move the highlighted class back into the active ROI for editing."""
+        """Move the highlighted class back into the active ROI for editing.
+
+        Anything already drawn stays as an unsaved selection, so nothing is
+        lost; saving afterwards turns every unsaved selection into a class.
+        """
         row = self.roi_list_widget.currentRow()
         if not 0 <= row < self._named_count():
             return
-
-        if self.roi_manager.roi_type is not None:
-            reply = QMessageBox.question(
-                self, "Replace Active ROI",
-                "There is already an active ROI being drawn.\n\n"
-                "Editing this class will discard it. Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
 
         entry = self.roi_manager.take_named_roi(row)
         # Remember its identity so saving it again restores name/class/colour
@@ -885,9 +1086,14 @@ class DualHistogramWidget(QWidget):
         """Remove the highlighted selection — a saved class or the unsaved one."""
         row = self.roi_list_widget.currentRow()
 
-        if self._is_active_row(row):
-            # Discard the ROI being drawn; saved classes are untouched
-            self.clear_roi()
+        unsaved_target = self._unsaved_target_for_row(row)
+        if unsaved_target is not None:
+            # Discard that one unsaved selection; everything else stays
+            if unsaved_target == ('active', 0) and self._editing_class:
+                self._editing_class = None
+            self.roi_manager.remove_unsaved(unsaved_target)
+            self._update_roi_list()
+            self._apply_roi_change()
             return
 
         if not 0 <= row < self._named_count():
@@ -1010,8 +1216,8 @@ class DualHistogramWidget(QWidget):
         self._refresh_named_roi_overlays()
         self.global_canvas.update_plot()
         self.local_canvas.update_plot()
-        # Enable 'Save as Class' whenever a complete active ROI exists
-        self.save_class_btn.setEnabled(self.roi_manager.roi_type is not None)
+        # Enable 'Save as Class' whenever an unsaved ROI exists
+        self.save_class_btn.setEnabled(self.roi_manager.unsaved_count() > 0)
         self.roi_updated.emit()
     
     def _on_log_scale_changed(self, state):

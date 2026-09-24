@@ -87,10 +87,22 @@ def test_saves_in_the_requested_format(tmp_path, suffix):
     assert path.stat().st_size > 0
 
 
-def test_unknown_extension_falls_back_to_png(tmp_path):
+def test_unknown_extension_falls_back_to_svg(tmp_path):
     hist_panel, slice_panel = _panels()
     path = save_histogram_slice_figure(
         tmp_path / "figure", hist_panel, slice_panel, dpi=72
     )
-    assert path.name == "figure.png"
+    assert path.name == "figure.svg"
     assert path.exists()
+
+
+def test_svg_keeps_text_as_text(tmp_path):
+    """Labels must stay editable text in the SVG, not glyph outlines."""
+    hist_panel, slice_panel = _panels()
+    path = save_histogram_slice_figure(
+        tmp_path / "figure.svg", hist_panel, slice_panel, dpi=72
+    )
+    svg = path.read_text()
+    assert svg.lstrip().startswith("<?xml")
+    assert "Class 1: Lithium" in svg
+    assert "Neutron intensity" in svg

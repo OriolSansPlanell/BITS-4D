@@ -2,8 +2,9 @@
 roi_manager.py - Region of Interest management
 
 Handles polygon and rectangular ROIs for histogram-based segmentation.
-Supports both a single "active" ROI (for classic segmentation) and a list
-of named class ROIs (for multi-class Random Forest training).
+Supports the ROIs being drawn (not yet saved; several may coexist) and a
+list of named class ROIs. One ROI at a time can be *selected*, to be moved
+with the arrow keys or removed.
 """
 
 import numpy as np
@@ -68,13 +69,16 @@ class ROIManager:
     Manages Region of Interest (ROI) for segmentation.
 
     Two layers:
-      • Single active ROI  – the ROI currently drawn on the histogram,
-        used by the classic segmentation engine (``is_inside_roi``).
-      • Named ROI list     – a list of {name, class_id, roi_type,
-        points/rectangle, color} dicts used for multi-class RF training.
+      • Unsaved ROIs – drawn on the histogram but not yet named. The most
+        recent one is the *active* ROI (``roi_type``/``polygon_points``/
+        ``rectangle``, the one editing works on); earlier ones wait in
+        ``pending_rois``. Drawing a new ROI keeps the previous one, and
+        saving turns every unsaved ROI into its own class.
+      • Named ROI list – a list of {name, class_id, roi_type,
+        points/rectangle, color} dicts, one per class.
 
     ``is_inside_roi()`` returns the union of **every** defined ROI —
-    all named class ROIs plus the active one.  This guarantees that the
+    all named class ROIs plus every unsaved one.  This guarantees that the
     region highlighted on the histogram is exactly the region that
     segmentation selects (a previous version silently ignored the active
     ROI once named ROIs existed, so the displayed selection and the
@@ -91,9 +95,16 @@ class ROIManager:
         self.rectangle: Optional[Tuple[float, float, float, float]] = None
         self.roi_type: Optional[str] = None  # 'polygon' | 'rectangle'
 
+        # --- earlier unsaved ROIs, oldest first ---
+        self.pending_rois: List[dict] = []
+
         # --- named multi-class ROI list ---
         self.named_rois: List[dict] = []
         self._next_class_id: int = 1
+
+        # --- the ROI picked on the histogram: ('named' | 'pending' |
+        #     'active', index), or None ---
+        self.selected: Optional[Tuple[str, int]] = None
 
     # ─────────────────────────── single active ROI ───────────────────────────
 
@@ -134,7 +145,8 @@ class ROIManager:
         Hidden classes do not count: they are neither drawn nor segmented,
         so with everything hidden and no active ROI there is nothing to do.
         """
-        return self.roi_type is not None or len(self.get_visible_named_rois()) > 0
+        return (self.roi_type is not None or bool(self.pending_rois)
+                or len(self.get_visible_named_rois()) > 0)
 
     def is_inside_roi(self, neutron_values: np.ndarray,
                       xray_values: np.ndarray) -> np.ndarray:
@@ -150,6 +162,8 @@ class ROIManager:
 
         result = np.zeros(neutron_values.shape, dtype=bool)
         for roi in self.get_visible_named_rois():
+            result |= self._mask_for_named_roi(roi, neutron_values, xray_values)
+        for roi in self.pending_rois:
             result |= self._mask_for_named_roi(roi, neutron_values, xray_values)
         if self.roi_type == 'polygon':
             result |= self._polygon_mask(
@@ -217,10 +231,195 @@ class ROIManager:
         return 0.0
 
     def clear_roi(self) -> None:
-        """Clear the single active ROI (named ROIs are unaffected)."""
+        """Clear every unsaved ROI (named ROIs are unaffected)."""
+        self.pending_rois = []
+        self._clear_active()
+        if self.selected is not None and self.selected[0] != 'named':
+            self.selected = None
+
+    def _clear_active(self) -> None:
         self.polygon_points = None
         self.rectangle = None
         self.roi_type = None
+
+    # ─────────────────────────── several unsaved ROIs ────────────────────────
+
+    def _active_entry(self) -> Optional[dict]:
+        """The active ROI as an independent ``{roi_type, points|rectangle}``."""
+        if self.roi_type == 'polygon':
+            return {'roi_type': 'polygon',
+                    'points': np.array(self.polygon_points, dtype=float)}
+        if self.roi_type == 'rectangle':
+            return {'roi_type': 'rectangle',
+                    'rectangle': tuple(float(v) for v in self.rectangle)}
+        return None
+
+    def stash_active(self) -> None:
+        """Keep the active ROI as an unsaved ROI and free the active slot.
+
+        Called before a newly drawn ROI becomes active, so drawing a second
+        ROI adds to the first instead of silently replacing it.
+        """
+        entry = self._active_entry()
+        if entry is None:
+            return
+        self.pending_rois.append(entry)
+        self._clear_active()
+        if self.selected == ('active', 0):
+            self.selected = ('pending', len(self.pending_rois) - 1)
+
+    def unsaved_count(self) -> int:
+        return len(self.pending_rois) + (1 if self.roi_type is not None else 0)
+
+    def unsaved_colors(self) -> List[str]:
+        """Colour of each unsaved ROI: the colour it will have as a class."""
+        start = self._next_class_id - 1
+        return [_class_color(start + k) for k in range(self.unsaved_count())]
+
+    def get_unsaved_rois(self) -> List[dict]:
+        """Every unsaved ROI, oldest first (the active one last).
+
+        Each entry is a copy with ``roi_type``, ``points`` or ``rectangle``,
+        ``color`` and ``target`` (the key used to select it).
+        """
+        entries = [dict(roi, target=('pending', index))
+                   for index, roi in enumerate(self.pending_rois)]
+        active = self._active_entry()
+        if active is not None:
+            entries.append(dict(active, target=('active', 0)))
+        for entry, color in zip(entries, self.unsaved_colors()):
+            entry['color'] = color
+        return entries
+
+    def save_unsaved_as_classes(self, names, colors=None,
+                                class_ids=None) -> List[int]:
+        """Turn every unsaved ROI into its own named class, in order.
+
+        *names* (and optional *colors* / *class_ids*, None entries meaning
+        "assign automatically") must have one entry per unsaved ROI.
+        Returns the class ids assigned.
+        """
+        unsaved = self.get_unsaved_rois()
+        names = list(names)
+        if len(names) != len(unsaved):
+            raise ValueError(
+                f"{len(unsaved)} unsaved ROI(s) but {len(names)} name(s)"
+            )
+        colors = list(colors) if colors is not None else [None] * len(names)
+        class_ids = (list(class_ids) if class_ids is not None
+                     else [None] * len(names))
+        assigned = []
+        for roi, name, color, class_id in zip(unsaved, names, colors,
+                                              class_ids):
+            assigned.append(self._append_named(
+                name, roi, class_id=class_id, color=color or roi['color']
+            ))
+        self.clear_roi()
+        return assigned
+
+    # ─────────────────────────── selection & moving ──────────────────────────
+
+    def roi_targets(self) -> List[Tuple[str, int]]:
+        """Every selectable ROI, bottom (drawn first) to top."""
+        targets = [('named', index) for index, roi in enumerate(self.named_rois)
+                   if roi.get('visible', True)]
+        targets += [('pending', index) for index in range(len(self.pending_rois))]
+        if self.roi_type is not None:
+            targets.append(('active', 0))
+        return targets
+
+    def _entry_for(self, target) -> Optional[dict]:
+        kind, index = target
+        if kind == 'named' and 0 <= index < len(self.named_rois):
+            return self.named_rois[index]
+        if kind == 'pending' and 0 <= index < len(self.pending_rois):
+            return self.pending_rois[index]
+        return None
+
+    def target_vertices(self, target) -> Optional[np.ndarray]:
+        """Outline (Nx2) of one selectable ROI, or None if it does not exist."""
+        if target is None:
+            return None
+        if target == ('active', 0):
+            return self.get_active_vertices()
+        entry = self._entry_for(target)
+        if entry is None:
+            return None
+        if entry['roi_type'] == 'polygon':
+            return np.array(entry['points'], dtype=float)
+        x_min, y_min, x_max, y_max = entry['rectangle']
+        return np.array([[x_min, y_min], [x_max, y_min],
+                         [x_max, y_max], [x_min, y_max]], dtype=float)
+
+    def hit_test(self, x: float, y: float) -> Optional[Tuple[str, int]]:
+        """The topmost ROI containing the point (x, y), or None."""
+        for target in reversed(self.roi_targets()):
+            vertices = self.target_vertices(target)
+            if vertices is not None and len(vertices) >= 3 and \
+                    Path(vertices).contains_point((x, y)):
+                return target
+        return None
+
+    def get_selected(self) -> Optional[Tuple[str, int]]:
+        """The selected ROI, or None when nothing (valid) is selected."""
+        if self.selected is None:
+            return None
+        if self.target_vertices(self.selected) is None:
+            self.selected = None
+        elif (self.selected[0] == 'named'
+              and not self.named_rois[self.selected[1]].get('visible', True)):
+            self.selected = None
+        return self.selected
+
+    def select(self, target) -> None:
+        self.selected = target if self.target_vertices(target) is not None \
+            else None
+
+    def translate(self, target, dx: float, dy: float) -> bool:
+        """Move one ROI by (dx, dy) in histogram coordinates."""
+        if target == ('active', 0):
+            if self.roi_type == 'polygon':
+                self.polygon_points = self.polygon_points + [dx, dy]
+            elif self.roi_type == 'rectangle':
+                x_min, y_min, x_max, y_max = self.rectangle
+                self.rectangle = (x_min + dx, y_min + dy,
+                                  x_max + dx, y_max + dy)
+            else:
+                return False
+            return True
+        entry = self._entry_for(target)
+        if entry is None:
+            return False
+        if entry['roi_type'] == 'polygon':
+            entry['points'] = np.asarray(entry['points'], dtype=float) + [dx, dy]
+        else:
+            x_min, y_min, x_max, y_max = entry['rectangle']
+            entry['rectangle'] = (x_min + dx, y_min + dy,
+                                  x_max + dx, y_max + dy)
+        return True
+
+    def remove_unsaved(self, target) -> bool:
+        """Delete one unsaved ROI. Named classes go through remove_named_roi."""
+        if target == ('active', 0) and self.roi_type is not None:
+            self._clear_active()
+            # The newest pending ROI becomes the active one again, so the
+            # active slot (which editing works on) stays filled.
+            if self.pending_rois:
+                entry = self.pending_rois.pop()
+                self._set_active_from(entry)
+        elif target is not None and target[0] == 'pending' and \
+                0 <= target[1] < len(self.pending_rois):
+            del self.pending_rois[target[1]]
+        else:
+            return False
+        self.selected = None
+        return True
+
+    def _set_active_from(self, entry: dict) -> None:
+        if entry['roi_type'] == 'polygon':
+            self.set_polygon_roi(np.asarray(entry['points']))
+        else:
+            self.set_rectangle_roi(*entry['rectangle'])
 
     # ──────────────────────────── named ROI list ─────────────────────────────
 
@@ -237,9 +436,15 @@ class ROIManager:
 
         Returns the assigned class_id.
         """
-        if self.roi_type is None:
+        entry = self._active_entry()
+        if entry is None:
             raise ValueError("No active ROI to save as named class.")
+        return self._append_named(name, entry, class_id=class_id, color=color)
 
+    def _append_named(self, name: str, roi: dict,
+                      class_id: Optional[int] = None,
+                      color: Optional[str] = None) -> int:
+        """Add *roi* (``roi_type`` + geometry) to the class list."""
         if class_id is None:
             class_id = self._next_class_id
         self._next_class_id = max(self._next_class_id, class_id) + 1
@@ -250,14 +455,14 @@ class ROIManager:
         entry: dict = {
             'name': name,
             'class_id': class_id,
-            'roi_type': self.roi_type,
+            'roi_type': roi['roi_type'],
             'color': color,
             'visible': True,
         }
-        if self.roi_type == 'polygon':
-            entry['points'] = self.polygon_points.copy()
+        if roi['roi_type'] == 'polygon':
+            entry['points'] = np.array(roi['points'], dtype=float)
         else:
-            entry['rectangle'] = self.rectangle
+            entry['rectangle'] = tuple(roi['rectangle'])
 
         self.named_rois.append(entry)
         return class_id
@@ -266,11 +471,14 @@ class ROIManager:
         """Remove named ROI at position *index* in the list."""
         if 0 <= index < len(self.named_rois):
             del self.named_rois[index]
+            self.selected = None
 
     def clear_named_rois(self) -> None:
         """Remove all named ROIs and reset the class counter."""
         self.named_rois.clear()
         self._next_class_id = 1
+        if self.selected is not None and self.selected[0] == 'named':
+            self.selected = None
 
     def has_named_rois(self) -> bool:
         return len(self.named_rois) > 0
@@ -303,11 +511,11 @@ class ROIManager:
         if not 0 <= index < len(self.named_rois):
             raise IndexError(f"No named ROI at index {index}")
 
+        # Keep whatever was being drawn: it stays as an unsaved ROI
+        self.stash_active()
         entry = self.named_rois.pop(index)
-        if entry['roi_type'] == 'polygon':
-            self.set_polygon_roi(np.asarray(entry['points']))
-        else:
-            self.set_rectangle_roi(*entry['rectangle'])
+        self._set_active_from(entry)
+        self.selected = ('active', 0)
         return entry
 
     def _mask_for_named_roi(self, roi: dict,
@@ -346,11 +554,12 @@ class ROIManager:
         for roi in visible:
             mask = self._mask_for_named_roi(roi, neutron_vol, xray_vol)
             labels[mask] = roi['class_id']
+        next_class = max(r['class_id'] for r in visible) + 1 if visible else 1
+        for roi in self.pending_rois:
+            labels[self._mask_for_named_roi(roi, neutron_vol, xray_vol)] = next_class
+            next_class += 1
         if self.roi_type is not None:
-            active_class = (
-                max(r['class_id'] for r in visible) + 1 if visible else 1
-            )
-            labels[self._mask_for_active_roi(neutron_vol, xray_vol)] = active_class
+            labels[self._mask_for_active_roi(neutron_vol, xray_vol)] = next_class
 
         return labels
 
@@ -391,6 +600,14 @@ class ROIManager:
         else:
             data['active'] = {'type': None}
 
+        # Earlier unsaved ROIs
+        data['pending'] = [
+            {'type': 'polygon', 'points': np.asarray(roi['points']).tolist()}
+            if roi['roi_type'] == 'polygon'
+            else {'type': 'rectangle', 'bounds': list(roi['rectangle'])}
+            for roi in self.pending_rois
+        ]
+
         # Named ROIs
         named = []
         for roi in self.named_rois:
@@ -424,7 +641,21 @@ class ROIManager:
         elif roi_type == 'rectangle':
             self.set_rectangle_roi(*active['bounds'])
         else:
-            self.clear_roi()
+            self._clear_active()
+
+        self.pending_rois = []
+        for roi in data.get('pending', []):
+            if roi.get('type') == 'polygon':
+                self.pending_rois.append({
+                    'roi_type': 'polygon',
+                    'points': np.array(roi['points'], dtype=float),
+                })
+            elif roi.get('type') == 'rectangle':
+                self.pending_rois.append({
+                    'roi_type': 'rectangle',
+                    'rectangle': tuple(roi['bounds']),
+                })
+        self.selected = None
 
         self.named_rois.clear()
         for entry in data.get('named_rois', []):
@@ -450,6 +681,8 @@ class ROIManager:
         parts = []
         if self.roi_type:
             parts.append(f"active={self.roi_type}")
+        if self.pending_rois:
+            parts.append(f"unsaved={len(self.pending_rois) + bool(self.roi_type)}")
         if self.named_rois:
             parts.append(f"named={len(self.named_rois)}")
         return f"ROIManager({', '.join(parts) or 'empty'})"
