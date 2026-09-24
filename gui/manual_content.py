@@ -314,6 +314,23 @@ and which outputs:</p>
 <p>Files are named after your materials — <code>Lithium</code>, not
 <code>Class 1</code>.</p>
 
+<h2>Histogram + slice figure</h2>
+<p><i>File → Export Histogram + Slice Figure</i> (Ctrl+Shift+F) saves one
+image of what is on screen:</p>
+<ul>
+<li><b>Left</b> — the histogram of the current timepoint, with the same
+    scale and range as on screen, and every material's selection drawn on
+    top of it.</li>
+<li><b>Right</b> — the slice currently displayed, with the same materials
+    highlighted in the same colours. The legend gives each material's share
+    of that slice.</li>
+</ul>
+<p>Choose the timepoint, plane and slice before exporting, and untick any
+material you want left out — hidden materials are left out of both panels.
+You can also include the selection you are still drawing, set the resolution,
+and turn the legends and the outlines around the highlights on or off. Save
+as PNG or TIFF for images, PDF or SVG for figures you will edit.</p>
+
 <h2>Quality metrics</h2>
 <p><i>Analytics → Histogram Time Analysis</i>:</p>
 <ul>
@@ -856,7 +873,8 @@ SECTIONS: List[Dict[str, str]] = [
      "keywords": "partial volume fraction interface boundary alloy"},
     {"id": "export", "group": "How to", "title": "Exporting and measuring",
      "body": _EXPORT,
-     "keywords": "save tiff csv label map report metrics"},
+     "keywords": "save tiff csv label map report metrics figure image png pdf "
+                 "svg histogram slice side by side"},
     {"id": "trouble", "group": "How to", "title": "If something looks wrong",
      "body": _TROUBLE,
      "keywords": "problem troubleshoot speckle vanished slow jump"},

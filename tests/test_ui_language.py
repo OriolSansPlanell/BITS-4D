@@ -147,13 +147,28 @@ def test_smoothing_strength_is_described_in_words_not_numbers():
 
 # ── the manual is the exception, and has to earn it ──────────────────────────
 
+def _manual_content():
+    """Load gui/manual_content.py on its own.
+
+    ``from gui import manual_content`` would run gui/__init__.py, which builds
+    the Qt window classes; the manual text must be checkable without Qt.
+    """
+    import importlib.util
+
+    path = pathlib.Path(__file__).resolve().parents[1] / "gui" / "manual_content.py"
+    spec = importlib.util.spec_from_file_location("_bits_manual_content", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_the_manual_explains_the_terms_the_interface_hides():
     """The vocabulary has to live somewhere, and this is where.
 
     A user who wants to know what "smoothing" actually does should be able to
     find the answer without leaving the application.
     """
-    from gui import manual_content
+    manual_content = _manual_content()
 
     text = manual_content.as_plain_text().lower()
     for term in ("mahalanobis", "winding rule", "covariance", "eigenvector",
@@ -162,7 +177,7 @@ def test_the_manual_explains_the_terms_the_interface_hides():
 
 
 def test_the_manual_covers_every_operation_the_menus_offer():
-    from gui import manual_content
+    manual_content = _manual_content()
 
     text = manual_content.as_plain_text().lower()
     for topic in ("check data", "control material", "smoothing",
@@ -172,7 +187,7 @@ def test_the_manual_covers_every_operation_the_menus_offer():
 
 
 def test_the_manual_says_why_the_classifier_was_removed():
-    from gui import manual_content
+    manual_content = _manual_content()
 
     section = manual_content.get_section("m_why")
     body = section["body"].lower()

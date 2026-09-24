@@ -21,6 +21,7 @@ main.py
 Computation layer (GUI-independent, scriptable):
     data/data_loader_4d.py        Memory-aware TIFF loading (memmap for big data)
     data/dataset_4d.py            Dataset4D container (T, Z, Y, X)
+    data/tiff_io.py               Volume → greyscale TIFF stack (never RGB)
     histograms/histogram_engine_4d.py
                                   Chunked CPU/GPU 2-D histogram accumulation
     segmentation/segmentation_engine_4d.py
@@ -53,6 +54,7 @@ Computation layer (GUI-independent, scriptable):
     utils/metrics_spatial.py      Metrics in the volume: shape, position, topology
     utils/validation.py           Block CV, anchoring index, bootstrap bands
     utils/segmentation_report.py  Text report describing an exported segmentation
+    utils/figure_export.py        Histogram + slice two-panel figure (no Qt)
     utils/config.py               Application-wide defaults
 ```
 
@@ -343,6 +345,31 @@ overlay-only update, `_apply_segmentation_overlays()` when the base image
 changes too) rather than calling `set_mask_overlays()` with its own list,
 which would erase the other source.
 
+### Histogram overlays
+
+The histogram canvases show three sources at once: the visible saved classes,
+outlines of segmentation layers that did not come from a drawn class (Otsu,
+K-means, material tracking), and — while *Show All on Histogram* is ticked —
+the visible saved selections. `_update_class_histogram_overlays(timepoint)`
+composes all three and is the only thing that should set the canvases'
+overlay list while a dataset is loaded; `_update_histogram_overlays()` (for
+selection changes) and `_update_current_timepoint()` go through it. Setting
+the list directly from one source erased the others.
+
+### Histogram + slice figure
+
+*File → Export Histogram + Slice Figure* (and *Export → Histogram + Slice
+Figure*) saves what is on screen as one two-panel figure.
+`BiTS4DMainWindow._histogram_slice_figure_panels()` gathers it: the local
+canvas's `histogram_data`, scale and range, its `roi_overlays` (plus,
+optionally, the unsaved ROI), and the slice viewer's `current_slice` with
+every `mask_overlays` entry re-sliced by `_slice_mask_for_display`. It
+returns `utils.figure_export.HistogramPanel` / `SlicePanel`, which
+`save_histogram_slice_figure()` renders with plain matplotlib — so the figure
+is testable without Qt, and anything that changes what the screen shows
+changes the figure the same way. The slice is the *displayed* one, so on a
+binned dataset the figure carries a note saying so.
+
 ## Execution model
 
 Long operations (loading, histogram accumulation, segmentation, RF
@@ -386,7 +413,9 @@ in place — cached histograms remain valid, so no recomputation occurs.
 - **New ROI shape:** add storage + a `_<shape>_mask()` static method to
   `ROIManager`, extend `is_inside_roi`, `get_named_roi_overlays`, and the
   (de)serialisation methods, and add drawing support to `HistogramCanvas`.
-- **New export format:** follow `utils/selection_library.py` — pure functions
-  taking selections + arrays, no GUI imports.
+- **New export format:** follow `utils/selection_library.py` or
+  `utils/figure_export.py` — pure functions taking selections + arrays, no
+  GUI imports. Write volumes with `data.tiff_io.write_volume_tiff`, which
+  stops tifffile from storing a 3- or 4-slice volume as an RGB image.
 - **Testing:** engines are GUI-free, so test them directly with pytest. GUI
   logic can be exercised offscreen (`QT_QPA_PLATFORM=offscreen`).

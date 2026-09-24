@@ -1,6 +1,54 @@
 # Bug-fix and cleanup notes
 
-## The classifier removed, a materials panel, and a built-in manual (latest)
+## Histogram + slice figure export, and a bug sweep (latest)
+
+**A two-panel figure export.** *File → Export Histogram + Slice Figure*
+(Ctrl+Shift+F; also under *Export*) saves the local bimodal histogram with
+every label's selection on top, next to the slice currently displayed with
+the same labels highlighted in the same colours. It is built from what is on
+screen — timepoint, plane, slice, contrast, histogram scale and range, and
+which labels are ticked — so the figure is what you were looking at. A small
+dialog sets the resolution, legends, outlines around the slice highlights,
+and whether to include the unsaved ROI; the format follows the file extension
+(PNG, PDF, SVG, TIFF). Rendering lives in `utils/figure_export.py` and uses no
+Qt, so it is tested headlessly (`tests/test_histogram_slice_figure.py`).
+
+**Bugs fixed**, each with a regression test in
+`tests/test_gui_figure_export_and_fixes.py` that fails on the previous code:
+
+- **Otsu always failed.** It imported `segmentation.random_forest_4d`, which
+  moved to `segmentation.legacy` when the classifier was retired.
+- **Tracking with unlocked definitions crashed after running.** It called
+  `_install_model_layers`, removed when locked mode arrived; it now uses
+  `_apply_locked_result` like the locked path.
+- **Saved selections erased the class outlines.** Toggling *Show All on
+  Histogram* (or any selection change) replaced the histogram overlays with
+  the selections alone, or cleared them. The selection outlines are now one
+  of the sources `_update_class_histogram_overlays` composes.
+- **Layer outlines stayed from the previous timepoint.** Changing timepoint
+  redrew the slice highlights but not the histogram outlines of that
+  timepoint's layers.
+- **Recalling a selection kept a stale 3-D grown region**, which *Create
+  Histogram ROI from Selection* then used instead of the recalled one. Clearing
+  the spatial ROI or the highlight now also clears the 3-D region.
+- **The grown region vanished on any redraw** (contrast, slice, plane). It is
+  now redrawn on its own slice, or re-sliced when it was grown in 3-D. Saving
+  it as a selection records the slice it was grown on rather than the slice on
+  screen.
+- **Small volumes were written as RGB images.** tifffile stores a uint8
+  volume with 3 or 4 slices as a colour picture; every volume is now written
+  through `data.tiff_io.write_volume_tiff` as a greyscale stack.
+- **Export All only offered the first segmented timepoint's layers**, so a
+  class segmented only later could not be exported; it now offers every
+  layer name in the series. Its progress count and the reported number of
+  exported timepoints were also off when some timepoints had no layers.
+- **Label volumes overflowed past 255 classes**; they switch to 16-bit.
+- **The headless test suite could not start.** `utils/__init__.py` imported
+  the Qt progress dialog eagerly, so CI (which installs no PyQt5) failed to
+  import every test module. Those names are now loaded on first use, and the
+  manual-content tests load the module without building the Qt window.
+
+## The classifier removed, a materials panel, and a built-in manual
 
 **The classifier is gone from the application.** Its tab, menu entries,
 handlers and state are removed; `segmentation.legacy` keeps the module

@@ -269,6 +269,9 @@ class SliceViewerWidget(QWidget):
         self.region_grow_mode = False
         self.region_grow_mask = None
         self.region_grow_mask_3d = None  # For 3D region growing (v15.0)
+        # (axis, slice_index) a 2-D grown mask belongs to, so it is only
+        # redrawn on that slice
+        self.region_grow_plane = None
         self.mask_overlay = None  # Matplotlib artist for mask display
         
         # Multiple mask overlays (segmentation layers + selection manager).
@@ -1188,6 +1191,8 @@ class SliceViewerWidget(QWidget):
         
         # Clear region growing state
         self.region_grow_mask = None
+        self.region_grow_mask_3d = None
+        self.region_grow_plane = None
         if self.mask_overlay is not None:
             try:
                 self.mask_overlay.remove()
@@ -1246,6 +1251,8 @@ class SliceViewerWidget(QWidget):
         """Remove all coloured overlays from the slice view without affecting the ROI."""
         # Clear single region-grow overlay
         self.region_grow_mask = None
+        self.region_grow_mask_3d = None
+        self.region_grow_plane = None
         if self.mask_overlay is not None:
             try:
                 self.mask_overlay.remove()
@@ -1491,6 +1498,8 @@ class SliceViewerWidget(QWidget):
             # No 3D mask in 2D mode
             self.region_grow_mask_3d = None
         
+        self.region_grow_plane = (self.current_axis, self.current_slice_index)
+
         num_pixels = np.sum(self.region_grow_mask)
         print(f"  Region grown: {num_pixels} pixels", file=sys.stderr)
         
@@ -1519,6 +1528,20 @@ class SliceViewerWidget(QWidget):
         # Store that we have a region (for histogram ROI creation)
         # We'll use region_grow_mask instead of spatial_roi_coords
     
+    def _region_grow_display_slice(self):
+        """The grown region's 2-D mask for the current view, or None.
+
+        A 3-D grown region is re-sliced for the current plane; a 2-D one is
+        shown only on the slice it was grown on.
+        """
+        if self.region_grow_mask_3d is not None:
+            return self._slice_mask_for_display(self.region_grow_mask_3d)
+        if self.region_grow_mask is None:
+            return None
+        return self._slice_mask_for_display(
+            self.region_grow_mask, self.region_grow_plane
+        )
+
     def _display_mask_overlay(self):
         """Display region growing mask overlay on slice"""
         if self.region_grow_mask is None:
@@ -1533,15 +1556,17 @@ class SliceViewerWidget(QWidget):
             self.mask_overlay = None
 
         # Show mask if checkbox is checked
-        if self.show_mask_cb.isChecked():
+        mask_2d = self._region_grow_display_slice()
+        if (self.show_mask_cb.isChecked() and mask_2d is not None
+                and self.ax.images):
             # Create colored overlay
-            mask_rgba = np.zeros((*self.region_grow_mask.shape, 4))
-            mask_rgba[self.region_grow_mask] = [0, 1, 0, 0.4]  # Green with alpha
+            mask_rgba = np.zeros((*mask_2d.shape, 4))
+            mask_rgba[mask_2d.astype(bool)] = [0, 1, 0, 0.4]  # Green with alpha
 
             # Display overlay
             self.mask_overlay = self.ax.imshow(
                 mask_rgba,
-                extent=self.ax.images[0].get_extent() if self.ax.images else None,
+                extent=self.ax.images[0].get_extent(),
                 zorder=10,
                 interpolation='nearest'
             )
@@ -1787,6 +1812,8 @@ class SliceViewerWidget(QWidget):
         self.current_slice = data_slice
         
         self.ax.clear()
+        # ax.clear() already detached the region-grow artist
+        self.mask_overlay = None
         self.ax.set_title(title)
         self.ax.axis('off')
         
@@ -1816,6 +1843,9 @@ class SliceViewerWidget(QWidget):
         # Draw multi-colour mask overlays; 3-D masks are re-sliced here so the
         # highlight tracks the current plane and slice index.
         self._display_mask_overlays()
+        # The grown region survives redraws (contrast, slice, plane changes)
+        if self.region_grow_mask is not None:
+            self._display_mask_overlay()
 
         # Report what is actually highlighted on this slice
         if self._visible_mask_pixels > 0:
@@ -2109,6 +2139,68 @@ class ExportOptionsDialog(QDialog):
         self.export_labels  = self._labels_cb.isChecked()
         self.export_histogram = self._histogram_cb.isChecked()
         self.export_report = self._report_cb.isChecked()
+        self.accept()
+
+
+class FigureExportDialog(QDialog):
+    """Options for the side-by-side histogram + slice figure export.
+
+    After exec_() returns Accepted, read ``dpi``, ``show_legend``,
+    ``outline_highlights`` and ``include_active_roi``.
+    """
+
+    def __init__(self, has_active_roi=False, parent=None):
+        super().__init__(parent)
+        from PyQt5.QtWidgets import QSpinBox
+
+        self.setWindowTitle("Export Histogram + Slice Figure")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Left: the local histogram of this timepoint with every label's\n"
+            "selection on top.  Right: the slice on screen with the same\n"
+            "labels highlighted."
+        ))
+
+        dpi_row = QHBoxLayout()
+        dpi_row.addWidget(QLabel("Resolution (DPI):"))
+        self._dpi_spin = QSpinBox()
+        self._dpi_spin.setRange(72, 1200)
+        self._dpi_spin.setSingleStep(50)
+        self._dpi_spin.setValue(300)
+        self._dpi_spin.setToolTip("Ignored for vector formats (PDF, SVG).")
+        dpi_row.addWidget(self._dpi_spin)
+        dpi_row.addStretch()
+        layout.addLayout(dpi_row)
+
+        self._legend_cb = QCheckBox("Show legends")
+        self._legend_cb.setChecked(True)
+        layout.addWidget(self._legend_cb)
+
+        self._outline_cb = QCheckBox("Outline the slice highlights")
+        self._outline_cb.setChecked(True)
+        self._outline_cb.setToolTip(
+            "Draw a thin contour around each highlighted label, so it stays\n"
+            "readable in print and in greyscale."
+        )
+        layout.addWidget(self._outline_cb)
+
+        self._active_cb = QCheckBox("Include the unsaved (active) ROI")
+        self._active_cb.setChecked(has_active_roi)
+        self._active_cb.setEnabled(has_active_roi)
+        layout.addWidget(self._active_cb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self):
+        self.dpi = self._dpi_spin.value()
+        self.show_legend = self._legend_cb.isChecked()
+        self.outline_highlights = self._outline_cb.isChecked()
+        self.include_active_roi = (
+            self._active_cb.isEnabled() and self._active_cb.isChecked()
+        )
         self.accept()
 
 
@@ -2520,6 +2612,18 @@ class BiTS4DMainWindow(QMainWindow):
         export_all_action.setShortcut("Ctrl+Shift+E")
         export_all_action.triggered.connect(self._export_all_timepoints)
         file_menu.addAction(export_all_action)
+
+        export_figure_action = QAction("Export Histogram + Slice Figure...", self)
+        export_figure_action.setShortcut("Ctrl+Shift+F")
+        export_figure_action.setToolTip(
+            "Save a two-panel figure: the local histogram with every label's\n"
+            "selection on top, and the slice on screen with the same labels\n"
+            "highlighted (PNG, PDF, SVG or TIFF)."
+        )
+        export_figure_action.triggered.connect(
+            self._on_export_histogram_slice_figure
+        )
+        file_menu.addAction(export_figure_action)
         
         file_menu.addSeparator()
         
@@ -2625,6 +2729,11 @@ class BiTS4DMainWindow(QMainWindow):
         generate_report_action.setShortcut("Ctrl+R")
         generate_report_action.triggered.connect(self._on_generate_pdf_report)
         export_menu.addAction(generate_report_action)
+
+        figure_action = QAction("🖼 Histogram + Slice Figure...", self)
+        figure_action.setToolTip(export_figure_action.toolTip())
+        figure_action.triggered.connect(self._on_export_histogram_slice_figure)
+        export_menu.addAction(figure_action)
         
         # Analytics menu (NEW for v14.1)
         analytics_menu = menubar.addMenu("🔬 Analytics")
@@ -3247,7 +3356,9 @@ class BiTS4DMainWindow(QMainWindow):
         # (the display volumes are the binned copies for large datasets)
         self._apply_segmentation_overlays(timepoint)
 
-        # Update histogram overlays to show RF class distributions for this timepoint
+        # Outlines of segmentation layers belong to this timepoint's layers,
+        # so redraw them rather than leaving the previous timepoint's.
+        self._update_class_histogram_overlays(timepoint)
 
         self.status_bar.showMessage(f"Viewing timepoint {timepoint}")
     
@@ -3440,6 +3551,17 @@ class BiTS4DMainWindow(QMainWindow):
         # Restore spatial mask if available
         if selection.spatial_mask is not None and hasattr(self.slice_viewer, 'region_grow_mask'):
             self.slice_viewer.region_grow_mask = selection.spatial_mask.copy()
+            # Never keep a previous 3-D grow: "Create Histogram ROI" prefers
+            # the 3-D mask and would otherwise use the old region.
+            mask_3d = getattr(selection, "spatial_mask_3d", None)
+            self.slice_viewer.region_grow_mask_3d = (
+                None if mask_3d is None else np.array(mask_3d, dtype=bool)
+            )
+            source_axis = getattr(selection, "source_axis", None)
+            self.slice_viewer.region_grow_plane = (
+                (source_axis, getattr(selection, "source_slice_index", None))
+                if source_axis is not None else None
+            )
             self.slice_viewer._display_mask_overlay()
             self.slice_viewer.info_label.setText(f"Recalled: {selection.name}")
         
@@ -3799,7 +3921,11 @@ class BiTS4DMainWindow(QMainWindow):
 
         # A 3-D region-grow result keeps its volume mask so the highlight
         # follows plane changes; a 2-D one is pinned to the plane it was
-        # grown on.
+        # grown on — which may not be the slice on screen any more.
+        plane = getattr(self.slice_viewer, 'region_grow_plane', None)
+        if spatial_mask is None or plane is None:
+            plane = (self.slice_viewer.current_axis,
+                     self.slice_viewer.current_slice_index)
         self.selection_manager.add_selection(
             name=name,
             spatial_mask=spatial_mask,
@@ -3807,8 +3933,8 @@ class BiTS4DMainWindow(QMainWindow):
             spatial_mask_3d=getattr(
                 self.slice_viewer, 'region_grow_mask_3d', None
             ),
-            source_axis=self.slice_viewer.current_axis,
-            source_slice_index=self.slice_viewer.current_slice_index,
+            source_axis=plane[0],
+            source_slice_index=plane[1],
         )
 
         self.status_bar.showMessage(f"✅ Saved selection: {name}")
@@ -3816,34 +3942,40 @@ class BiTS4DMainWindow(QMainWindow):
     def _update_histogram_overlays(self):
         """Show visible saved selections on the histograms and slice viewer.
 
-        The slice viewer's highlights are re-composed (rather than replaced)
-        so changing selections never erases the segmentation layers.
+        Both views are re-composed rather than replaced, so toggling the
+        saved selections never erases the class outlines on the histograms
+        or the segmentation layers on the slice.
         """
-        visible_selections = self.selection_manager.get_visible_selections()
-        show_all = self.selection_manager.show_all_cb.isChecked()
-
-        if show_all and len(visible_selections) > 0:
-            histogram_overlays = []
-            for selection in visible_selections:
-                if selection.histogram_roi is not None:
-                    color = selection.color if selection.color is not None else (1, 0, 0, 0.8)
-                    histogram_overlays.append((
-                        selection.name,
-                        selection.histogram_roi,
-                        color
-                    ))
-
-            # Update histograms
-            for canvas in [self.dual_histogram.global_canvas, self.dual_histogram.local_canvas]:
-                canvas.set_roi_overlays(histogram_overlays)
-
-            # Slice viewer: segmentation layers + the visible selections
-            self._refresh_slice_overlays()
+        if self.dataset is not None:
+            self._update_class_histogram_overlays(self.dataset.current_timepoint)
         else:
-            # Clear the selection overlays, keeping segmentation highlights
-            for canvas in [self.dual_histogram.global_canvas, self.dual_histogram.local_canvas]:
-                canvas.clear_roi_overlays()
-            self._refresh_slice_overlays()
+            overlays = list(
+                self.dual_histogram.get_roi_manager().get_named_roi_overlays()
+            )
+            overlays += self._selection_histogram_overlays()
+            for canvas in (self.dual_histogram.global_canvas,
+                           self.dual_histogram.local_canvas):
+                canvas.set_roi_overlays(overlays)
+        self._refresh_slice_overlays()
+
+    def _selection_histogram_overlays(self):
+        """Histogram outlines of the visible saved selections.
+
+        Empty unless "Show All on Histogram" is ticked.
+        """
+        manager = getattr(self, "selection_manager", None)
+        if manager is None or not manager.show_all_cb.isChecked():
+            return []
+        overlays = []
+        for selection in manager.get_visible_selections():
+            if selection.histogram_roi is None:
+                continue
+            color = (
+                selection.color if selection.color is not None
+                else (1, 0, 0, 0.8)
+            )
+            overlays.append((selection.name, selection.histogram_roi, color))
+        return overlays
 
     # ── RF histogram overlay ──────────────────────────────────────────────────
 
@@ -4050,12 +4182,13 @@ class BiTS4DMainWindow(QMainWindow):
                                          xray_vol=None):
         """Redraw the class outlines on both histogram canvases.
 
-        Two things are shown together:
+        Three things are shown together:
 
         1. the regions you drew, exactly as drawn, and
         2. an outline around any segmentation layer that is *not* one of them
            — from Otsu, from K-means, or from a material-tracking run — so you
-           can see where those boundaries fall relative to your own.
+           can see where those boundaries fall relative to your own, and
+        3. the visible saved selections, while "Show All on Histogram" is on.
 
         A layer produced by a drawn region repeats that region's shape exactly,
         so it is skipped: drawing both would put two outlines on one class and
@@ -4091,6 +4224,7 @@ class BiTS4DMainWindow(QMainWindow):
             except Exception:
                 pass
 
+        overlays += self._selection_histogram_overlays()
         self.dual_histogram.global_canvas.set_roi_overlays(overlays)
         self.dual_histogram.local_canvas.set_roi_overlays(overlays)
 
@@ -4395,7 +4529,7 @@ class BiTS4DMainWindow(QMainWindow):
 
         def _otsu_op(progress_callback):
             progress_callback(10, "Computing Otsu thresholds …")
-            from segmentation.random_forest_4d import labels_from_otsu
+            from segmentation.legacy.random_forest_4d import labels_from_otsu
             labels = labels_from_otsu(neutron_vol, xray_vol, n_classes, channel)
             progress_callback(80, "Building class masks …")
             return labels
@@ -4450,15 +4584,6 @@ class BiTS4DMainWindow(QMainWindow):
     # installs the canonical implementation onto this class at import
     # time (see gui/__init__.py). It segments every ROI shown on the
     # histogram across all timepoints and records their outlines.
-
-    # ─────────────────────────────────────────────────────────
-    #  Random Forest slots
-    # ─────────────────────────────────────────────────────────
-
-    @pyqtSlot()
-    # ─────────────────────────────────────────────────────────
-    #  End Random Forest slots
-    # ─────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def _save_roi(self):
@@ -4886,7 +5011,8 @@ class BiTS4DMainWindow(QMainWindow):
             return
 
         try:
-            import os, tifffile
+            import os
+            from data.tiff_io import write_volume_tiff
             from utils.histogram_export import sanitize_name, save_bin_edges
             neutron_vol, xray_vol = self.dataset.get_volume_at_time(current_t)
             base = f"timepoint_{current_t:03d}"
@@ -4903,17 +5029,17 @@ class BiTS4DMainWindow(QMainWindow):
 
                 if do_mask:
                     p = f"{pfx}_mask.tif"
-                    tifffile.imwrite(p, mask_bool.astype(np.uint8) * 255)
+                    write_volume_tiff(p, mask_bool.astype(np.uint8) * 255)
                     files_written.append(os.path.basename(p))
                 if do_neutron:
                     vol = neutron_vol.copy(); vol[~mask_bool] = 0
                     p = f"{pfx}_neutron.tif"
-                    tifffile.imwrite(p, vol)
+                    write_volume_tiff(p, vol)
                     files_written.append(os.path.basename(p))
                 if do_xray:
                     vol = xray_vol.copy(); vol[~mask_bool] = 0
                     p = f"{pfx}_xray.tif"
-                    tifffile.imwrite(p, vol)
+                    write_volume_tiff(p, vol)
                     files_written.append(os.path.basename(p))
                 if do_histogram:
                     files_written += self._export_class_histogram(
@@ -4921,11 +5047,14 @@ class BiTS4DMainWindow(QMainWindow):
                     )
 
             if do_labels:
-                label_vol = np.zeros(neutron_vol.shape, dtype=np.uint8)
+                label_vol = np.zeros(
+                    neutron_vol.shape,
+                    dtype=np.uint8 if len(sel_layers) < 256 else np.uint16,
+                )
                 for idx, (mask_3d, _, _) in enumerate(sel_layers, start=1):
                     label_vol[mask_3d.astype(bool)] = idx
                 p = os.path.join(output_dir, f"{base}_labels.tif")
-                tifffile.imwrite(p, label_vol)
+                write_volume_tiff(p, label_vol)
                 files_written.append(os.path.basename(p))
 
             if do_report:
@@ -4968,12 +5097,16 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        # Collect the union of all unique layer names across timepoints so the
-        # user can pick which ones to include across the whole batch.
-        # Use the layers from the first non-empty timepoint as representative.
-        representative_layers = next(
-            layers for layers in self.segmentation_masks.values() if layers
-        )
+        # Offer the union of layer names across every timepoint, so a class
+        # segmented only at later timepoints can still be picked. Each name
+        # is represented by its first occurrence (its swatch and voxel count).
+        representative_layers = []
+        seen_names = set()
+        for _t, layers in sorted(self.segmentation_masks.items()):
+            for layer in layers:
+                if layer[2] not in seen_names:
+                    seen_names.add(layer[2])
+                    representative_layers.append(layer)
 
         # ── Export options dialog ────────────────────────────────────────────
         dlg = ExportOptionsDialog(representative_layers, parent=self)
@@ -5009,7 +5142,8 @@ class BiTS4DMainWindow(QMainWindow):
         num_timepoints = sum(1 for v in self.segmentation_masks.values() if v)
 
         try:
-            import os, tifffile
+            import os
+            from data.tiff_io import write_volume_tiff
             from PyQt5.QtWidgets import QProgressDialog
             from PyQt5.QtCore import Qt
             from utils.histogram_export import sanitize_name, save_bin_edges
@@ -5040,9 +5174,13 @@ class BiTS4DMainWindow(QMainWindow):
             }
             exported_layers = {}
 
-            for i, (t, layers) in enumerate(sorted(self.segmentation_masks.items())):
-                if not layers:
-                    continue
+            # Only non-empty timepoints count towards progress
+            segmented = [
+                (t, layers)
+                for t, layers in sorted(self.segmentation_masks.items())
+                if layers
+            ]
+            for i, (t, layers) in enumerate(segmented):
                 if progress.wasCanceled():
                     break
 
@@ -5065,16 +5203,16 @@ class BiTS4DMainWindow(QMainWindow):
                     mask_bool = mask_3d.astype(bool)
 
                     if do_mask:
-                        tifffile.imwrite(f"{pfx}_mask.tif",
+                        write_volume_tiff(f"{pfx}_mask.tif",
                                          mask_bool.astype(np.uint8) * 255)
                         total_files += 1
                     if do_neutron:
                         vol = neutron_vol.copy(); vol[~mask_bool] = 0
-                        tifffile.imwrite(f"{pfx}_neutron.tif", vol)
+                        write_volume_tiff(f"{pfx}_neutron.tif", vol)
                         total_files += 1
                     if do_xray:
                         vol = xray_vol.copy(); vol[~mask_bool] = 0
-                        tifffile.imwrite(f"{pfx}_xray.tif", vol)
+                        write_volume_tiff(f"{pfx}_xray.tif", vol)
                         total_files += 1
                     if do_histogram:
                         total_files += len(self._export_class_histogram(
@@ -5084,13 +5222,16 @@ class BiTS4DMainWindow(QMainWindow):
                 exported_layers[t] = t_layers
 
                 if do_labels:
-                    label_vol = np.zeros(neutron_vol.shape, dtype=np.uint8)
+                    label_vol = np.zeros(
+                        neutron_vol.shape,
+                        dtype=np.uint8 if len(class_order) < 256 else np.uint16,
+                    )
                     # Label values come from the fixed class order, not this
                     # timepoint's list, so a value means the same class in
                     # every exported volume even if a class is missing here.
                     for mask_3d, _color, layer_name in t_layers:
                         label_vol[mask_3d.astype(bool)] = label_values[layer_name]
-                    tifffile.imwrite(
+                    write_volume_tiff(
                         os.path.join(output_dir, f"{base}_labels.tif"), label_vol
                     )
                     total_files += 1
@@ -5107,7 +5248,7 @@ class BiTS4DMainWindow(QMainWindow):
             if total_files > 0:
                 QMessageBox.information(
                     self, "Export Complete",
-                    f"Exported {num_timepoints} timepoint(s).\n"
+                    f"Exported {len(exported_layers)} timepoint(s).\n"
                     f"Total files written: {total_files}\n\n"
                     f"Saved to: {output_dir}"
                 )
@@ -5121,6 +5262,128 @@ class BiTS4DMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export:\n{e}")
             import traceback; traceback.print_exc()
+
+    # ── Histogram + slice figure ─────────────────────────────────────────
+
+    def _histogram_slice_figure_panels(self, include_active_roi=True):
+        """What the figure export draws, gathered from what is on screen.
+
+        Left panel: the local histogram exactly as displayed (scale, range)
+        with every label outline the local canvas shows — saved classes,
+        outlines of other segmentation layers and visible saved selections —
+        plus, optionally, the unsaved ROI. Right panel: the slice on screen
+        with the same labels' highlights, re-sliced for the current plane.
+
+        Returns ``(HistogramPanel, SlicePanel)``, or None when there is no
+        local histogram or slice to draw.
+        """
+        from utils.figure_export import HistogramPanel, SlicePanel
+
+        canvas = self.dual_histogram.local_canvas
+        viewer = self.slice_viewer
+        if (self.dataset is None or canvas.histogram_data is None
+                or getattr(viewer, "current_slice", None) is None):
+            return None
+
+        timepoint = self.dataset.current_timepoint
+        overlays = [
+            (name, np.asarray(vertices, dtype=float), color)
+            for name, vertices, color in canvas.roi_overlays
+            if vertices is not None
+        ]
+        roi_manager = self.dual_histogram.get_roi_manager()
+        if include_active_roi:
+            active = roi_manager.get_active_vertices()
+            if active is not None:
+                overlays.append(("Active ROI (unsaved)", active, "lime"))
+
+        slice_overlays = []
+        for entry in viewer.mask_overlays:
+            name, mask, color = entry[0], entry[1], entry[2]
+            plane = entry[3] if len(entry) > 3 else None
+            mask_2d = viewer._slice_mask_for_display(mask, plane)
+            if mask_2d is not None:
+                slice_overlays.append((name, np.asarray(mask_2d, bool), color))
+
+        note = ""
+        if viewer.display_bin_factor > 1:
+            note = (
+                f"Display binned x{viewer.display_bin_factor} (median); "
+                "segmentation ran at full resolution"
+            )
+
+        histogram_panel = HistogramPanel(
+            histogram_data=canvas.histogram_data,
+            overlays=overlays,
+            log_scale=canvas.use_log_scale,
+            vmin=canvas.vmin,
+            vmax=canvas.vmax,
+            title=f"Local histogram (T={timepoint})",
+        )
+        slice_panel = SlicePanel(
+            image=np.asarray(viewer.current_slice),
+            overlays=slice_overlays,
+            vmin=viewer.vmin,
+            vmax=viewer.vmax,
+            title=viewer.ax.get_title() or f"Slice (T={timepoint})",
+            note=note,
+        )
+        return histogram_panel, slice_panel
+
+    @pyqtSlot()
+    def _on_export_histogram_slice_figure(self):
+        """Save the local histogram and the current slice side by side."""
+        if self.dataset is None:
+            QMessageBox.warning(self, "No Dataset", "Please load a dataset first")
+            return
+        if self.dual_histogram.local_canvas.histogram_data is None:
+            QMessageBox.warning(
+                self, "No Histogram",
+                "The local histogram has not been computed yet."
+            )
+            return
+
+        has_active = self.dual_histogram.get_roi_manager().has_roi()
+        dialog = FigureExportDialog(has_active_roi=has_active, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        panels = self._histogram_slice_figure_panels(dialog.include_active_roi)
+        if panels is None:
+            QMessageBox.warning(
+                self, "Nothing to Export",
+                "There is no slice or local histogram on screen to export."
+            )
+            return
+
+        timepoint = self.dataset.current_timepoint
+        axis = self.slice_viewer.current_axis
+        index = self.slice_viewer.current_slice_index
+        default_name = f"histogram_slice_T{timepoint:03d}_{axis}{index}.png"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Save Histogram + Slice Figure", default_name,
+            "PNG image (*.png);;PDF document (*.pdf);;SVG vector (*.svg);;"
+            "TIFF image (*.tif *.tiff);;All files (*)",
+        )
+        if not path:
+            return
+
+        from utils.figure_export import save_histogram_slice_figure
+        try:
+            written = save_histogram_slice_figure(
+                path, *panels,
+                dpi=dialog.dpi,
+                show_legend=dialog.show_legend,
+                outline_highlights=dialog.outline_highlights,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Export Error", f"Could not save the figure:\n{exc}"
+            )
+            import traceback; traceback.print_exc()
+            return
+
+        self.status_bar.showMessage(f"Figure saved to {written}")
 
     # ========== v14.0: Selection Library & Reporting Methods ==========
 
@@ -5953,7 +6216,7 @@ class BiTS4DMainWindow(QMainWindow):
         if outcome is None:
             return
 
-        self._install_model_layers(outcome)
+        self._apply_locked_result(outcome)
         self.model_result = outcome
         moved = []
         for entry in outcome.timepoints:

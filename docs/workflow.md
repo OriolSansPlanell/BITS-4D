@@ -157,6 +157,12 @@ downstream works on them:
   per-material histograms, and `segmentation_report.txt` recording each
   material's name, its value in the label volumes, and its voxel count at
   every timepoint.
+- **Histogram + slice figure** (*File → Export Histogram + Slice Figure*,
+  Ctrl+Shift+F) — one image with the local histogram and every material's
+  selection on the left, and the slice on screen with the same materials
+  highlighted on the right. It shows exactly what you are looking at: pick the
+  timepoint, plane and slice first, and untick any material you want left
+  out.
 - **Quality metrics** — *Analytics → Histogram Time Analysis*: histogram
   metrics, spatial metrics (position, spread, how many pieces a material is
   in, contact area between materials), and the histogram evolution images.
@@ -194,6 +200,7 @@ you have three options, in order of preference:
 | find out whether the instrument moved | Analytics → Time Series Segmentation → Check Instrument Stability |
 | measure shape, position, contact area | Analytics → Histogram Time Analysis → Spatial Metrics |
 | export volumes and a written report | File → Export |
+| a figure of the histogram next to the slice | File → Export Histogram + Slice Figure |
 
 ## The one-line summary
 
