@@ -133,6 +133,9 @@ class KMeans3D:
             "cluster_centers": centers_original,
             "inertia_scaled": float(model.inertia_),
             "scaled_features": True,
+            # Per-channel standardisation: with the centres it defines each
+            # cluster's region of the (neutron, X-ray) plane
+            "feature_scale": np.asarray(scaler.scale_, dtype=float),
         }
         for cluster_id in range(n_clusters):
             count = int(np.count_nonzero(labels_3d == cluster_id))

@@ -31,6 +31,8 @@ back to voxels.
   set of clusters. The time-series level also finds **phases present only in
   some timepoints** (however small), reports when each cluster is present,
   and exports every cluster's share of the sample over time (CSV + SVG).
+  Clusters go straight into the selection panel as classes — tick them off,
+  rename or edit them like drawn regions.
 - **Materials panel** — every material, whether drawn on the histogram or
   copied from a K-means clustering, listed with a per-material toggle:
   *Changes* or *Stays unchanged*. Marking the second kind gives every other

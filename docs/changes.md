@@ -1,6 +1,32 @@
 # Bug-fix and cleanup notes
 
-## K-means at three scales, transient phases, and two report fixes (latest)
+## Clear Highlight really clears; K-means clusters become classes (latest)
+
+**Fixed — cleared highlights came back.** Clear Highlight only wiped the
+screen: the layers stayed visible, so the next redraw — unticking a class,
+drawing a region, *Segment Current* — brought every material back. And
+K-means materials had no entry in the selection panel, so they could not be
+unticked at all: after *Clear Highlight*, unticking everything and drawing a
+new ROI, *Segment Current* showed every K-means material alongside the new
+region. Now Clear Highlight hides every layer until its class is ticked
+again or it is segmented again, and unticks every class, so the next
+segmentation covers and shows only what is selected next. Nothing is
+deleted.
+
+**K-means clusters appear in the selection panel.** Every scope adds one
+class per cluster, so there is nothing to draw and save one by one; the
+separate *Copy K-means Clusters to Materials* step is gone. For slice and
+volume clusters the class region is the cluster's exact K-means cell — the
+intersection of the half-planes that make a point nearer its centre than any
+other, in the standardised metric — so segmenting with it reproduces the
+cluster voxel for voxel (`test_volume_classes_reproduce_the_clusters_exactly`)
+and *Segment All* extends it to every timepoint. Time-series clusters are
+listed as *layer-only* classes: hideable and renameable, but not
+re-segmented from an outline, since a transient phase cuts a hole in its
+neighbour's region. Re-running a scope replaces its earlier classes and
+layers, including clusters a smaller re-run no longer produces.
+
+## K-means at three scales, transient phases, and two report fixes
 
 **K-means at slice, volume or time-series scale.** One set of controls on
 the *Auto Seg* tab (the viewer's *🔍 Auto-Detect* opens it) with a scope:

@@ -58,6 +58,56 @@ class SliceClustering:
     labels: np.ndarray            # 2-D, -1 where a pixel was not finite
     centers: np.ndarray           # (k, 2) in (neutron, X-ray) units
     pixel_counts: np.ndarray      # (k,)
+    scale: np.ndarray = None      # (2,) channel standardisation used
+
+
+def kmeans_cell_polygon(centers, scale, index, bounds) -> Optional[np.ndarray]:
+    """The region of the (neutron, X-ray) plane that K-means gives *index*.
+
+    K-means on standardised channels assigns a point to the nearest centre
+    in the metric ``sum_d ((v_d - c_d) / scale_d)**2``. The set of points
+    nearer to centre *i* than to every other centre is an intersection of
+    half-planes — a convex polygon. It is clipped to *bounds*
+    ``(x_min, y_min, x_max, y_max)`` (the histogram range).
+
+    Testing a voxel against this polygon gives exactly the cluster K-means
+    assigns it, which is what lets a cluster become an ordinary class.
+    Returns None if the cell does not reach inside *bounds*.
+    """
+    centers = np.asarray(centers, dtype=float)
+    weights = 1.0 / np.square(np.asarray(scale, dtype=float))
+    x_min, y_min, x_max, y_max = bounds
+    polygon = [(x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max)]
+    own = centers[index]
+    for other_index, other in enumerate(centers):
+        if other_index == index:
+            continue
+        # |v-own|^2_w <= |v-other|^2_w  <=>  a . v <= b
+        a = 2.0 * weights * (other - own)
+        b = float(np.sum(weights * (other ** 2 - own ** 2)))
+        polygon = _clip_half_plane(polygon, a, b)
+        if len(polygon) < 3:
+            return None
+    return np.array(polygon, dtype=float)
+
+
+def _clip_half_plane(polygon, a, b):
+    """Sutherland–Hodgman: keep the part of *polygon* where a . v <= b."""
+    result = []
+    count = len(polygon)
+    for position in range(count):
+        current = np.asarray(polygon[position])
+        following = np.asarray(polygon[(position + 1) % count])
+        current_in = a @ current <= b
+        following_in = a @ following <= b
+        if current_in:
+            result.append(tuple(current))
+        if current_in != following_in:
+            denominator = a @ (following - current)
+            if denominator != 0:
+                t = (b - a @ current) / denominator
+                result.append(tuple(current + t * (following - current)))
+    return result
 
 
 def cluster_slice(neutron_slice, xray_slice, n_clusters: int,
@@ -92,7 +142,8 @@ def cluster_slice(neutron_slice, xray_slice, n_clusters: int,
     labels = labels.reshape(shape)
     counts = np.array([np.count_nonzero(labels == k) for k in range(n_clusters)])
     centers = scaler.inverse_transform(model.cluster_centers_)
-    return SliceClustering(labels=labels, centers=centers, pixel_counts=counts)
+    return SliceClustering(labels=labels, centers=centers, pixel_counts=counts,
+                           scale=np.asarray(scaler.scale_, dtype=float))
 
 
 # ── time series ──────────────────────────────────────────────────────────────
