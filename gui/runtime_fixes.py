@@ -34,6 +34,10 @@ def _apply_correctness_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> N
         if not has_roi and self.dataset is not None:
             self.slice_viewer._clear_highlight()
 
+        # A class ticked back on after Clear Highlight shows its layers again
+        if hasattr(self, "_forget_cleared_for_reticked_classes"):
+            self._forget_cleared_for_reticked_classes()
+
         # Ticking a class on or off changes which segmentation layers apply,
         # so refresh the highlights and histogram outlines straight away
         # instead of waiting for the next timepoint change.
@@ -76,7 +80,8 @@ def _apply_correctness_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> N
 
         # Segment every ROI shown on the histogram: all named class ROIs plus
         # the active (unsaved) one, so batch results match the display.
-        if roi_manager.has_named_rois() or roi_manager.unsaved_count() > 1:
+        if (roi_manager.get_segmentable_named_rois()
+                or roi_manager.unsaved_count() > 1):
             roi_specs = self._enumerate_roi_specs(roi_manager)
         else:
             roi_specs = None

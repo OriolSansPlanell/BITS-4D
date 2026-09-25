@@ -874,8 +874,9 @@ class DualHistogramWidget(QWidget):
         self.roi_list_widget.blockSignals(True)
         self.roi_list_widget.clear()
         for roi in self.roi_manager.named_rois:
-            label = (f"Class {roi['class_id']}  |  {roi['name']}  "
-                     f"[{roi['roi_type']}]")
+            kind = ("layers" if roi.get('layer_only', False)
+                    else roi['roi_type'])
+            label = f"Class {roi['class_id']}  |  {roi['name']}  [{kind}]"
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             self._style_roi_item(item, roi)

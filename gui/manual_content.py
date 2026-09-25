@@ -138,6 +138,14 @@ own unsaved region). Save it again when you are done. Untick a
 class to hide it — a hidden class is excluded from segmentation too, so what
 you see on the histogram is always exactly what gets segmented.</p>
 
+<h2>Starting again from a clean view</h2>
+<p><b>🧹 Clear Highlight</b> (under the slice, with the spatial tools) hides
+every coloured overlay — segmentation layers, saved selections, the grown
+region — and unticks every class, so the next region you draw is segmented,
+and shown, on its own. Nothing is deleted: tick a class to bring its layers
+back. A layer with no class behind it (from Otsu, or an unsaved region)
+comes back when you segment it again.</p>
+
 <h2>From the slice viewer instead</h2>
 <p>If a material is easier to point at in space than in the histogram: draw a
 box on a slice, or use <b>Region Grow</b> (2-D or full 3-D), then convert the
@@ -152,21 +160,31 @@ slice) choose a <b>scope</b> and the number of clusters, then press
 <table>
 <tr><th>Scope</th><th>What it clusters</th><th>What you get</th></tr>
 <tr><td><b>Slice</b></td><td>The pixels of the slice on screen.
-    Seconds.</td><td>One saved selection per cluster, on that slice, with
-    its region on the histogram. Enough to see which phases a slice holds,
-    or to start drawing from.</td></tr>
-<tr><td><b>Volume</b></td><td>Every voxel of this timepoint.</td><td>One
-    3-D selection per cluster. <b>Copy K-means Clusters to Materials</b>
-    turns them into materials.</td></tr>
+    Seconds.</td><td>A layer per cluster on that slice. <b>Segment
+    Current</b> extends the clusters to the whole volume.</td></tr>
+<tr><td><b>Volume</b></td><td>Every voxel of this timepoint.</td><td>A layer
+    per cluster at this timepoint. <b>Segment All</b> extends them to every
+    timepoint.</td></tr>
 <tr><td><b>Time series</b></td><td>Every timepoint at once, with one shared
     set of clusters.</td><td>A segmentation layer per cluster at every
     timepoint, in the same colour throughout, plus a separate cluster for
     each phase that is present only in some timepoints.</td></tr>
 </table>
-<p>Copied or not, a cluster behaves like a drawn material from then on —
-including the control setting, so a cluster you recognise as the casing can
-be marked <i>Stays unchanged</i> like any other. Rename them to something
-meaningful before you run the series.</p>
+<p>Every scope puts its clusters straight into the <b>selection panel</b>
+under the histogram, one class per cluster, so there is nothing to draw or
+save by hand. From then on a cluster is a class like any drawn one: tick it
+off to hide it (and leave it out of segmentation), rename it with a
+double-click, edit or remove it, and on the Materials tab mark it <i>Stays
+unchanged</i> if it is the casing. Rename them to something meaningful before
+you run the series. Running the same scope again replaces its earlier
+clusters.</p>
+<p>A slice or volume cluster's region on the histogram is its exact K-means
+region, so segmenting with it gives back exactly the voxels K-means put in
+the cluster — at any timepoint. Time-series clusters are marked
+<i>[layers]</i>: a phase found only in some timepoints cuts a hole in its
+neighbour's region, which no single outline can describe, so their stored
+layers are the segmentation and <i>Segment Current</i> leaves them as they
+are.</p>
 
 <h3>Phases present only in some timepoints</h3>
 <p>With <i>Find phases present only in some timepoints</i> ticked, the
@@ -985,6 +1003,7 @@ SECTIONS: List[Dict[str, str]] = [
     {"id": "define", "group": "How to", "title": "Defining materials",
      "body": _DEFINING,
      "keywords": "roi region polygon rectangle draw class kmeans k-means "
+                 "clear highlight hide "
                  "cluster edit slice volume time series transient phase "
                  "timeline "
                  "select move arrow keys keyboard backspace delete several"},

@@ -369,17 +369,30 @@ which would erase the other source.
 `_run_kmeans()` dispatches on the scope chosen on the *Auto Seg* tab (the
 viewer's *Auto-Detect* button only brings those settings forward):
 
-- **slice** — `cluster_slice()` on the displayed slice; results become 2-D
-  selections pinned to that plane ("Slice cluster *k*").
+- **slice** — `cluster_slice()` on the displayed slice; a layer per cluster
+  on that slice only ("Slice cluster *k*").
 - **volume** — `KMeans3D.cluster_volume()` on the current timepoint's display
-  volumes; 3-D selections ("3D Cluster *k*") that
-  `_convert_kmeans_clusters_to_materials()` turns into layers.
+  volumes; a layer per cluster at that timepoint ("K-means cluster *k*").
 - **series** — `run_series_clustering()`: local histograms (from the engine
   cache, computed where missing), `cluster_series()` on the shared bin grid,
   then one bin-lookup pass per timepoint (`SeriesClustering.label_volume`).
   The window writes a layer per cluster at every timepoint where it has
   voxels ("Series cluster *k*", "Transient phase *j*"), replacing earlier
   series layers, and records `outline(k)` as each layer's histogram shape.
+
+Every scope ends in `_replace_kmeans_results()`, which also adds one class
+per cluster to the selection panel (`ROIManager.add_named_polygon`), so a
+cluster is ticked, renamed and hidden like a drawn class — hiding it hides
+its layers through `_visible_layers()`, which matches layers to classes by
+name. For slice and volume the class outline is the cluster's exact K-means
+cell (`kmeans_cell_polygon()`: nearest centre in the standardised metric, an
+intersection of half-planes clipped to the histogram range), so segmenting
+with it reproduces the cluster voxel for voxel at any timepoint. Series
+clusters are `layer_only` classes: listed and hideable, but
+`get_segmentable_named_rois()` leaves them out of `has_roi`,
+`is_inside_roi`, `get_multi_class_labels` and `_enumerate_roi_specs`,
+because a transient phase cuts a hole in its neighbour's cell that no
+single outline describes.
 
 Persistent clusters are weighted K-means on bin centres; transient phases
 are islands found by `find_transient_islands()` and appended after them.
@@ -388,6 +401,17 @@ The criteria and why K-means alone cannot find them are in the manual
 selections (`SelectionManagerWidget.remove_selections`) or layers, never
 anything else. Memory: a time-series run stores one boolean mask per present
 cluster per timepoint, like any other layer.
+
+### Clear Highlight
+
+The viewer's *Clear Highlight* button (`_on_clear_highlight_clicked`) emits
+`highlight_cleared`; the window records every current layer in
+`_cleared_layers` as `{(t, name): mask}` and unticks every class.
+`_visible_layers()` skips a layer while the stored mask *is* the layer's
+mask, so re-segmenting (a new mask) shows it again, and ticking a class
+back on (`_forget_cleared_for_reticked_classes`, called on every ROI
+update) drops its entries. `SliceViewerWidget._clear_highlight()` itself
+stays a one-off wipe, used internally when the last ROI goes away.
 
 ### Histogram overlays
 

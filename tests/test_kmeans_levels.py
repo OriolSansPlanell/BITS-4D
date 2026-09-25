@@ -80,6 +80,34 @@ def test_slice_needs_enough_distinct_values():
         cluster_slice(np.ones((5, 5)), np.ones((5, 5)), 3)
 
 
+def test_cell_polygons_partition_the_plane_exactly():
+    """Each cluster's polygon holds exactly the points K-means gives it."""
+    from matplotlib.path import Path
+    from utils.clustering_3d import KMeans3D
+    from utils.kmeans_levels import kmeans_cell_polygon
+
+    rng = np.random.default_rng(3)
+    neutron = rng.normal(500, 40, (6, 30, 30))
+    xray = rng.normal(5, 0.4, (6, 30, 30))          # very different scales
+    neutron[:, :10] = rng.normal(200, 40, (6, 10, 30))
+    xray[:, :10] = rng.normal(8, 0.4, (6, 10, 30))
+    neutron[:, 20:, :5] = rng.normal(800, 40, (6, 10, 5))
+    labels, centers, stats = KMeans3D.cluster_volume(neutron, xray, 3)
+    pad_n = 0.01 * np.ptp(neutron)
+    pad_x = 0.01 * np.ptp(xray)
+    bounds = (neutron.min() - pad_n, xray.min() - pad_x,
+              neutron.max() + pad_n, xray.max() + pad_x)
+    points = np.column_stack((neutron.ravel(), xray.ravel()))
+    hits = np.zeros(len(points), dtype=int)
+    for cluster in range(3):
+        polygon = kmeans_cell_polygon(centers, stats["feature_scale"],
+                                      cluster, bounds)
+        inside = Path(polygon).contains_points(points)
+        np.testing.assert_array_equal(inside, labels.ravel() == cluster)
+        hits += inside
+    assert np.all(hits == 1)
+
+
 # ── time series ──────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("seed", range(4))
@@ -247,25 +275,118 @@ def test_three_scopes_are_offered(window):
     assert scopes == ["slice", "volume", "series"]
 
 
-def test_slice_scope_saves_pinned_selections(window, quiet_dialogs):
+def _class_names(window):
+    return [roi['name']
+            for roi in window.dual_histogram.get_roi_manager().named_rois]
+
+
+def _layer(window, timepoint, name):
+    return next(layer for layer in window.segmentation_masks[timepoint]
+                if layer[2] == name)
+
+
+def test_slice_scope_adds_classes_and_a_slice_layer(window, quiet_dialogs):
+    viewer = window.slice_viewer
     _run(window, "slice")
-    names = [s.name for s in window.selection_manager.selections]
-    assert names == ["Slice cluster 0", "Slice cluster 1", "Slice cluster 2"]
-    selection = window.selection_manager.selections[0]
-    assert selection.spatial_mask.ndim == 2
-    assert selection.source_axis == window.slice_viewer.current_axis
+    assert _class_names(window) == [
+        "Slice cluster 0", "Slice cluster 1", "Slice cluster 2"]
+    # The layer covers the slice it came from, and nothing else
+    mask = _layer(window, 3, "Slice cluster 0")[0]
+    index = viewer.current_slice_index
+    assert mask[index].any()
+    assert not np.delete(mask, index, axis=0).any()
     # Running again replaces them rather than adding duplicates
     _run(window, "slice")
-    assert len(window.selection_manager.selections) == 3
+    assert len(_class_names(window)) == 3
+    assert len([l for l in window.segmentation_masks[3]
+                if l[2].startswith("Slice cluster")]) == 3
 
 
-def test_volume_scope_can_be_copied_to_materials(window, quiet_dialogs):
+def test_volume_scope_adds_its_clusters_to_the_selection_panel(
+        window, quiet_dialogs):
     _run(window, "volume")
-    assert window.copy_clusters_btn.isEnabled()
-    window._convert_kmeans_clusters_to_materials()
+    assert _class_names(window) == [
+        "K-means cluster 0", "K-means cluster 1", "K-means cluster 2"]
     names = {layer[2] for layer in window.segmentation_masks[3]}
     assert {"K-means cluster 0", "K-means cluster 1",
             "K-means cluster 2"} <= names
+    # Each class has its own tick in the panel
+    assert window.dual_histogram.roi_list_widget.count() == 3
+
+
+def test_volume_classes_reproduce_the_clusters_exactly(window, quiet_dialogs):
+    """Segmenting with a cluster's class gives back exactly that cluster —
+    the class region is the cluster's K-means cell, not an approximation."""
+    _run(window, "volume")
+    kmeans_masks = {layer[2]: layer[0].copy()
+                    for layer in window.segmentation_masks[3]}
+    window._segment_current_volume()
+    for name, original in kmeans_masks.items():
+        np.testing.assert_array_equal(_layer(window, 3, name)[0], original,
+                                      err_msg=name)
+
+
+def test_volume_rerun_with_fewer_clusters_leaves_nothing_stale(
+        window, quiet_dialogs):
+    _run(window, "volume", clusters=4)
+    _run(window, "volume", clusters=2)
+    assert _class_names(window) == ["K-means cluster 0", "K-means cluster 1"]
+    assert not any(l[2] in ("K-means cluster 2", "K-means cluster 3")
+                   for l in window.segmentation_masks[3])
+
+
+def test_series_clusters_are_listed_but_not_resegmented(window, quiet_dialogs):
+    _run(window, "series")
+    manager = window.dual_histogram.get_roi_manager()
+    series = [roi for roi in manager.named_rois
+              if roi['name'].startswith(("Series cluster", "Transient phase"))]
+    assert series and all(roi['layer_only'] for roi in series)
+    assert manager.get_segmentable_named_rois() == []
+    # Unticking one hides its layers at every timepoint
+    index = _class_names(window).index("Series cluster 0")
+    manager.set_named_roi_visible(index, False)
+    for t in range(window.dataset.num_timepoints):
+        assert "Series cluster 0" not in [l[2] for l in window._visible_layers(t)]
+
+
+def test_clear_highlight_then_a_new_roi_shows_only_that_roi(
+        window, quiet_dialogs, monkeypatch):
+    """The reported bug: after Clear Highlight and unticking everything, a
+    new ROI + Segment Current brought back every material's highlight."""
+    from PyQt5.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.Yes))
+    _run(window, "volume")
+    viewer = window.slice_viewer
+    shown = lambda: {entry[0] for entry in viewer.mask_overlays}
+    assert shown()
+
+    viewer._on_clear_highlight_clicked()
+    assert shown() == set()
+    # The classes were unticked with it, so nothing comes back on redraw
+    window._update_current_timepoint(3)
+    assert shown() == set()
+
+    manager = window.dual_histogram.get_roi_manager()
+    manager.set_rectangle_roi(50, 850, 150, 950)
+    window.dual_histogram._on_roi_updated()
+    window._segment_current_volume()
+    assert shown() == {"Rectangle ROI"}
+
+    # Ticking a class back on brings its layer back; nothing was deleted
+    window.dual_histogram._set_all_classes_visible(True)
+    assert {"K-means cluster 0", "K-means cluster 1",
+            "K-means cluster 2"} <= shown()
+
+
+def test_cleared_layer_without_a_class_returns_when_resegmented(
+        window, quiet_dialogs):
+    window.otsu_classes_spin.setValue(2)
+    window._run_otsu_segment()
+    window.slice_viewer._on_clear_highlight_clicked()
+    assert not window._visible_layers(3)
+    window._run_otsu_segment()
+    assert [l[2] for l in window._visible_layers(3)] == ["Otsu class 1"]
 
 
 def test_series_scope_writes_layers_for_every_timepoint(window, quiet_dialogs):

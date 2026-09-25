@@ -79,8 +79,14 @@ under the slice), at the scale the question needs:
 | Scope | Clusters | Use it when |
 | --- | --- | --- |
 | **Slice** | the slice on screen | a quick look at which phases a slice holds |
-| **Volume** | every voxel of this timepoint | defining materials at the reference timepoint (*Copy K-means Clusters to Materials*) |
+| **Volume** | every voxel of this timepoint | defining materials at the reference timepoint; *Segment All* extends them to every timepoint |
 | **Time series** | every timepoint, one shared clustering | following phases through the experiment, including phases that exist only in some timepoints |
+
+Every scope puts its clusters straight into the selection panel, one class
+per cluster, so they can be ticked off, renamed and edited like drawn regions
+without drawing anything. A slice or volume cluster's region is its exact
+K-means region, so segmenting with it reproduces the cluster at any
+timepoint.
 
 The time-series scope writes a layer per cluster at every timepoint, keeps
 each cluster's colour throughout, and flags the phases present only in some

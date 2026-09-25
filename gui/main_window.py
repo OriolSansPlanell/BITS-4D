@@ -77,6 +77,9 @@ class SliceViewerWidget(QWidget):
 
     # The Auto-Detect button: K-means is configured and run by the window
     kmeans_requested = pyqtSignal()
+
+    # The Clear Highlight button: the window hides the layers behind it
+    highlight_cleared = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -290,12 +293,13 @@ class SliceViewerWidget(QWidget):
 
         self.clear_highlight_btn = QPushButton("🧹 Clear Highlight")
         self.clear_highlight_btn.setToolTip(
-            "Remove all coloured overlays from the slice view\n"
-            "(region-grow mask and histogram selection highlights).\n"
-            "Useful when switching between manual ROI selections."
+            "Hide every coloured overlay: segmentation layers, saved\n"
+            "selections and the region-grow mask. Classes are unticked, so\n"
+            "the next segmentation shows only what you select next.\n"
+            "Tick a class to bring its layers back; nothing is deleted."
         )
         self.clear_highlight_btn.setEnabled(False)
-        self.clear_highlight_btn.clicked.connect(self._clear_highlight)
+        self.clear_highlight_btn.clicked.connect(self._on_clear_highlight_clicked)
         spatial.append(self.clear_highlight_btn)
         
         
@@ -707,8 +711,19 @@ class SliceViewerWidget(QWidget):
 
         self.info_label.setText("Spatial ROI cleared")
 
+    def _on_clear_highlight_clicked(self):
+        """The Clear Highlight button: clear now, and let the window hide the
+        layers so the next redraw does not bring them straight back."""
+        self._clear_highlight()
+        self.highlight_cleared.emit()
+
     def _clear_highlight(self):
-        """Remove all coloured overlays from the slice view without affecting the ROI."""
+        """Remove all coloured overlays from the slice view without affecting the ROI.
+
+        Only what is drawn right now: the window re-composes the overlays on
+        the next redraw. The button goes through _on_clear_highlight_clicked,
+        which also asks the window to keep them hidden.
+        """
         # Clear single region-grow overlay
         self.region_grow_mask = None
         self.region_grow_mask_3d = None
@@ -1694,6 +1709,11 @@ class BiTS4DMainWindow(QMainWindow):
         # segmentation_masks: {timepoint -> [(mask_3d, color, name), ...]}
         # Each entry is one coloured segmentation layer for that timepoint.
         self.segmentation_masks = {}
+        # Layers hidden by Clear Highlight: {(timepoint, name) -> mask}. Keyed
+        # to the mask object, so re-segmenting (a new mask) shows it again.
+        self._cleared_layers = {}
+        # Classes unticked at the last ROI update, to notice re-ticking
+        self._last_hidden_classes = set()
         # segmentation_layer_shapes: {(timepoint, layer_name) -> Nx2 vertices}
         # Exact histogram-space outline of layers created from an ROI, so the
         # histogram overlay can show the true selected shape instead of a
@@ -1810,6 +1830,7 @@ class BiTS4DMainWindow(QMainWindow):
             self._on_create_histogram_roi_from_spatial)
         self.slice_viewer.clusters_detected.connect(self._on_clusters_detected)
         self.slice_viewer.kmeans_requested.connect(self._show_kmeans_controls)
+        self.slice_viewer.highlight_cleared.connect(self._on_highlight_cleared)
         viewer_layout.addWidget(self.slice_viewer)
         viewer_group.setLayout(viewer_layout)
         centre_vbox.addWidget(viewer_group)
@@ -2015,7 +2036,10 @@ class BiTS4DMainWindow(QMainWindow):
         self.copy_clusters_btn.clicked.connect(
             self._convert_kmeans_clusters_to_materials
         )
-        km_layout.addWidget(self.copy_clusters_btn)
+        # Every K-means run now puts its clusters in the selection panel
+        # itself, so this button is no longer shown; the conversion stays
+        # available to code that calls it.
+        self.copy_clusters_btn.hide()
 
         self.kmeans_status_label = QLabel("Status: ready")
         self.kmeans_status_label.setWordWrap(True)
@@ -2039,6 +2063,8 @@ class BiTS4DMainWindow(QMainWindow):
         self.material_panel.copy_clusters_requested.connect(
             self._convert_kmeans_clusters_to_materials
         )
+        # K-means runs add their clusters to the selection panel directly
+        self.material_panel.copy_clusters_btn.hide()
         self.material_panel.preview_requested.connect(
             lambda: self._run_material_tracking(preview=True)
         )
@@ -2664,6 +2690,8 @@ class BiTS4DMainWindow(QMainWindow):
         
         self.dataset = dataset
         self.segmentation_masks.clear()  # Clear any previous segmentation masks
+        self._cleared_layers = {}
+        self._last_hidden_classes = set()
         self._clear_layer_shapes()
         self.model_result = None
         self._last_kmeans_cluster_selections = []
@@ -3330,20 +3358,93 @@ class BiTS4DMainWindow(QMainWindow):
     def _kmeans_color(self, index):
         return self._OVERLAY_COLORS[index % len(self._OVERLAY_COLORS)]
 
-    def _show_cluster_selections(self, payloads, prefixes):
-        """Replace earlier clusters of this kind and show the new ones."""
-        self.selection_manager.remove_selections([
-            sel.name for sel in self.selection_manager.selections
-            if any(sel.name.startswith(prefix) for prefix in prefixes)
+    def _kmeans_cell_bounds(self):
+        """The histogram range, padded by one bin, that K-means cells are
+        clipped to — padded so the extreme voxels sit inside, not on, it."""
+        hist = self.global_histogram
+        x_edges, y_edges = hist.x_edges, hist.y_edges
+        dx = float(x_edges[1] - x_edges[0])
+        dy = float(y_edges[1] - y_edges[0])
+        return (float(x_edges[0]) - dx, float(y_edges[0]) - dy,
+                float(x_edges[-1]) + dx, float(y_edges[-1]) + dy)
+
+    def _replace_kmeans_results(self, prefixes, classes, layers_by_timepoint):
+        """Put one K-means run into the selection panel and the viewer.
+
+        *classes*: ``(name, outline, rgba, layer_only)`` — each becomes a
+        class in the selection panel, so it can be ticked, hidden, renamed,
+        edited and removed like a drawn one. *layers_by_timepoint*:
+        ``{t: [(mask, rgba, name), ...]}``.
+
+        Classes and layers of an earlier run of the same scope (names
+        starting with one of *prefixes*) are replaced everywhere; nothing
+        else is touched.
+        """
+        import matplotlib.colors as mcolors
+
+        prefixes = tuple(prefixes)
+        roi_manager = self.dual_histogram.get_roi_manager()
+        roi_manager.remove_named_rois_by_name([
+            roi['name'] for roi in roi_manager.named_rois
+            if roi['name'].startswith(prefixes)
         ])
-        self._on_clusters_detected(payloads)
-        self.selection_manager.show_all_cb.setChecked(True)
-        self._update_histogram_overlays()
+        for timepoint in list(self.segmentation_masks):
+            layers = self.segmentation_masks[timepoint]
+            kept = [layer for layer in layers
+                    if not str(layer[2]).startswith(prefixes)]
+            if len(kept) != len(layers):
+                self.segmentation_masks[timepoint] = kept
+                for cache in (self.segmentation_layer_shapes,
+                              self._derived_outline_cache,
+                              self._display_mask_cache):
+                    for key in [k for k in cache
+                                if k[0] == timepoint
+                                and str(k[1]).startswith(prefixes)]:
+                        del cache[key]
+
+        outlines = {}
+        for name, outline, rgba, layer_only in classes:
+            if outline is None:
+                continue
+            roi_manager.add_named_polygon(
+                name, outline, color=mcolors.to_hex(rgba[:3]),
+                layer_only=layer_only,
+            )
+            outlines[name] = outline
+        for timepoint, layers in layers_by_timepoint.items():
+            self.segmentation_masks.setdefault(timepoint, []).extend(layers)
+            for _mask, _rgba, name in layers:
+                if name in outlines:
+                    self._record_layer_shape(timepoint, name, outlines[name])
+
+        self.dual_histogram._update_roi_list()
+        self.dual_histogram._apply_roi_change()
+        self.export_current_btn.setEnabled(True)
+        self.export_all_btn.setEnabled(True)
+        current = self.dataset.current_timepoint
+        self._apply_segmentation_overlays(current)
+        self._update_class_histogram_overlays(current)
+        self._refresh_material_panel()
+
+    def _full_resolution_mask(self, display_mask, timepoint):
+        """A mask on the display grid, brought to the data's full grid."""
+        if self.display_bin_factor <= 1:
+            return display_mask
+        from utils.display_downsampler import DisplayDownsampler
+        shape = self.dataset.get_volume_at_time(timepoint)[0].shape
+        return DisplayDownsampler.upscale_mask(
+            display_mask, self.display_bin_factor, shape
+        )
 
     def _run_kmeans_slice(self, n_clusters):
-        """Level 1: the slice on screen. Fast; gives 2-D selections."""
+        """Level 1: the slice on screen. Fast.
+
+        Each cluster becomes a class in the selection panel whose region is
+        the cluster's exact K-means cell, and a layer on this slice only.
+        Segment Current then extends a class to the whole volume.
+        """
         from utils.clustering_3d import KMeans3D
-        from utils.kmeans_levels import cluster_slice
+        from utils.kmeans_levels import cluster_slice, kmeans_cell_polygon
 
         viewer = self.slice_viewer
         if viewer.current_slice_data is None or viewer.current_slice_index is None:
@@ -3354,28 +3455,50 @@ class BiTS4DMainWindow(QMainWindow):
         xray = KMeans3D.extract_slice_from_labels(xray_vol, axis, index)
 
         result = cluster_slice(neutron, xray, n_clusters)
-        payloads = []
+        bounds = self._kmeans_cell_bounds()
+        timepoint = self.dataset.current_timepoint
+        classes, layers = [], []
         for cluster in range(n_clusters):
-            mask = result.labels == cluster
-            if not mask.any():
+            labels_2d = result.labels == cluster
+            if not labels_2d.any():
                 continue
-            outline = KMeans3D.create_convex_hull_roi_3d(neutron[mask], xray[mask])
-            payloads.append((
-                f"Slice cluster {cluster}", mask, outline, cluster,
-                self._kmeans_color(cluster),
+            name = f"Slice cluster {cluster}"
+            rgba = self._kmeans_color(cluster)
+            classes.append((
+                name,
+                kmeans_cell_polygon(result.centers, result.scale, cluster, bounds),
+                rgba, False,
             ))
-        self._show_cluster_selections(payloads, ("Slice cluster ",))
+            display_mask = np.zeros(neutron_vol.shape, dtype=bool)
+            if axis == 'z':
+                display_mask[index, :, :] = labels_2d
+            elif axis == 'y':
+                display_mask[:, index, :] = labels_2d
+            else:
+                display_mask[:, :, index] = labels_2d
+            layers.append((self._full_resolution_mask(display_mask, timepoint),
+                           rgba, name))
+
+        self._replace_kmeans_results(("Slice cluster ",), classes,
+                                     {timepoint: layers})
         self.kmeans_status_label.setText(
-            f"Status: {len(payloads)} cluster(s) on the "
-            f"{axis.upper()} slice {index} — saved as selections"
+            f"Status: {len(classes)} cluster(s) on the {axis.upper()} slice "
+            f"{index}, added to the selection panel — Segment Current "
+            "extends them to the volume"
         )
         self.status_bar.showMessage(
-            f"Slice K-means: {len(payloads)} clusters on slice {index}"
+            f"Slice K-means: {len(classes)} clusters on slice {index}"
         )
 
     def _run_kmeans_volume(self, n_clusters):
-        """Level 2: every voxel of this timepoint. Gives 3-D selections."""
+        """Level 2: every voxel of this timepoint.
+
+        Each cluster becomes a class in the selection panel (its exact
+        K-means cell, so Segment All reproduces it at every timepoint) and
+        a layer at this timepoint.
+        """
         from utils.clustering_3d import KMeans3D
+        from utils.kmeans_levels import kmeans_cell_polygon
 
         timepoint = self.dataset.current_timepoint
         neutron_vol, xray_vol = self._display_volumes_at(timepoint)
@@ -3393,27 +3516,33 @@ class BiTS4DMainWindow(QMainWindow):
         )
         if outcome is None:
             return
-        labels, _centers, _stats = outcome
+        labels, centers, stats = outcome
 
-        viewer = self.slice_viewer
-        payloads = []
+        bounds = self._kmeans_cell_bounds()
+        classes, layers = [], []
         for cluster in range(n_clusters):
-            mask_3d = labels == cluster
-            if not mask_3d.any():
+            mask = labels == cluster
+            if not mask.any():
                 continue
-            mask_2d = KMeans3D.extract_slice_from_labels(
-                mask_3d, viewer.current_axis, viewer.current_slice_index
-            )
-            outline = KMeans3D.create_convex_hull_roi_3d(
-                neutron_vol[mask_3d], xray_vol[mask_3d]
-            )
-            payloads.append((
-                f"3D Cluster {cluster}", mask_2d, outline, cluster,
-                self._kmeans_color(cluster), mask_3d,
+            name = f"K-means cluster {cluster}"
+            rgba = self._kmeans_color(cluster)
+            classes.append((
+                name,
+                kmeans_cell_polygon(centers, stats["feature_scale"], cluster,
+                                    bounds),
+                rgba, False,
             ))
-        self._show_cluster_selections(payloads, ("3D Cluster ",))
+            layers.append((self._full_resolution_mask(mask, timepoint),
+                           rgba, name))
+
+        self._replace_kmeans_results(("K-means cluster ", "3D Cluster "),
+                                     classes, {timepoint: layers})
+        self.kmeans_status_label.setText(
+            f"Status: {len(classes)} cluster(s) at T={timepoint}, added to the "
+            "selection panel — Segment All extends them to every timepoint"
+        )
         self.status_bar.showMessage(
-            f"Volume K-means: {len(payloads)} clusters at T={timepoint}"
+            f"Volume K-means: {len(classes)} clusters at T={timepoint}"
         )
 
     def _run_kmeans_series(self, n_clusters, find_transient=True,
@@ -3450,35 +3579,29 @@ class BiTS4DMainWindow(QMainWindow):
                   for k in range(result.n_clusters)]
         names = [result.cluster_name(k) for k in range(result.n_clusters)]
         outlines = [result.outline(k) for k in range(result.n_clusters)]
-        series_prefixes = ("Series cluster ", "Transient phase ")
-
+        layers_by_timepoint = {}
         for t_index, timepoint in enumerate(result.timepoints):
             label_volume = labels.pop(timepoint)
-            kept = [
-                layer for layer in self.segmentation_masks.get(timepoint, [])
-                if not str(layer[2]).startswith(series_prefixes)
-            ]
+            layers = []
             for cluster in range(result.n_clusters):
                 if result.counts[t_index, cluster] <= 0:
                     continue
                 mask = label_volume == cluster
-                if not mask.any():
-                    continue
-                kept.append((mask, colors[cluster], names[cluster]))
-                self._record_layer_shape(timepoint, names[cluster],
-                                         outlines[cluster])
-            self.segmentation_masks[timepoint] = kept
+                if mask.any():
+                    layers.append((mask, colors[cluster], names[cluster]))
+            layers_by_timepoint[timepoint] = layers
 
+        # Listed as classes so each can be ticked on and off; layer-only,
+        # because a transient phase cuts a hole in its neighbour's region
+        # and no single outline describes that — the per-timepoint labels
+        # are the segmentation.
+        classes = [(names[k], outlines[k], colors[k], True)
+                   for k in range(result.n_clusters)]
         self.kmeans_series_result = result
         self._kmeans_series_colors = colors
         self.kmeans_timeline_btn.setEnabled(True)
-        self.export_current_btn.setEnabled(True)
-        self.export_all_btn.setEnabled(True)
-
-        current = self.dataset.current_timepoint
-        self._apply_segmentation_overlays(current)
-        self._update_class_histogram_overlays(current)
-        self._refresh_material_panel()
+        self._replace_kmeans_results(("Series cluster ", "Transient phase "),
+                                     classes, layers_by_timepoint)
 
         transient = result.transient_clusters()
         lines = [
@@ -3938,10 +4061,52 @@ class BiTS4DMainWindow(QMainWindow):
         layer straight back.
         """
         hidden = self._hidden_class_names()
+        cleared = getattr(self, "_cleared_layers", {})
         return [
             layer for layer in self.segmentation_masks.get(timepoint, [])
             if layer[2] not in hidden
+            and cleared.get((int(timepoint), layer[2])) is not layer[0]
         ]
+
+    def _on_highlight_cleared(self):
+        """Clear Highlight: hide every layer until it is asked for again.
+
+        Before, the button only wiped the screen: the layers stayed visible,
+        so the next redraw (unticking a class, drawing, segmenting) brought
+        every one of them back. Now each layer is hidden until its class is
+        ticked again or it is segmented again, and the classes are unticked
+        — so the next segmentation covers, and shows, only what is selected
+        next. Nothing is deleted.
+        """
+        self._cleared_layers = {
+            (int(timepoint), layer[2]): layer[0]
+            for timepoint, layers in self.segmentation_masks.items()
+            for layer in layers
+        }
+        if self.selection_manager.show_all_cb.isChecked():
+            self.selection_manager.show_all_cb.setChecked(False)
+        roi_manager = self.dual_histogram.get_roi_manager()
+        if roi_manager.get_visible_named_rois():
+            self.dual_histogram._set_all_classes_visible(False)
+        self._last_hidden_classes = self._hidden_class_names()
+        if self.dataset is not None:
+            self._refresh_slice_overlays()
+            self._update_class_histogram_overlays(self.dataset.current_timepoint)
+        self.status_bar.showMessage(
+            "Highlights cleared — tick a class, or segment again, to show "
+            "layers; nothing was deleted"
+        )
+
+    def _forget_cleared_for_reticked_classes(self):
+        """A class ticked back on shows its layers again."""
+        hidden_now = self._hidden_class_names()
+        reticked = self._last_hidden_classes - hidden_now
+        if reticked:
+            self._cleared_layers = {
+                key: mask for key, mask in self._cleared_layers.items()
+                if key[1] not in reticked
+            }
+        self._last_hidden_classes = hidden_now
 
     def _compose_slice_overlays(self, timepoint):
         """Build the slice-viewer overlay list for *timepoint*.
@@ -4083,7 +4248,7 @@ class BiTS4DMainWindow(QMainWindow):
         "Active ROI"; several are numbered, each in the colour it is drawn in.
         """
         specs = []
-        for roi in roi_manager.get_visible_named_rois():
+        for roi in roi_manager.get_segmentable_named_rois():
             spec = {
                 'name': roi['name'],
                 'roi_type': roi['roi_type'],
@@ -4182,7 +4347,8 @@ class BiTS4DMainWindow(QMainWindow):
         # ── Multi-class path: one mask per ROI shown on the histogram ─────────
         # This includes the active (unsaved) ROI so the segmented layers always
         # match the selection displayed on the histogram.
-        if roi_manager.has_named_rois() or roi_manager.unsaved_count() > 1:
+        if (roi_manager.get_segmentable_named_rois()
+                or roi_manager.unsaved_count() > 1):
             roi_specs = self._enumerate_roi_specs(roi_manager)
 
             def multi_segment_op(progress_callback):

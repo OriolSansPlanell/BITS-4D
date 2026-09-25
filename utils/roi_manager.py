@@ -146,7 +146,7 @@ class ROIManager:
         so with everything hidden and no active ROI there is nothing to do.
         """
         return (self.roi_type is not None or bool(self.pending_rois)
-                or len(self.get_visible_named_rois()) > 0)
+                or len(self.get_segmentable_named_rois()) > 0)
 
     def is_inside_roi(self, neutron_values: np.ndarray,
                       xray_values: np.ndarray) -> np.ndarray:
@@ -161,7 +161,7 @@ class ROIManager:
             raise ValueError("No ROI defined")
 
         result = np.zeros(neutron_values.shape, dtype=bool)
-        for roi in self.get_visible_named_rois():
+        for roi in self.get_segmentable_named_rois():
             result |= self._mask_for_named_roi(roi, neutron_values, xray_values)
         for roi in self.pending_rois:
             result |= self._mask_for_named_roi(roi, neutron_values, xray_values)
@@ -491,6 +491,40 @@ class ROIManager:
         """Named ROIs that are currently shown and segmented."""
         return [roi for roi in self.named_rois if roi.get('visible', True)]
 
+    def get_segmentable_named_rois(self) -> List[dict]:
+        """Visible classes that segmentation draws from their outline.
+
+        A *layer-only* class (``layer_only=True``) already has its
+        segmentation stored per timepoint — e.g. a time-series K-means
+        cluster, whose region can have holes no single outline describes.
+        It is listed, drawn and can be hidden like any class, but is never
+        re-segmented from its outline.
+        """
+        return [roi for roi in self.get_visible_named_rois()
+                if not roi.get('layer_only', False)]
+
+    def add_named_polygon(self, name: str, points, color: Optional[str] = None,
+                          layer_only: bool = False) -> int:
+        """Add a class straight from an outline (no active ROI involved)."""
+        class_id = self._append_named(
+            name, {'roi_type': 'polygon', 'points': np.asarray(points, float)},
+            color=color,
+        )
+        if layer_only:
+            self.named_rois[-1]['layer_only'] = True
+        return class_id
+
+    def remove_named_rois_by_name(self, names) -> int:
+        """Remove every class whose name is in *names*; returns how many."""
+        names = set(names)
+        before = len(self.named_rois)
+        self.named_rois = [roi for roi in self.named_rois
+                           if roi['name'] not in names]
+        removed = before - len(self.named_rois)
+        if removed:
+            self.selected = None
+        return removed
+
     def set_named_roi_visible(self, index: int, visible: bool) -> None:
         """Show/hide one class.
 
@@ -550,7 +584,7 @@ class ROIManager:
         """
         labels = np.zeros(neutron_vol.shape, dtype=np.int32)
 
-        visible = self.get_visible_named_rois()
+        visible = self.get_segmentable_named_rois()
         for roi in visible:
             mask = self._mask_for_named_roi(roi, neutron_vol, xray_vol)
             labels[mask] = roi['class_id']
