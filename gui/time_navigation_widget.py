@@ -31,15 +31,21 @@ class TimeNavigationWidget(QWidget):
         self.init_ui()
     
     def init_ui(self):
+        # One compact row (wrapping to two on a narrow window) so the bar
+        # leaves the plots room on a short laptop screen.
+        from gui.responsive import flow_row, group
+
         layout = QVBoxLayout()
-        
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(3)
+
         # Timepoint info label
         self.info_label = QLabel(f"Timepoint: 0 / {self.num_timepoints - 1}")
         self.info_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.info_label)
-        
+
         # Slider with navigation buttons
         slider_layout = QHBoxLayout()
+        slider_layout.addWidget(self.info_label)
         
         self.first_btn = QPushButton("⏮")
         self.first_btn.setMaximumWidth(40)
@@ -58,6 +64,7 @@ class TimeNavigationWidget(QWidget):
         self.slider.setMaximum(self.num_timepoints - 1)
         self.slider.setValue(0)
         self.slider.valueChanged.connect(self._on_slider_change)
+        self.slider.setMinimumWidth(220)
         slider_layout.addWidget(self.slider)
         
         self.next_btn = QPushButton("▶")
@@ -72,47 +79,38 @@ class TimeNavigationWidget(QWidget):
         self.last_btn.clicked.connect(self.jump_to_last)
         slider_layout.addWidget(self.last_btn)
         
-        layout.addLayout(slider_layout)
+        slider_row = QWidget()
+        slider_row.setLayout(slider_layout)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
         
         # Spinbox for direct entry
-        spinbox_layout = QHBoxLayout()
-        spinbox_layout.addWidget(QLabel("Go to timepoint:"))
-        
         self.spinbox = QSpinBox()
         self.spinbox.setMinimum(0)
         self.spinbox.setMaximumWidth(100)
         self.spinbox.setMaximum(self.num_timepoints - 1)
         self.spinbox.valueChanged.connect(self._on_spinbox_change)
-        spinbox_layout.addWidget(self.spinbox)
-        spinbox_layout.addStretch()
-        
-        layout.addLayout(spinbox_layout)
-        
+
         # Playback controls
-        playback_layout = QHBoxLayout()
-        
         self.play_btn = QPushButton("▶ Play")
         self.play_btn.setToolTip("Play/Pause animation")
         self.play_btn.clicked.connect(self.toggle_playback)
-        playback_layout.addWidget(self.play_btn)
-        
-        playback_layout.addWidget(QLabel("FPS:"))
         self.fps_spinbox = QSpinBox()
         self.fps_spinbox.setMinimum(1)
         self.fps_spinbox.setMaximum(60)
         self.fps_spinbox.setValue(10)
         self.fps_spinbox.setMaximumWidth(60)
         self.fps_spinbox.setToolTip("Frames per second")
-        playback_layout.addWidget(self.fps_spinbox)
-        
         self.loop_checkbox = QCheckBox("Loop")
         self.loop_checkbox.setChecked(True)
         self.loop_checkbox.setToolTip("Loop playback")
-        playback_layout.addWidget(self.loop_checkbox)
-        
-        playback_layout.addStretch()
-        
-        layout.addLayout(playback_layout)
+        # One line on a wide window, wrapping to two on a narrow one
+        layout.addWidget(flow_row(
+            slider_row,
+            group(QLabel("Go to:"), self.spinbox),
+            self.play_btn,
+            group(QLabel("FPS:"), self.fps_spinbox),
+            self.loop_checkbox,
+        ))
         
         self.setLayout(layout)
     

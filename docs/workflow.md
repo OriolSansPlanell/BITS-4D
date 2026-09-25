@@ -53,6 +53,12 @@ X-ray on the y-axis — and save it with a name (*Lithium*, *Separator*,
 *Aluminium*). Draw one per material. Use *✂ Segment Current* to see them in
 the slice viewer and adjust until they look right at the first timepoint.
 
+You can draw several regions before saving: each stays on the histogram in
+its own colour, and *Save as Class* asks for a name for each and makes one
+class per region. To adjust a region, **click it** on either histogram and
+move it with the **arrow keys** (one bin per press, **Shift** for ten);
+**Backspace** or **Delete** removes it — for a saved class, after asking.
+
 Two things worth knowing:
 
 - **The names you give here are the names in every output**, in this order,
@@ -158,7 +164,7 @@ downstream works on them:
   material's name, its value in the label volumes, and its voxel count at
   every timepoint.
 - **Histogram + slice figure** (*File → Export Histogram + Slice Figure*,
-  Ctrl+Shift+F) — one image with the local histogram and every material's
+  Ctrl+Shift+F) — one SVG with the local histogram and every material's
   selection on the left, and the slice on screen with the same materials
   highlighted on the right. It shows exactly what you are looking at: pick the
   timepoint, plane and slice first, and untick any material you want left
@@ -201,6 +207,7 @@ you have three options, in order of preference:
 | measure shape, position, contact area | Analytics → Histogram Time Analysis → Spatial Metrics |
 | export volumes and a written report | File → Export |
 | a figure of the histogram next to the slice | File → Export Histogram + Slice Figure |
+| move or delete a region | click it on the histogram, then arrow keys / Backspace |
 
 ## The one-line summary
 

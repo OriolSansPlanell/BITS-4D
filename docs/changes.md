@@ -1,6 +1,50 @@
 # Bug-fix and cleanup notes
 
-## Histogram + slice figure export, and a bug sweep (latest)
+## Fits a laptop screen; several ROIs, keyboard editing; SVG figures (latest)
+
+**The window fits a 14" or 16" laptop.** Its minimum size was 3839×1038 px
+— long single rows of controls, two histograms side by side at 400 px each,
+and a fixed 1800×960 geometry — so part of it was off-screen on anything but
+a very wide monitor. It is now 394×210, and the layout is checked against a
+1280×720 screen by `tests/test_responsive_layout.py`:
+
+- the window opens at a size that fits the screen it is on;
+- rows of buttons wrap (`gui/responsive.py`: `FlowLayout`, `flow_row`);
+- the global and local histograms sit side by side when there is room and
+  become tabs when the histogram column is narrow (`PlotPanes`);
+- each main column and every right-hand tab scrolls when its content really
+  does not fit, instead of forcing the window wider;
+- the histogram's display settings moved into a *Display ▾* drop-down, the
+  spatial selection tools can be folded away (*🛠 Spatial tools*, folded by
+  default on a small screen), and time navigation is one bar along the
+  bottom of the window;
+- matplotlib canvases re-fit their labels when resized.
+
+**Several unsaved ROIs.** Drawing a second ROI used to replace the first. Now
+every region drawn stays on the histogram, each in the colour it will have as
+a class, and is listed in the selection panel. *Save as Class* asks for one
+name per region and makes one class each — two regions drawn, two classes
+saved. Every unsaved region is segmented, each as its own layer when there is
+more than one. *Edit* no longer discards what was being drawn; it stays as an
+unsaved region. Unsaved regions are kept by *Save/Load ROI Settings*.
+
+**Select, move and delete ROIs from the keyboard.** Click any region —
+saved or not, on either histogram — to select it (dashed black-and-white
+outline, and its row in the panel). The arrow keys move it by one histogram
+bin, Shift+arrow by ten; Backspace or Delete removes it, going through the
+same confirmation as *Remove* for a saved class. Picking a row in the panel
+selects its region too.
+
+**The histogram + slice figure is saved as SVG** by default, with text kept
+as text so labels and legends stay editable. PDF, PNG and TIFF remain
+available in the save dialog.
+
+**Also fixed:** a click with the rectangle tool that did not drag raised an
+error (a zero-size rectangle); it is now ignored. The local histogram's
+changes (a moved ROI) now reach the rest of the window as the global
+histogram's always did.
+
+## Histogram + slice figure export, and a bug sweep
 
 **A two-panel figure export.** *File → Export Histogram + Slice Figure*
 (Ctrl+Shift+F; also under *Export*) saves the local bimodal histogram with

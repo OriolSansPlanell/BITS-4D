@@ -97,8 +97,8 @@ def test_active_roi_is_optional(window):
     window.dual_histogram.get_roi_manager().set_rectangle_roi(*RECT_A)
     with_active, _ = window._histogram_slice_figure_panels(True)
     without, _ = window._histogram_slice_figure_panels(False)
-    assert "Active ROI (unsaved)" in [o[0] for o in with_active.overlays]
-    assert "Active ROI (unsaved)" not in [o[0] for o in without.overlays]
+    assert "Unsaved ROI" in [o[0] for o in with_active.overlays]
+    assert "Unsaved ROI" not in [o[0] for o in without.overlays]
 
 
 def test_hidden_class_is_left_out_of_both_panels(window, monkeypatch):
@@ -119,7 +119,7 @@ def test_export_action_writes_the_file(window, monkeypatch, tmp_path):
         main_window.FigureExportDialog, "exec_",
         lambda self: (self._on_accept(), QDialog.Accepted)[1],
     )
-    target = tmp_path / "figure.png"
+    target = tmp_path / "figure.svg"
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName",
         staticmethod(lambda *a, **k: (str(target), "")),

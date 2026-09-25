@@ -76,7 +76,7 @@ def _apply_correctness_fixes(main_window_cls: Type, slice_viewer_cls: Type) -> N
 
         # Segment every ROI shown on the histogram: all named class ROIs plus
         # the active (unsaved) one, so batch results match the display.
-        if roi_manager.has_named_rois():
+        if roi_manager.has_named_rois() or roi_manager.unsaved_count() > 1:
             roi_specs = self._enumerate_roi_specs(roi_manager)
         else:
             roi_specs = None

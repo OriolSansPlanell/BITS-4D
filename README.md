@@ -45,10 +45,17 @@ back to voxels.
   value in the exported label volumes, its voxel count at every timepoint,
   and the settings the segmentation was made with.
 - **Histogram + slice figure** — *File → Export Histogram + Slice Figure*
-  (Ctrl+Shift+F) saves a two-panel figure: on the left the local bimodal
-  histogram with every label's selection drawn on top, on the right the slice
-  currently displayed with the same labels highlighted in the same colours.
-  PNG, PDF, SVG or TIFF, at the resolution you choose.
+  (Ctrl+Shift+F) saves a two-panel **SVG** figure: on the left the local
+  bimodal histogram with every label's selection drawn on top, on the right
+  the slice currently displayed with the same labels highlighted in the same
+  colours. Text stays editable; PDF, PNG or TIFF can be chosen instead.
+- **Editing regions on the histogram** — draw several regions and save them
+  together (one class each), click any region to select it, move it with the
+  arrow keys (one histogram bin per press, Shift for ten) and remove it with
+  Backspace.
+- **Fits a laptop screen** — the window sizes itself to the screen; on a
+  narrow panel the two histograms become tabs, button rows wrap, and the
+  spatial tools can be folded away, so a 14" or 16" laptop is enough.
 - **Quality metrics** — *Analytics → Histogram Time Analysis → Histogram &
   Segmentation Metrics* writes a CSV of every ground-truth-free metric
   (streak and smear scores, marginal asymmetry and drift, Davies–Bouldin

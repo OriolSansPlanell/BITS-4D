@@ -16,6 +16,7 @@ main.py
     ├── manual_content.py         Its text: how-to and mathematics
     ├── selection_manager.py      Saved selections (mask + histogram ROI)
     ├── statistics_panel.py       Live per-selection statistics
+    ├── responsive.py             Wrapping rows, plot tabs, fit-to-screen
     └── time_navigation_widget.py Timepoint slider / playback
 
 Computation layer (GUI-independent, scriptable):
@@ -115,10 +116,26 @@ locks this property in; keep it green when touching any of these modules.
 
 `ROIManager` holds two layers of state:
 
-- an **active ROI** (`roi_type`, `polygon_points` / `rectangle`) — the shape
-  currently drawn/edited on the canvases, and
+- **unsaved ROIs** — drawn but not yet named. The newest is the **active
+  ROI** (`roi_type`, `polygon_points` / `rectangle`), the one editing and
+  the vertex handles work on; earlier ones wait in `pending_rois`. The
+  canvas calls `stash_active()` before a newly drawn ROI becomes active, so a
+  second ROI adds to the first instead of replacing it.
+  `get_unsaved_rois()` lists them all with a preview colour (the colour each
+  will get as a class), and `save_unsaved_as_classes(names)` turns every one
+  into its own class;
 - a list of **named class ROIs** (`named_rois`) — saved classes for
   multi-material workflows, each with a `visible` flag.
+
+One ROI at a time can be **selected** (`selected`, a `('named' | 'pending' |
+'active', index)` key; read it through `get_selected()`, which drops a key
+whose ROI has gone). `hit_test()` finds the topmost ROI under a click,
+`translate()` moves one and `remove_unsaved()` deletes an unsaved one.
+`HistogramCanvas` wires these to the mouse and to the arrow keys (one
+histogram bin per press, Shift for ten) and Backspace/Delete, which the
+panel routes through the same removal path as the *Remove* button so a saved
+class is confirmed first. Every unsaved ROI is segmented: with more than one,
+`_enumerate_roi_specs()` gives each its own layer ("Unsaved ROI n").
 
 **Visibility is not just a display flag**: a hidden class is excluded from
 the overlays *and* from segmentation (`has_roi`, `is_inside_roi`,
@@ -362,13 +379,36 @@ the list directly from one source erased the others.
 Figure*) saves what is on screen as one two-panel figure.
 `BiTS4DMainWindow._histogram_slice_figure_panels()` gathers it: the local
 canvas's `histogram_data`, scale and range, its `roi_overlays` (plus,
-optionally, the unsaved ROI), and the slice viewer's `current_slice` with
+optionally, every unsaved ROI), and the slice viewer's `current_slice` with
 every `mask_overlays` entry re-sliced by `_slice_mask_for_display`. It
 returns `utils.figure_export.HistogramPanel` / `SlicePanel`, which
 `save_histogram_slice_figure()` renders with plain matplotlib — so the figure
 is testable without Qt, and anything that changes what the screen shows
 changes the figure the same way. The slice is the *displayed* one, so on a
-binned dataset the figure carries a note saying so.
+binned dataset the figure carries a note saying so. SVG is the default
+format, written with `svg.fonttype = none` so text stays editable.
+
+## Screen size
+
+The window is built to fit a laptop (tested against 1280×720). Nothing sets
+a large fixed minimum; instead `gui/responsive.py` provides:
+
+- `FlowLayout` / `flow_row()` — rows of controls that wrap. The container
+  raises its own minimum height to what the wrapping needs, because
+  splitters and scroll areas ignore height-for-width.
+- `PlotPanes` — the global and local histograms side by side when the panel
+  is wide enough, otherwise tabs showing one at a time (panes are hidden, not
+  re-parented).
+- `scrollable()` — each main column and every right-hand tab sits in a
+  scroll area, so when the window is smaller than a column's content that
+  column scrolls instead of forcing the window wider.
+- `fit_to_screen()` — opens the window at the preferred size or what the
+  screen offers, and flags a small screen (the spatial tools then start
+  folded).
+
+`tests/test_responsive_layout.py` checks the window's minimum size against a
+1280×720 screen; keep it passing when adding controls — put new rows of
+buttons in a `flow_row`, not a `QHBoxLayout`.
 
 ## Execution model
 
