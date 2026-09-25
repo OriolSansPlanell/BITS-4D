@@ -45,6 +45,7 @@ Computation layer (GUI-independent, scriptable):
     model/segmenter.py            The HMRF-EM loop over a series
     utils/roi_manager.py          Histogram-space ROI state + containment tests
     utils/clustering_3d.py        Scale-aware K-means on paired volumes
+    utils/kmeans_levels.py        K-means at slice / volume / time-series scale
     utils/region_growing.py       2-D flood fill (uni/bivariate)
     utils/region_growing_3d.py    3-D connected region growing
     utils/value_extractor.py      Spatial rectangle → intensity values
@@ -361,6 +362,32 @@ must go through that composer (`_refresh_slice_overlays()` for an
 overlay-only update, `_apply_segmentation_overlays()` when the base image
 changes too) rather than calling `set_mask_overlays()` with its own list,
 which would erase the other source.
+
+### K-means at three scales
+
+`utils/kmeans_levels.py` (no Qt) holds the three levels; the main window's
+`_run_kmeans()` dispatches on the scope chosen on the *Auto Seg* tab (the
+viewer's *Auto-Detect* button only brings those settings forward):
+
+- **slice** — `cluster_slice()` on the displayed slice; results become 2-D
+  selections pinned to that plane ("Slice cluster *k*").
+- **volume** — `KMeans3D.cluster_volume()` on the current timepoint's display
+  volumes; 3-D selections ("3D Cluster *k*") that
+  `_convert_kmeans_clusters_to_materials()` turns into layers.
+- **series** — `run_series_clustering()`: local histograms (from the engine
+  cache, computed where missing), `cluster_series()` on the shared bin grid,
+  then one bin-lookup pass per timepoint (`SeriesClustering.label_volume`).
+  The window writes a layer per cluster at every timepoint where it has
+  voxels ("Series cluster *k*", "Transient phase *j*"), replacing earlier
+  series layers, and records `outline(k)` as each layer's histogram shape.
+
+Persistent clusters are weighted K-means on bin centres; transient phases
+are islands found by `find_transient_islands()` and appended after them.
+The criteria and why K-means alone cannot find them are in the manual
+(*Mathematics → K-means at three scales*). Every re-run replaces its own
+selections (`SelectionManagerWidget.remove_selections`) or layers, never
+anything else. Memory: a time-series run stores one boolean mask per present
+cluster per timepoint, like any other layer.
 
 ### Histogram overlays
 

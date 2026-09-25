@@ -145,12 +145,42 @@ selection into a histogram region. The software takes the intensity pairs of
 the voxels you picked and builds the region around them.</p>
 
 <h2>From K-means</h2>
-<p>On the <i>Auto Seg</i> tab, run 3-D K-means and press <b>Copy K-means
-Clusters to Materials</b>. Each cluster becomes a material and behaves exactly
-like a drawn one from then on — including the control setting, so a cluster
-you recognise as the casing can be marked <i>Stays unchanged</i> like any
-other. Rename them on the selection panel to something meaningful before you
-run the series.</p>
+<p>K-means groups voxels by their (neutron, X-ray) values without you drawing
+anything. On the <i>Auto Seg</i> tab (or with <b>🔍 Auto-Detect</b> under the
+slice) choose a <b>scope</b> and the number of clusters, then press
+<b>Run K-means</b>:</p>
+<table>
+<tr><th>Scope</th><th>What it clusters</th><th>What you get</th></tr>
+<tr><td><b>Slice</b></td><td>The pixels of the slice on screen.
+    Seconds.</td><td>One saved selection per cluster, on that slice, with
+    its region on the histogram. Enough to see which phases a slice holds,
+    or to start drawing from.</td></tr>
+<tr><td><b>Volume</b></td><td>Every voxel of this timepoint.</td><td>One
+    3-D selection per cluster. <b>Copy K-means Clusters to Materials</b>
+    turns them into materials.</td></tr>
+<tr><td><b>Time series</b></td><td>Every timepoint at once, with one shared
+    set of clusters.</td><td>A segmentation layer per cluster at every
+    timepoint, in the same colour throughout, plus a separate cluster for
+    each phase that is present only in some timepoints.</td></tr>
+</table>
+<p>Copied or not, a cluster behaves like a drawn material from then on —
+including the control setting, so a cluster you recognise as the casing can
+be marked <i>Stays unchanged</i> like any other. Rename them to something
+meaningful before you run the series.</p>
+
+<h3>Phases present only in some timepoints</h3>
+<p>With <i>Find phases present only in some timepoints</i> ticked, the
+time-series scope also looks for regions of the histogram that fill at some
+timepoints and are empty at others — a reaction product, a deposit, a phase
+that forms and dissolves. Each becomes a cluster named <i>Transient phase
+1, 2, …</i> however small it is; plain K-means would miss it, because it
+spends its clusters on the bulk of the voxels. The summary says where each
+one is present (for example <i>T2–T5</i>), and <b>Export Cluster
+Timeline</b> writes every cluster's share of the sample at every timepoint
+(CSV) with a plot (SVG).</p>
+<div class="note">Instrument drift moves intensities too, and a large drift
+can look like a new phase. Run <i>Check Instrument Stability</i> first when
+a transient phase appears where you did not expect one.</div>
 
 <h2>What a definition actually is</h2>
 <p>Not the polygon. What the software keeps is where the selected voxels sit
@@ -794,6 +824,66 @@ Cohen's kappa (κ),</p>
 <p>which corrects for the agreement chance alone would produce.</p>
 """
 
+_MATH_KMEANS = """
+<h1>K-means at three scales</h1>
+
+<h2>Slice and volume</h2>
+<p>Each voxel is the point <i>v = (n, x)</i>. Both channels are standardised
+first, <i>z = (v − μ) / σ</i> per channel, because neutron and X-ray values
+can differ by orders of magnitude and unscaled K-means would then separate
+along the larger channel only. K-means minimises</p>
+<span class="m">Σ<sub>i</sub> min<sub>k</sub> ‖z<sub>i</sub> −
+c<sub>k</sub>‖²</span>
+<p>(k-means++ start, ten restarts, the best kept). The volume scope fits on
+up to 250 000 sampled voxels and assigns every voxel to its nearest centre.
+Non-finite values are left unassigned.</p>
+
+<h2>Time series: persistent phases</h2>
+<p>The series is clustered on the histogram plane. With
+<i>h<sub>t</sub>(b)</i> the count in bin <i>b</i> at timepoint <i>t</i> and
+<i>N<sub>t</sub></i> that timepoint's total, each bin is weighted by</p>
+<span class="m">w(b) = (1/T) Σ<sub>t</sub> h<sub>t</sub>(b) /
+N<sub>t</sub></span>
+<p>— the pooled histogram with every timepoint counting equally, which is
+what K-means on an equal number of voxels from each timepoint would see.
+Weighted K-means on the bin centres (standardised with the same weights)
+gives the persistent clusters. With <i>Give small phases more weight</i> the
+weight is <i>log(1 + w(b)·N̄)</i> instead: a small phase then competes on the
+area it covers rather than its voxel count, at the price of splitting a broad
+phase more readily. Every bin of the grid is assigned to its nearest centre,
+so labelling a voxel is a bin lookup — identical to assigning it to the
+nearest centre directly, up to the bin width.</p>
+
+<h2>Time series: transient phases</h2>
+<p>K-means cannot find a phase holding a small fraction of one timepoint: the
+objective is dominated by the bulk of the voxels, so no centre moves to it.
+Such a phase is identified by time instead. Each <i>h<sub>t</sub></i> is
+smoothed with a Gaussian (σ = 1 bin); a bin is <i>occupied</i> at
+<i>t</i> when the smoothed count is ≥ 0.5. Bins occupied at some but fewer
+than half of the timepoints are grown by ⌈3σ⌉+1 bins into bins that are not
+persistently occupied (so the phase's tails stay with it) and grouped into
+connected islands. With <i>C<sub>t</sub></i> an island's total count at
+<i>t</i>, the island is a transient phase when</p>
+<ul>
+<li><i>max<sub>t</sub> C<sub>t</sub> ≥ 10</i> voxels;</li>
+<li><i>max<sub>t</sub> C<sub>t</sub> ≥ m + 5√(m + 1)</i>, with <i>m</i> the
+    median of <i>C<sub>t</sub></i> — five times the counting noise above what
+    the island usually holds;</li>
+<li><i>min<sub>t</sub> C<sub>t</sub> ≤ 0.2 max<sub>t</sub> C<sub>t</sub></i> —
+    it (nearly) vanishes at some timepoint.</li>
+</ul>
+<p>The last two conditions reject the flickering rim of a broad persistent
+phase: its bins come and go individually, but its total barely changes. Each
+island's bins are assigned to a new cluster, numbered after the persistent
+ones; its centre is the peak-count-weighted mean of its bins.</p>
+
+<h2>Presence</h2>
+<p>Cluster <i>k</i> is <i>present</i> at <i>t</i> when it holds at least
+0.1 % of that timepoint's voxels. The per-timepoint counts come straight from
+the histograms (<i>Σ<sub>b ∈ k</sub> h<sub>t</sub>(b)</i>), so they match the
+label volumes exactly.</p>
+"""
+
 _MATH_WHY = """
 <h1>Why there is no classifier</h1>
 
@@ -894,7 +984,9 @@ SECTIONS: List[Dict[str, str]] = [
      "keywords": "begin first steps overview workflow axes neutron xray"},
     {"id": "define", "group": "How to", "title": "Defining materials",
      "body": _DEFINING,
-     "keywords": "roi region polygon rectangle draw class kmeans cluster edit "
+     "keywords": "roi region polygon rectangle draw class kmeans k-means "
+                 "cluster edit slice volume time series transient phase "
+                 "timeline "
                  "select move arrow keys keyboard backspace delete several"},
     {"id": "controls", "group": "How to", "title": "Control materials",
      "body": _CONTROLS,
@@ -947,6 +1039,10 @@ SECTIONS: List[Dict[str, str]] = [
     {"id": "m_metrics", "group": "Mathematics", "title": "The metrics",
      "body": _MATH_METRICS,
      "keywords": "davies bouldin kappa cohen gyration rind iou validation agreement"},
+    {"id": "m_kmeans", "group": "Mathematics",
+     "title": "K-means at three scales", "body": _MATH_KMEANS,
+     "keywords": "kmeans k-means cluster standardise weighted histogram "
+                 "transient island poisson presence timeline"},
     {"id": "m_why", "group": "Mathematics", "title": "Why there is no classifier",
      "body": _MATH_WHY,
      "keywords": "random forest classifier mutual information bayes error legacy"},

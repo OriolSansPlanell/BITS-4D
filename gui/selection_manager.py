@@ -173,6 +173,32 @@ class SelectionManagerWidget(QWidget):
                     visible.append(self.selections[index])
         return visible
     
+    def remove_selections(self, names):
+        """Remove every selection whose name is in *names*.
+
+        Re-running a clustering replaces its earlier selections this way
+        instead of piling up duplicates. Visibility ticks of the remaining
+        selections are kept.
+        """
+        names = set(names)
+        if not any(sel.name in names for sel in self.selections):
+            return
+        visible = {id(sel) for sel in self.get_visible_selections()}
+        kept = [sel for sel in self.selections if sel.name not in names]
+        self.selections = kept
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for index, sel in enumerate(kept):
+            item = QListWidgetItem(sel.name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if id(sel) in visible else Qt.Unchecked)
+            item.setData(Qt.UserRole, index)
+            self.list_widget.addItem(item)
+        self.list_widget.blockSignals(False)
+        self._update_info()
+        self.delete_btn.setEnabled(bool(kept))
+        self.selections_changed.emit()
+
     def clear_all(self):
         """Clear all selections"""
         self.selections = []

@@ -25,9 +25,12 @@ back to voxels.
 - **Spatial → histogram selection** — draw a rectangle or grow a region
   (2-D or full 3-D, univariate or bivariate) on the slice viewer and convert
   it into a histogram ROI automatically.
-- **Automated segmentation** — multi-level Otsu thresholding and K-means
-  clustering (2-D slice, 3-D volume, or hybrid) that generate class masks
-  and histogram overlays.
+- **Automated segmentation** — multi-level Otsu thresholding, and K-means
+  clustering at three scales: the **slice** on screen (seconds), the
+  **volume** of one timepoint, or the whole **time series** with one shared
+  set of clusters. The time-series level also finds **phases present only in
+  some timepoints** (however small), reports when each cluster is present,
+  and exports every cluster's share of the sample over time (CSV + SVG).
 - **Materials panel** — every material, whether drawn on the histogram or
   copied from a K-means clustering, listed with a per-material toggle:
   *Changes* or *Stays unchanged*. Marking the second kind gives every other

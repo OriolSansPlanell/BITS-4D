@@ -9,10 +9,10 @@
 PyQt5>=5.15.0
 
 # Scientific computing
-numpy>=1.20.0,<2.0.0  # Keep NumPy 1.x for compatibility
-matplotlib>=3.3.0
+numpy>=1.22.0         # NumPy 1.x and 2.x both work
+matplotlib>=3.5.0     # matplotlib.colormaps registry
 scipy>=1.6.0          # Region growing, convex hulls, image filters
-scikit-learn>=0.24.0  # K-means clustering, Random Forest
+scikit-learn>=1.0.0   # K-means clustering (weighted), legacy classifier
 
 # Image I/O
 tifffile>=2021.0.0

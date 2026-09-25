@@ -74,6 +74,9 @@ class SliceViewerWidget(QWidget):
     # Signal emitted when clusters are detected (for selection manager)
     # Arguments: (list of (name, spatial_mask, histogram_roi, cluster_id, color))
     clusters_detected = pyqtSignal(list)
+
+    # The Auto-Detect button: K-means is configured and run by the window
+    kmeans_requested = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -271,7 +274,11 @@ class SliceViewerWidget(QWidget):
         
         # Auto-detect features button
         self.auto_detect_btn = QPushButton("🔍 Auto-Detect")
-        self.auto_detect_btn.setToolTip("Automatically detect features in slice")
+        self.auto_detect_btn.setToolTip(
+            "K-means clustering of the (neutron, X-ray) values: on this slice,\n"
+            "on this timepoint's volume, or on the whole time series.\n"
+            "Opens the K-means settings on the Auto Seg tab."
+        )
         self.auto_detect_btn.clicked.connect(self._on_auto_detect)
         spatial.append(self.auto_detect_btn)
         
@@ -488,628 +495,13 @@ class SliceViewerWidget(QWidget):
         self.canvas.draw_idle()
     
     def _on_auto_detect(self):
-        """Automatically detect features using histogram clustering + spatial density"""
-        import sys
-        from PyQt5.QtWidgets import QInputDialog, QMessageBox, QDialog, QVBoxLayout, QLabel, QRadioButton, QDialogButtonBox
-        
-        print("Auto-detecting features using histogram clustering...", file=sys.stderr)
-        
-        if self.current_slice is None or self.current_slice_data is None:
-            QMessageBox.warning(self, "No Data", "No slice data available")
-            return
-        
-        # Check if 3D mode is possible
-        is_3d_available = self.mode_3d_cb.isChecked()
-        
-        # If 3D mode, offer choice
-        if is_3d_available:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Clustering Mode")
-            layout = QVBoxLayout()
-            
-            layout.addWidget(QLabel("Choose clustering mode:"))
-            
-            mode_3d = QRadioButton("3D Volume Clustering (Comprehensive)")
-            mode_3d.setToolTip("Clusters entire 3D volume - best for connected features")
-            
-            mode_2d = QRadioButton("2D Slice Clustering (Current slice only)")
-            mode_2d.setToolTip("Clusters current slice - better for low-density features")
-            
-            mode_hybrid = QRadioButton("Hybrid Mode (Recommended)")
-            mode_hybrid.setToolTip("Runs both 2D and 3D clustering, keeps unique ROIs from each")
-            mode_hybrid.setChecked(True)  # Default to hybrid
-            
-            layout.addWidget(mode_3d)
-            layout.addWidget(mode_2d)
-            layout.addWidget(mode_hybrid)
-            
-            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            layout.addWidget(buttons)
-            
-            dialog.setLayout(layout)
-            
-            if dialog.exec_() != QDialog.Accepted:
-                return
-            
-            # Determine mode
-            if mode_hybrid.isChecked():
-                self._auto_detect_hybrid()
-            elif mode_3d.isChecked():
-                self._auto_detect_3d()
-            else:
-                self._auto_detect_2d()
-        else:
-            # 2D mode only
-            self._auto_detect_2d()
-    
-    def _auto_detect_3d(self):
-        """3D k-means clustering on entire volume"""
-        import sys
-        from utils.clustering_3d import KMeans3D
-        from utils.region_growing_3d import RegionGrowing3D
-        from PyQt5.QtWidgets import QInputDialog
-        import numpy as np
-        import matplotlib.cm as cm
-        
-        print("Starting 3D k-means clustering on volume...", file=sys.stderr)
-        
-        # Get volumes
-        neutron_vol, xray_vol = self.current_slice_data
-        
-        # Ask user for number of clusters
-        num_clusters, ok = QInputDialog.getInt(
-            self, "3D Histogram Clustering", 
-            "Number of clusters/regions to detect (3D):",
-            5, 2, 20, 1
-        )
-        
-        if not ok:
-            return
-        
-        try:
-            # Show progress
-            from utils.progress_dialog import ProgressDialog
-            progress = ProgressDialog(
-                "3D Clustering",
-                "Computing k-means on 3D volume...",
-                0,  # Indeterminate
-                self
-            )
-            progress.show()
-            QApplication.processEvents()
-            
-            # Perform 3D k-means
-            labels_3d, centers, cluster_stats = KMeans3D.cluster_volume(
-                neutron_vol,
-                xray_vol,
-                n_clusters=num_clusters
-            )
-            
-            progress.close()
-            
-            # Store 3D cluster information
-            self.cluster_map_3d = labels_3d
-            self.cluster_centers = centers
-            self.num_clusters = num_clusters
-            
-            # Extract 2D slice for display
-            self.cluster_map = RegionGrowing3D.extract_slice_from_3d_mask(
-                labels_3d,
-                self.current_axis,
-                self.current_slice_index
-            )
-            
-            # Create cluster selections
-            cluster_selections = []
-            cmap = cm.get_cmap('tab10')
-            
-            for cluster_id in range(num_clusters):
-                # Get 3D mask
-                mask_3d = (labels_3d == cluster_id)
-                
-                # Get 2D slice mask
-                mask_2d = RegionGrowing3D.extract_slice_from_3d_mask(
-                    mask_3d,
-                    self.current_axis,
-                    self.current_slice_index
-                )
-                
-                # Get ROI for histogram
-                neutron_vals = neutron_vol[mask_3d]
-                xray_vals = xray_vol[mask_3d]
-                
-                roi_vertices = KMeans3D.create_convex_hull_roi_3d(
-                    neutron_vals,
-                    xray_vals
-                )
-                
-                color = cmap(cluster_id / num_clusters)
-                
-                cluster_selections.append((
-                    f"3D Cluster {cluster_id}",
-                    mask_2d,  # 2D for display
-                    roi_vertices,
-                    cluster_id,
-                    color,
-                    mask_3d  # Store 3D mask too
-                ))
-            
-            # Emit signal with clusters
-            self.clusters_detected.emit(cluster_selections)
-            
-            QMessageBox.information(
-                self,
-                "3D Clustering Complete",
-                f"Detected {num_clusters} clusters in 3D volume.\n\n"
-                f"Clusters saved to Selection Manager.\n"
-                f"Each selection represents the entire 3D cluster.\n\n"
-                f"💡 Tip: Use histogram polygon tool to manually add\n"
-                f"ROIs for low-density features that were missed."
-            )
-            
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"3D clustering failed:\n{str(e)}"
-            )
-            import traceback
-            traceback.print_exc()
-    
-    def _auto_detect_hybrid(self):
-        """Hybrid mode: Run both 2D and 3D clustering, merge unique ROIs"""
-        import sys
-        from PyQt5.QtWidgets import QInputDialog
-        
-        print("Starting HYBRID clustering (2D + 3D)...", file=sys.stderr)
-        
-        # Ask for number of clusters
-        num_clusters, ok = QInputDialog.getInt(
-            self, "Hybrid Clustering", 
-            "Number of clusters for each method:",
-            5, 2, 10, 1
-        )
-        
-        if not ok:
-            return
-        
-        try:
-            from utils.progress_dialog import ProgressDialog
-            progress = ProgressDialog(
-                "Hybrid Clustering",
-                "Running 2D clustering on current slice...",
-                0,
-                self
-            )
-            progress.show()
-            QApplication.processEvents()
-            
-            # Run 2D clustering first
-            print("Phase 1: 2D clustering...", file=sys.stderr)
-            
-            # Get current slice for both neutron and X-ray
-            neutron_vol, xray_vol = self.current_slice_data
-            
-            # Extract current slice based on axis
-            if self.current_axis == 'z':
-                neutron_slice = neutron_vol[self.current_slice_index, :, :]
-                xray_slice = xray_vol[self.current_slice_index, :, :]
-            elif self.current_axis == 'y':
-                neutron_slice = neutron_vol[:, self.current_slice_index, :]
-                xray_slice = xray_vol[:, self.current_slice_index, :]
-            else:  # x
-                neutron_slice = neutron_vol[:, :, self.current_slice_index]
-                xray_slice = xray_vol[:, :, self.current_slice_index]
-            
-            # Flatten and cluster
-            neutron_flat = neutron_slice.flatten()
-            xray_flat = xray_slice.flatten()
-            points = np.column_stack([neutron_flat, xray_flat])
-            
-            from sklearn.cluster import KMeans
-            kmeans_2d = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
-            labels_2d = kmeans_2d.fit_predict(points)
-            labels_2d = labels_2d.reshape(neutron_slice.shape)
-            
-            # Store 2D clusters
-            clusters_2d = []
-            for i in range(num_clusters):
-                mask = (labels_2d == i)
-                neutron_vals = neutron_slice[mask]
-                xray_vals = xray_slice[mask]
-                clusters_2d.append((mask, neutron_vals, xray_vals))
-            
-            print(f"  2D: {num_clusters} clusters found", file=sys.stderr)
-            
-            # Run 3D clustering
-            progress.setLabelText("Running 3D clustering on volume...")
-            QApplication.processEvents()
-            
-            print("Phase 2: 3D clustering...", file=sys.stderr)
-            # neutron_vol and xray_vol already extracted above
-            
-            from utils.clustering_3d import KMeans3D
-            from utils.region_growing_3d import RegionGrowing3D
-            
-            labels_3d, centers_3d, stats_3d = KMeans3D.cluster_volume(
-                neutron_vol, xray_vol,
-                n_clusters=num_clusters
-            )
-            
-            # Store 3D clusters
-            clusters_3d = []
-            for i in range(num_clusters):
-                mask_3d = (labels_3d == i)
-                mask_2d = RegionGrowing3D.extract_slice_from_3d_mask(
-                    mask_3d, self.current_axis, self.current_slice_index
-                )
-                neutron_vals = neutron_vol[mask_3d]
-                xray_vals = xray_vol[mask_3d]
-                clusters_3d.append((mask_2d, neutron_vals, xray_vals, mask_3d))
-            
-            print(f"  3D: {num_clusters} clusters found", file=sys.stderr)
-            
-            # Merge: Keep all 2D clusters + non-overlapping 3D clusters
-            progress.setLabelText("Merging results...")
-            QApplication.processEvents()
-            
-            print("Phase 3: Merging unique ROIs...", file=sys.stderr)
-            
-            import matplotlib.cm as cm
-            cmap = cm.get_cmap('tab20')  # More colors for hybrid
-            
-            all_clusters = []
-            color_idx = 0
-            
-            # Add all 2D clusters
-            for i, (mask_2d, n_vals, x_vals) in enumerate(clusters_2d):
-                roi_vertices = self._create_roi_from_cluster(n_vals, x_vals)
-                color = cmap(color_idx / (num_clusters * 2))
-                all_clusters.append((
-                    f"2D Cluster {i}",
-                    mask_2d,
-                    roi_vertices,
-                    i,
-                    color
-                ))
-                color_idx += 1
-            
-            # Add 3D clusters
-            for i, (mask_2d, n_vals, x_vals, mask_3d) in enumerate(clusters_3d):
-                roi_vertices = KMeans3D.create_convex_hull_roi_3d(
-                    n_vals, x_vals,
-                    percentile=98,
-                    density_aware=True
-                )
-                color = cmap(color_idx / (num_clusters * 2))
-                all_clusters.append((
-                    f"3D Cluster {i}",
-                    mask_2d,
-                    roi_vertices,
-                    i + num_clusters,  # Offset cluster IDs
-                    color,
-                    mask_3d
-                ))
-                color_idx += 1
-            
-            progress.close()
-            
-            # Emit all clusters
-            self.clusters_detected.emit(all_clusters)
-            
-            QMessageBox.information(
-                self,
-                "Hybrid Clustering Complete",
-                f"Combined results:\n"
-                f"  • {num_clusters} clusters from 2D (current slice)\n"
-                f"  • {num_clusters} clusters from 3D (full volume)\n"
-                f"  • Total: {len(all_clusters)} selections\n\n"
-                f"2D clusters capture low-density features\n"
-                f"3D clusters capture volumetric coherence\n\n"
-                f"All saved to Selection Manager."
-            )
-            
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Hybrid clustering failed:\n{str(e)}"
-            )
-            import traceback
-            traceback.print_exc()
-    
-    def _create_roi_from_cluster(self, neutron_vals, xray_vals):
-        """Helper to create ROI from cluster data (for 2D clusters)"""
-        from scipy.spatial import ConvexHull
-        
-        # Subsample if needed
-        if len(neutron_vals) > 5000:
-            indices = np.random.choice(len(neutron_vals), 5000, replace=False)
-            neutron_vals = neutron_vals[indices]
-            xray_vals = xray_vals[indices]
-        
-        # Create convex hull
-        points = np.column_stack([neutron_vals, xray_vals])
-        
-        try:
-            if len(points) >= 3:
-                hull = ConvexHull(points)
-                return points[hull.vertices]
-            else:
-                # Rectangle fallback
-                n_min, n_max = np.min(neutron_vals), np.max(neutron_vals)
-                x_min, x_max = np.min(xray_vals), np.max(xray_vals)
-                return np.array([
-                    [n_min, x_min], [n_max, x_min],
-                    [n_max, x_max], [n_min, x_max]
-                ])
-        except:
-            n_min, n_max = np.min(neutron_vals), np.max(neutron_vals)
-            x_min, x_max = np.min(xray_vals), np.max(xray_vals)
-            return np.array([
-                [n_min, x_min], [n_max, x_min],
-                [n_max, x_max], [n_min, x_max]
-            ])
-    
-    def _auto_detect_2d(self):
-        """2D k-means clustering on current slice (original behavior)"""
-        import sys
-        from utils.feature_detection import FeatureDetector
-        from utils.region_growing import RegionGrowing
-        from PyQt5.QtWidgets import QInputDialog
-        from sklearn.cluster import KMeans
-        import numpy as np
-        import matplotlib.cm as cm
-        
-        print("Auto-detecting features using histogram clustering...", file=sys.stderr)
-        
-        if self.current_slice is None or self.current_slice_data is None:
-            QMessageBox.warning(self, "No Data", "No slice data available")
-            return
-        
-        # Get both slices for bivariate analysis
-        neutron_vol, xray_vol = self.current_slice_data
-        
-        # Extract both slices
-        if self.current_axis == 'z':
-            neutron_slice = neutron_vol[self.current_slice_index, :, :]
-            xray_slice = xray_vol[self.current_slice_index, :, :]
-        elif self.current_axis == 'y':
-            neutron_slice = neutron_vol[:, self.current_slice_index, :]
-            xray_slice = xray_vol[:, self.current_slice_index, :]
-        else:  # 'x'
-            neutron_slice = neutron_vol[:, :, self.current_slice_index]
-            xray_slice = xray_vol[:, :, self.current_slice_index]
-        
-        # Ask user for number of clusters
-        num_clusters, ok = QInputDialog.getInt(
-            self, "Histogram Clustering", 
-            "Number of clusters/regions to detect:",
-            5, 2, 20, 1
-        )
-        
-        if not ok:
-            return
-        
-        try:
-            print(f"  Performing k-means clustering with {num_clusters} clusters", file=sys.stderr)
-            
-            # Create 2D point cloud from histogram
-            neutron_flat = neutron_slice.flatten()
-            xray_flat = xray_slice.flatten()
-            
-            # Stack into (N, 2) array for clustering
-            points = np.column_stack([neutron_flat, xray_flat])
-            
-            # Perform k-means clustering
-            kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(points)
-            cluster_centers = kmeans.cluster_centers_
-            
-            print(f"  Cluster centers:", file=sys.stderr)
-            for i, center in enumerate(cluster_centers):
-                print(f"    Cluster {i}: Neutron={center[0]:.0f}, X-ray={center[1]:.0f}", file=sys.stderr)
-            
-            # Reshape labels back to image shape
-            label_map = labels.reshape(neutron_slice.shape)
-            
-            # Store cluster information
-            self.cluster_map = label_map
-            self.cluster_centers = cluster_centers
-            self.num_clusters = num_clusters
-            
-            # Calculate spatial density for each cluster
-            print("  Computing spatial density for each cluster...", file=sys.stderr)
-            
-            # Divide slice into grid for density calculation
-            grid_rows, grid_cols = 10, 10  # 10x10 grid
-            height, width = neutron_slice.shape
-            cell_height = height // grid_rows
-            cell_width = width // grid_cols
-            
-            # For each cluster, find where it's concentrated
-            cluster_density = np.zeros((num_clusters, grid_rows, grid_cols))
-            
-            for cluster_id in range(num_clusters):
-                cluster_mask = (label_map == cluster_id)
-                
-                # Count pixels in each grid cell
-                for i in range(grid_rows):
-                    for j in range(grid_cols):
-                        y_start = i * cell_height
-                        y_end = (i + 1) * cell_height if i < grid_rows - 1 else height
-                        x_start = j * cell_width
-                        x_end = (j + 1) * cell_width if j < grid_cols - 1 else width
-                        
-                        cell_mask = cluster_mask[y_start:y_end, x_start:x_end]
-                        cluster_density[cluster_id, i, j] = np.sum(cell_mask)
-            
-            # Find representative points for each cluster (density peaks)
-            features = []
-            for cluster_id in range(num_clusters):
-                density = cluster_density[cluster_id]
-                
-                # Find cell with highest density
-                max_i, max_j = np.unravel_index(np.argmax(density), density.shape)
-                
-                # Get center of that cell
-                y_center = int(max_i * cell_height + cell_height / 2)
-                x_center = int(max_j * cell_width + cell_width / 2)
-                
-                # Find exact peak within that cell
-                y_start = max_i * cell_height
-                y_end = (max_i + 1) * cell_height if max_i < grid_rows - 1 else height
-                x_start = max_j * cell_width
-                x_end = (max_j + 1) * cell_width if max_j < grid_cols - 1 else width
-                
-                # Get cluster pixels in this cell
-                cell_cluster_mask = label_map[y_start:y_end, x_start:x_end] == cluster_id
-                
-                if np.any(cell_cluster_mask):
-                    # Find centroid of cluster pixels in this cell
-                    y_coords, x_coords = np.where(cell_cluster_mask)
-                    y_peak = int(np.mean(y_coords)) + y_start
-                    x_peak = int(np.mean(x_coords)) + x_start
-                    
-                    features.append((y_peak, x_peak, cluster_id))
-                    
-                    print(f"  Cluster {cluster_id}: Peak at ({y_peak}, {x_peak}), "
-                          f"Density={density[max_i, max_j]:.0f}", file=sys.stderr)
-            
-            if len(features) == 0:
-                QMessageBox.information(self, "No Features", "No cluster peaks detected.")
-                return
-            
-            # Store detected features (without cluster_id for display)
-            self.detected_features = [(y, x) for y, x, _ in features]
-            self.cluster_assignments = {(y, x): cid for y, x, cid in features}
-            
-            # Display cluster map overlay
-            self._display_cluster_map()
-            
-            # Display feature markers with cluster colors
-            self._display_cluster_markers()
-            
-            # Update info
-            self.info_label.setText(
-                f"Detected {num_clusters} clusters - Click on marker to select region"
-            )
-            
-            # Enable region grow mode
-            if not self.region_grow_btn.isChecked():
-                self.region_grow_btn.setChecked(True)
-            
-            # Prepare cluster selections for emission
-            cmap = cm.get_cmap('tab10')
-            
-            cluster_selections = []
-            
-            for cluster_id in range(num_clusters):
-                # Create mask for this cluster
-                cluster_mask = (label_map == cluster_id)
-                
-                # Get cluster color
-                color = cmap(cluster_id / num_clusters)
-                
-                # Extract values for this cluster
-                neutron_vals = neutron_slice[cluster_mask]
-                xray_vals = xray_slice[cluster_mask]
-                
-                # Create ROI vertices (convex hull)
-                roi_vertices = RegionGrowing.create_convex_hull_roi(
-                    neutron_vals, xray_vals, margin=0.05
-                )
-                
-                # Add to list
-                cluster_selections.append((
-                    f"Cluster {cluster_id}",  # name
-                    cluster_mask,              # spatial_mask
-                    roi_vertices,              # histogram_roi
-                    cluster_id,                # cluster_id
-                    color                      # color
-                ))
-            
-            # Emit signal for main window to save to selection manager
-            self.clusters_detected.emit(cluster_selections)
-            
-            print(f"  Emitted {num_clusters} clusters for saving", file=sys.stderr)
-            
-        except Exception as e:
-            print(f"Error detecting features: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
-            QMessageBox.warning(self, "Detection Error", f"Error detecting features:\n{e}")
-    
-    def _display_cluster_map(self):
-        """Display cluster map as colored overlay"""
-        if not hasattr(self, 'cluster_map'):
-            return
-        
-        # Remove old cluster overlay
-        if hasattr(self, 'cluster_overlay') and self.cluster_overlay is not None:
-            try:
-                self.cluster_overlay.remove()
-            except:
-                pass
-            self.cluster_overlay = None
-        
-        # Create colored overlay from cluster map
-        import matplotlib.cm as cm
-        import matplotlib.colors as mcolors
-        
-        # Use a colormap
-        cmap = cm.get_cmap('tab10')
-        
-        # Create RGBA image
-        cluster_rgba = np.zeros((*self.cluster_map.shape, 4))
-        
-        for cluster_id in range(self.num_clusters):
-            mask = (self.cluster_map == cluster_id)
-            color = cmap(cluster_id / self.num_clusters)
-            cluster_rgba[mask] = [color[0], color[1], color[2], 0.3]  # Semi-transparent
-        
-        # Display overlay
-        self.cluster_overlay = self.ax.imshow(
-            cluster_rgba,
-            extent=self.ax.images[0].get_extent() if self.ax.images else None,
-            zorder=9,
-            interpolation='nearest'
-        )
-        
-        self.canvas.draw_idle()
-    
-    def _display_cluster_markers(self):
-        """Display markers for cluster centers with cluster-specific colors"""
-        import matplotlib.cm as cm
-        
-        # Remove old markers
-        for marker in self.feature_markers:
-            try:
-                marker.remove()
-            except:
-                pass
-        self.feature_markers = []
-        
-        # Get colormap
-        cmap = cm.get_cmap('tab10')
-        
-        # Add new markers with cluster colors
-        for y, x in self.detected_features:
-            cluster_id = self.cluster_assignments[(y, x)]
-            color = cmap(cluster_id / self.num_clusters)
-            
-            marker = self.ax.plot(x, y, 'o', 
-                                markersize=15, 
-                                markeredgewidth=3,
-                                markerfacecolor='none',
-                                markeredgecolor=color,
-                                zorder=15)[0]
-            self.feature_markers.append(marker)
-        
-        self.canvas.draw_idle()
-    
+        """Ask for K-means clustering (slice, volume or time series).
+
+        The clustering itself lives in the main window, which has the whole
+        dataset and the histogram engine — the time-series level needs both.
+        """
+        self.kmeans_requested.emit()
+
     def set_volume_shape(self, shape):
         """Set the volume shape for slider configuration"""
         self.volume_shape = shape
@@ -2291,6 +1683,8 @@ class BiTS4DMainWindow(QMainWindow):
         # Latest 3-D K-means result, available to copy in as materials
         self._last_kmeans_cluster_selections = []
         self._cluster_timepoint = None
+        # Latest time-series K-means result (utils.kmeans_levels)
+        self.kmeans_series_result = None
 
         # Current state
         self.global_histogram = None
@@ -2415,6 +1809,7 @@ class BiTS4DMainWindow(QMainWindow):
         self.slice_viewer.spatial_roi_to_histogram.connect(
             self._on_create_histogram_roi_from_spatial)
         self.slice_viewer.clusters_detected.connect(self._on_clusters_detected)
+        self.slice_viewer.kmeans_requested.connect(self._show_kmeans_controls)
         viewer_layout.addWidget(self.slice_viewer)
         viewer_group.setLayout(viewer_layout)
         centre_vbox.addWidget(viewer_group)
@@ -2476,8 +1871,8 @@ class BiTS4DMainWindow(QMainWindow):
 
         auto_info = QLabel(
             "<b>Automated Segmentation</b><br>"
-            "Run Otsu thresholding or K-means to generate initial class masks "
-            "on the current timepoint, which are then ready to train the RF."
+            "Run Otsu thresholding or K-means clustering to generate "
+            "segmentation layers without drawing anything."
         )
         auto_info.setWordWrap(True)
         auto_info.setStyleSheet("color: #555; font-size: 9pt;")
@@ -2526,33 +1921,103 @@ class BiTS4DMainWindow(QMainWindow):
         kmeans_group = QGroupBox("K-means Clustering")
         km_layout = QVBoxLayout()
         km_info = QLabel(
-            "Use the <b>🔍 Auto-Detect</b> button in the Volume Viewer to run\n"
-            "3-D k-means clustering. Then convert every detected cluster into\n"
-            "a saved RF training class with one click."
+            "Groups voxels by their (neutron, X-ray) values, at one of three "
+            "scales. <b>Slice</b> is quick; <b>Volume</b> covers this "
+            "timepoint; <b>Time series</b> covers every timepoint with one "
+            "shared set of clusters and also finds phases present only in "
+            "some timepoints."
         )
         km_info.setWordWrap(True)
         km_info.setStyleSheet("color: #555; font-size: 9pt;")
         km_layout.addWidget(km_info)
+
+        km_form = QFormLayout()
+        self.kmeans_scope_combo = QComboBox()
+        self.kmeans_scope_combo.addItem("Slice — the slice on screen (fast)", "slice")
+        self.kmeans_scope_combo.addItem("Volume — this timepoint", "volume")
+        self.kmeans_scope_combo.addItem("Time series — every timepoint", "series")
+        self.kmeans_scope_combo.setCurrentIndex(1)
+        self.kmeans_scope_combo.setToolTip(
+            "Slice: seconds; gives 2-D selections on this slice.\n"
+            "Volume: every voxel of this timepoint; gives 3-D selections\n"
+            "that can be copied to materials.\n"
+            "Time series: one clustering for all timepoints, so a cluster\n"
+            "keeps its colour through time; also finds phases that appear\n"
+            "only in some timepoints. Writes segmentation layers for every\n"
+            "timepoint."
+        )
+        km_form.addRow("Scope:", self.kmeans_scope_combo)
+
+        self.kmeans_clusters_spin = QSpinBox()
+        self.kmeans_clusters_spin.setRange(2, 20)
+        self.kmeans_clusters_spin.setValue(4)
+        self.kmeans_clusters_spin.setToolTip(
+            "Number of clusters. For the time series, the number of phases\n"
+            "present throughout; phases found only in some timepoints are\n"
+            "added on top."
+        )
+        km_form.addRow("Clusters:", self.kmeans_clusters_spin)
+        km_layout.addLayout(km_form)
+
+        self.kmeans_transient_cb = QCheckBox(
+            "Find phases present only in some timepoints"
+        )
+        self.kmeans_transient_cb.setChecked(True)
+        self.kmeans_transient_cb.setToolTip(
+            "Time series only. Looks for regions of the histogram that fill\n"
+            "at some timepoints and are empty at others, and makes each one\n"
+            "a cluster of its own, however small. Instrument drift can look\n"
+            "like this too — check instrument stability first."
+        )
+        km_layout.addWidget(self.kmeans_transient_cb)
+
+        self.kmeans_small_cb = QCheckBox("Give small phases more weight")
+        self.kmeans_small_cb.setChecked(False)
+        self.kmeans_small_cb.setToolTip(
+            "Time series only. Lets a small phase that is present throughout\n"
+            "win a cluster of its own, at the price of splitting a broad\n"
+            "phase more readily."
+        )
+        km_layout.addWidget(self.kmeans_small_cb)
+
+        def _scope_changed(_index=None):
+            series = self.kmeans_scope_combo.currentData() == "series"
+            self.kmeans_transient_cb.setEnabled(series)
+            self.kmeans_small_cb.setEnabled(series)
+        self.kmeans_scope_combo.currentIndexChanged.connect(_scope_changed)
+        _scope_changed()
+
+        self.kmeans_run_btn = QPushButton("▶ Run K-means")
+        self.kmeans_run_btn.clicked.connect(self._run_kmeans)
+        km_layout.addWidget(self.kmeans_run_btn)
+
+        self.kmeans_timeline_btn = QPushButton("📈 Export Cluster Timeline...")
+        self.kmeans_timeline_btn.setEnabled(False)
+        self.kmeans_timeline_btn.setToolTip(
+            "After a time-series run: every cluster's voxel count and share\n"
+            "of the sample at every timepoint (CSV), plus a plot (SVG)."
+        )
+        self.kmeans_timeline_btn.clicked.connect(self._export_kmeans_timeline)
+        km_layout.addWidget(self.kmeans_timeline_btn)
 
         self.copy_clusters_btn = QPushButton(
             "⚡ Copy K-means Clusters to Materials"
         )
         self.copy_clusters_btn.setEnabled(False)
         self.copy_clusters_btn.setToolTip(
-            "Turn each 3-D K-means cluster into a material.\n"
+            "Turn each volume K-means cluster into a material.\n"
             "Existing drawn and Otsu materials are kept.\n"
             "Copying again replaces the earlier cluster-derived ones.\n"
             "They appear on the Materials tab, where each one can be set\n"
-            "to change or to stay unchanged like any other material."
+            "to change or to stay unchanged like any other material.\n"
+            "(Time-series clusters are layers already.)"
         )
         self.copy_clusters_btn.clicked.connect(
             self._convert_kmeans_clusters_to_materials
         )
         km_layout.addWidget(self.copy_clusters_btn)
 
-        self.kmeans_status_label = QLabel(
-            "Status: run 3-D Auto-Detect first"
-        )
+        self.kmeans_status_label = QLabel("Status: ready")
         self.kmeans_status_label.setWordWrap(True)
         self.kmeans_status_label.setStyleSheet(
             "color: gray; font-style: italic; font-size: 9pt;"
@@ -3030,6 +2495,7 @@ class BiTS4DMainWindow(QMainWindow):
             ("Choosing the Smoothing Strength", "m_auto"),
             ("Which Voxels Count", "m_valid"),
             ("Instrument Drift", "m_drift"),
+            ("K-means at Three Scales", "m_kmeans"),
             ("Mixed Boundaries", "m_partial"),
             ("The Metrics", "m_metrics"),
             ("Why There Is No Classifier", "m_why"),
@@ -3206,7 +2672,9 @@ class BiTS4DMainWindow(QMainWindow):
         self.material_panel.set_clusters_available(False)
         self.material_panel.clear_result()
         self.material_panel.set_materials([])
-        self.kmeans_status_label.setText("Status: run 3-D Auto-Detect first")
+        self.kmeans_series_result = None
+        self.kmeans_timeline_btn.setEnabled(False)
+        self.kmeans_status_label.setText("Status: ready")
         self.kmeans_status_label.setStyleSheet(
             "color: gray; font-style: italic; font-size: 9pt;"
         )
@@ -3811,10 +3279,275 @@ class BiTS4DMainWindow(QMainWindow):
 
         print(f"  All clusters saved to selection manager", file=sys.stderr)
     
+    # ── K-means at three scales ─────────────────────────────────────────
+
+    #: Colours of time-series phases found only in some timepoints; kept
+    #: apart from the overlay palette so they stand out.
+    _TRANSIENT_COLORS = [
+        (1.00, 0.00, 0.85, 0.60),   # magenta
+        (0.00, 0.90, 1.00, 0.60),   # cyan
+        (1.00, 0.84, 0.00, 0.60),   # gold
+        (0.55, 1.00, 0.20, 0.60),   # lime
+        (1.00, 0.40, 0.10, 0.60),   # orange
+    ]
+
+    def _show_kmeans_controls(self):
+        """Auto-Detect in the viewer: bring the K-means settings forward."""
+        for index in range(self.right_tabs.count()):
+            if self.right_tabs.widget(index).isAncestorOf(self.kmeans_run_btn):
+                self.right_tabs.setCurrentIndex(index)
+                break
+        self.kmeans_run_btn.setFocus()
+        self.status_bar.showMessage(
+            "Choose the K-means scope and number of clusters, then Run K-means"
+        )
+
+    @pyqtSlot()
+    def _run_kmeans(self):
+        """Run K-means at the scope chosen on the Auto Seg tab."""
+        if self.dataset is None:
+            QMessageBox.warning(self, "No Dataset", "Please load a dataset first.")
+            return
+        scope = self.kmeans_scope_combo.currentData()
+        n_clusters = self.kmeans_clusters_spin.value()
+        from utils.cancellation import OperationCancelled, OperationFailed
+        try:
+            if scope == "slice":
+                self._run_kmeans_slice(n_clusters)
+            elif scope == "volume":
+                self._run_kmeans_volume(n_clusters)
+            else:
+                self._run_kmeans_series(
+                    n_clusters,
+                    find_transient=self.kmeans_transient_cb.isChecked(),
+                    emphasise_small=self.kmeans_small_cb.isChecked(),
+                )
+        except (OperationCancelled, OperationFailed):
+            self.kmeans_status_label.setText("Status: cancelled or failed")
+        except ValueError as exc:
+            QMessageBox.warning(self, "K-means", str(exc))
+
+    def _kmeans_color(self, index):
+        return self._OVERLAY_COLORS[index % len(self._OVERLAY_COLORS)]
+
+    def _show_cluster_selections(self, payloads, prefixes):
+        """Replace earlier clusters of this kind and show the new ones."""
+        self.selection_manager.remove_selections([
+            sel.name for sel in self.selection_manager.selections
+            if any(sel.name.startswith(prefix) for prefix in prefixes)
+        ])
+        self._on_clusters_detected(payloads)
+        self.selection_manager.show_all_cb.setChecked(True)
+        self._update_histogram_overlays()
+
+    def _run_kmeans_slice(self, n_clusters):
+        """Level 1: the slice on screen. Fast; gives 2-D selections."""
+        from utils.clustering_3d import KMeans3D
+        from utils.kmeans_levels import cluster_slice
+
+        viewer = self.slice_viewer
+        if viewer.current_slice_data is None or viewer.current_slice_index is None:
+            raise ValueError("No slice is displayed")
+        neutron_vol, xray_vol = viewer.current_slice_data
+        axis, index = viewer.current_axis, viewer.current_slice_index
+        neutron = KMeans3D.extract_slice_from_labels(neutron_vol, axis, index)
+        xray = KMeans3D.extract_slice_from_labels(xray_vol, axis, index)
+
+        result = cluster_slice(neutron, xray, n_clusters)
+        payloads = []
+        for cluster in range(n_clusters):
+            mask = result.labels == cluster
+            if not mask.any():
+                continue
+            outline = KMeans3D.create_convex_hull_roi_3d(neutron[mask], xray[mask])
+            payloads.append((
+                f"Slice cluster {cluster}", mask, outline, cluster,
+                self._kmeans_color(cluster),
+            ))
+        self._show_cluster_selections(payloads, ("Slice cluster ",))
+        self.kmeans_status_label.setText(
+            f"Status: {len(payloads)} cluster(s) on the "
+            f"{axis.upper()} slice {index} — saved as selections"
+        )
+        self.status_bar.showMessage(
+            f"Slice K-means: {len(payloads)} clusters on slice {index}"
+        )
+
+    def _run_kmeans_volume(self, n_clusters):
+        """Level 2: every voxel of this timepoint. Gives 3-D selections."""
+        from utils.clustering_3d import KMeans3D
+
+        timepoint = self.dataset.current_timepoint
+        neutron_vol, xray_vol = self._display_volumes_at(timepoint)
+
+        def operation(progress_callback=None, cancel_check=None):
+            return KMeans3D.cluster_volume(
+                neutron_vol, xray_vol, n_clusters=n_clusters,
+                progress_callback=progress_callback, cancel_check=cancel_check,
+            )
+
+        outcome = run_with_progress(
+            self, "K-means: Volume",
+            f"Clustering timepoint {timepoint} into {n_clusters} groups...",
+            operation,
+        )
+        if outcome is None:
+            return
+        labels, _centers, _stats = outcome
+
+        viewer = self.slice_viewer
+        payloads = []
+        for cluster in range(n_clusters):
+            mask_3d = labels == cluster
+            if not mask_3d.any():
+                continue
+            mask_2d = KMeans3D.extract_slice_from_labels(
+                mask_3d, viewer.current_axis, viewer.current_slice_index
+            )
+            outline = KMeans3D.create_convex_hull_roi_3d(
+                neutron_vol[mask_3d], xray_vol[mask_3d]
+            )
+            payloads.append((
+                f"3D Cluster {cluster}", mask_2d, outline, cluster,
+                self._kmeans_color(cluster), mask_3d,
+            ))
+        self._show_cluster_selections(payloads, ("3D Cluster ",))
+        self.status_bar.showMessage(
+            f"Volume K-means: {len(payloads)} clusters at T={timepoint}"
+        )
+
+    def _run_kmeans_series(self, n_clusters, find_transient=True,
+                           emphasise_small=False):
+        """Level 3: every timepoint, one shared clustering.
+
+        Writes one segmentation layer per cluster at every timepoint where
+        that cluster holds voxels, replacing earlier series layers.
+        """
+        from utils.kmeans_levels import describe_presence, run_series_clustering
+
+        if self.histogram_engine is None or self.global_histogram is None:
+            raise ValueError("Compute the histogram first (load a dataset).")
+
+        def operation(progress_callback=None, cancel_check=None):
+            return run_series_clustering(
+                self.dataset, self.histogram_engine, n_clusters,
+                emphasise_small=emphasise_small,
+                find_transient=find_transient,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+
+        outcome = run_with_progress(
+            self, "K-means: Time Series",
+            f"Clustering all {self.dataset.num_timepoints} timepoints...",
+            operation,
+        )
+        if outcome is None:
+            return
+        result, labels = outcome
+
+        colors = [self._series_cluster_color(result, k)
+                  for k in range(result.n_clusters)]
+        names = [result.cluster_name(k) for k in range(result.n_clusters)]
+        outlines = [result.outline(k) for k in range(result.n_clusters)]
+        series_prefixes = ("Series cluster ", "Transient phase ")
+
+        for t_index, timepoint in enumerate(result.timepoints):
+            label_volume = labels.pop(timepoint)
+            kept = [
+                layer for layer in self.segmentation_masks.get(timepoint, [])
+                if not str(layer[2]).startswith(series_prefixes)
+            ]
+            for cluster in range(result.n_clusters):
+                if result.counts[t_index, cluster] <= 0:
+                    continue
+                mask = label_volume == cluster
+                if not mask.any():
+                    continue
+                kept.append((mask, colors[cluster], names[cluster]))
+                self._record_layer_shape(timepoint, names[cluster],
+                                         outlines[cluster])
+            self.segmentation_masks[timepoint] = kept
+
+        self.kmeans_series_result = result
+        self._kmeans_series_colors = colors
+        self.kmeans_timeline_btn.setEnabled(True)
+        self.export_current_btn.setEnabled(True)
+        self.export_all_btn.setEnabled(True)
+
+        current = self.dataset.current_timepoint
+        self._apply_segmentation_overlays(current)
+        self._update_class_histogram_overlays(current)
+        self._refresh_material_panel()
+
+        transient = result.transient_clusters()
+        lines = [
+            f"{result.n_persistent} phase(s) present through the series"
+            + (f", and {result.n_clusters - result.n_persistent} found only "
+               "in some timepoints." if result.n_clusters > result.n_persistent
+               else "."),
+            "",
+        ]
+        for cluster in range(result.n_clusters):
+            peak = 100.0 * result.fractions[:, cluster].max()
+            where = describe_presence(result.present_at(cluster),
+                                      result.timepoints)
+            flag = "  ← only some timepoints" if cluster in transient else ""
+            lines.append(
+                f"• {names[cluster]}: neutron {result.centers[cluster, 0]:.4g}, "
+                f"X-ray {result.centers[cluster, 1]:.4g} — up to {peak:.2f}% "
+                f"of the sample, present {where}{flag}"
+            )
+        lines += [
+            "",
+            "Each cluster is a segmentation layer at every timepoint where it "
+            "has voxels. Export Cluster Timeline writes the share of each "
+            "cluster over time.",
+        ]
+        self.kmeans_status_label.setText(
+            f"Status: {result.n_clusters} series cluster(s), "
+            f"{len(transient)} present only in some timepoints"
+        )
+        QMessageBox.information(self, "Time-Series K-means", "\n".join(lines))
+
+    def _series_cluster_color(self, result, cluster):
+        if result.is_transient_phase(cluster):
+            offset = cluster - result.n_persistent
+            return self._TRANSIENT_COLORS[offset % len(self._TRANSIENT_COLORS)]
+        return self._kmeans_color(cluster)
+
+    @pyqtSlot()
+    def _export_kmeans_timeline(self):
+        """CSV of every cluster's share over time, and a plot of it."""
+        result = self.kmeans_series_result
+        if result is None:
+            QMessageBox.information(
+                self, "No Time-Series Result",
+                "Run K-means with the Time series scope first."
+            )
+            return
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export Cluster Timeline", "kmeans_timeline.csv",
+            "CSV (*.csv)"
+        )
+        if not path:
+            return
+        from utils.kmeans_levels import plot_timeline
+        base = path[:-4] if path.lower().endswith(".csv") else path
+        csv_path, plot_path = base + ".csv", base + ".svg"
+        try:
+            result.write_timeline_csv(csv_path)
+            plot_timeline(result, plot_path,
+                          colors=getattr(self, "_kmeans_series_colors", None))
+        except OSError as exc:
+            QMessageBox.critical(self, "Export Error", f"Could not write:\n{exc}")
+            return
+        self.status_bar.showMessage(f"Timeline saved: {csv_path}, {plot_path}")
+
     @pyqtSlot()
     def _convert_kmeans_clusters_to_materials(self):
         """
-        Convert the most recent 3-D K-means result into RF training classes.
+        Convert the most recent volume K-means result into materials.
 
         Every cluster becomes one 3-D segmentation layer. Existing manual and
         Otsu layers are preserved; earlier K-means-derived layers for the same
@@ -3832,8 +3565,8 @@ class BiTS4DMainWindow(QMainWindow):
         if not payloads or source_t is None:
             QMessageBox.warning(
                 self,
-                "No 3-D K-means Result",
-                "Run Auto-Detect in 3-D K-means mode first.",
+                "No Volume K-means Result",
+                "Run K-means with the Volume scope first.",
             )
             return
 
@@ -3845,8 +3578,8 @@ class BiTS4DMainWindow(QMainWindow):
 
             neutron_vol, xray_vol = self.dataset.get_volume_at_time(source_t)
 
-            # Clustering runs on the display grid for large datasets; RF
-            # trains at full resolution, so upscale the cluster masks first.
+            # Clustering runs on the display grid for large datasets;
+            # materials live at full resolution, so upscale the masks first.
             if self.display_bin_factor > 1:
                 upscaled = []
                 for payload in payloads:
@@ -3865,7 +3598,7 @@ class BiTS4DMainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "K-means Conversion Failed",
-                f"Could not create RF classes:\n{exc}",
+                f"Could not create materials:\n{exc}",
             )
             return
 
@@ -3938,7 +3671,7 @@ class BiTS4DMainWindow(QMainWindow):
             "color: green; font-style: italic; font-size: 9pt;"
         )
         self.status_bar.showMessage(
-            f"Converted {len(new_layers)} K-means clusters to RF classes "
+            f"Converted {len(new_layers)} K-means clusters to materials "
             f"at T={source_t}"
         )
 
@@ -3946,28 +3679,27 @@ class BiTS4DMainWindow(QMainWindow):
             100.0 * summary.covered_voxels / summary.total_voxels
         )
         details = (
-            f"Created {len(new_layers)} RF training classes from T={source_t}.\n\n"
+            f"Created {len(new_layers)} materials from T={source_t}.\n\n"
             f"Covered voxels: {summary.covered_voxels:,} "
             f"({coverage_percent:.2f}%)\n"
             f"Uncovered/background voxels: {summary.uncovered_voxels:,}\n"
             f"Overlapping voxels: {summary.overlapping_voxels:,}\n"
             f"New saved histogram selections: {added_selections}\n\n"
-            "The RF reference timepoint has been set automatically. "
-            "You can now click 'Train RF on Current Segmentation'."
+            "They are listed on the Materials tab, ready to track through "
+            "the series."
         )
 
         if summary.overlapping_voxels:
             QMessageBox.warning(
                 self,
-                "K-means Classes Created with Overlap",
+                "K-means Materials Created with Overlap",
                 details
-                + "\n\nOverlapping masks are resolved by layer order during "
-                  "RF label construction.",
+                + "\n\nOverlapping masks are resolved by layer order.",
             )
         else:
             QMessageBox.information(
                 self,
-                "K-means Classes Ready for RF",
+                "K-means Materials Ready",
                 details,
             )
 
