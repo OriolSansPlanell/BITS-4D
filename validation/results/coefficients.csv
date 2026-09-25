@@ -1,0 +1,6 @@
+scenario,setting,method,seconds,Air,Aluminium,Electrolyte,Lithium,Product,mean,unclassified
+coefficients,Product,region (defined where it exists),3.96,0.9752,0.9413,0.9942,0.9831,0.7884,0.9364,0.0379
+coefficients,Product,no definition (from T0 only),2.49,0.9682,0.9228,0.9773,0.978,0.1667,0.8026,0.0756
+coefficients,Product,"coefficients, exact",3.69,0.9697,0.9276,0.9872,0.9791,0.7524,0.9232,0.0485
+coefficients,Product,"coefficients, +5% error",3.93,0.9753,0.9415,0.9949,0.982,0.7927,0.9373,0.0374
+coefficients,Product,"coefficients, +15% error",2.85,0.9682,0.9228,0.9801,0.978,0.6467,0.8992,0.0545

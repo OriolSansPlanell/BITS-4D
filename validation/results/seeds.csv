@@ -1,0 +1,19 @@
+scenario,setting,method,seconds,Air,Aluminium,Electrolyte,Lithium,Product,mean,unclassified
+seeds,seed=0,"BiTS (locked, auto smoothing)",4.09,0.9752,0.9413,0.9942,0.9831,0.7884,0.9364,0.0379
+seeds,seed=0,Random walker,12.49,0.9993,0.9942,0.9949,0.8664,0.506,0.8722,0.0
+seeds,seed=0,"Pixel classifier (RF, ilastik features)",1.03,0.9851,0.9324,0.9688,0.9153,0.7256,0.9054,0.0
+seeds,seed=1,"BiTS (locked, auto smoothing)",4.12,0.9762,0.945,0.994,0.9828,0.7815,0.9359,0.0364
+seeds,seed=1,Random walker,14.55,0.9993,0.994,0.9951,0.8667,0.5049,0.872,0.0
+seeds,seed=1,"Pixel classifier (RF, ilastik features)",1.01,0.9848,0.9288,0.9681,0.8942,0.7532,0.9058,0.0
+seeds,seed=2,"BiTS (locked, auto smoothing)",2.78,0.9685,0.9248,0.9855,0.9755,0.7428,0.9194,0.0535
+seeds,seed=2,Random walker,14.11,0.9994,0.9939,0.9947,0.8662,0.5047,0.8718,0.0
+seeds,seed=2,"Pixel classifier (RF, ilastik features)",1.52,0.9854,0.9337,0.9687,0.9112,0.7354,0.9069,0.0
+seeds,seed=3,"BiTS (locked, auto smoothing)",4.46,0.9764,0.9411,0.9936,0.9829,0.7732,0.9334,0.0375
+seeds,seed=3,Random walker,9.8,0.9991,0.994,0.9952,0.8676,0.5036,0.8719,0.0
+seeds,seed=3,"Pixel classifier (RF, ilastik features)",1.29,0.9847,0.9323,0.9687,0.9086,0.7195,0.9028,0.0
+seeds,seed=4,"BiTS (locked, auto smoothing)",3.98,0.9761,0.94,0.9939,0.9832,0.7912,0.9369,0.0378
+seeds,seed=4,Random walker,10.29,0.9993,0.9941,0.9946,0.8649,0.5051,0.8716,0.0
+seeds,seed=4,"Pixel classifier (RF, ilastik features)",1.08,0.9862,0.938,0.9697,0.8996,0.7413,0.9069,0.0
+seeds,mean ± sd,"BiTS (locked, auto smoothing)",,,,,,0.775 ± 0.017,0.932 ± 0.007,
+seeds,mean ± sd,Random walker,,,,,,0.505 ± 0.001,0.872 ± 0.000,
+seeds,mean ± sd,"Pixel classifier (RF, ilastik features)",,,,,,0.735 ± 0.012,0.906 ± 0.002,

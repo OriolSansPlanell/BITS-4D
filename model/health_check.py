@@ -112,14 +112,107 @@ def run_health_check(
 
     names = list(outcome.class_names)
     controls = [name for name in control_materials if name in names]
+    library = getattr(outcome, "library", None)
+
+    # ── classes that could not be defined at all ─────────────────────────
+    for name, reason in getattr(library, "dropped", []) or []:
+        report.findings.append(Finding(
+            "classes defined", Status.FAIL,
+            f"The material '{name}' could not be defined and is missing from "
+            f"these results.",
+            reason[:1].upper() + reason[1:] + ".",
+        ))
+    for name, note in getattr(library, "notes", []) or []:
+        report.findings.append(Finding(
+            "classes defined", Status.WARN,
+            f"The material '{name}' was {note}.",
+        ))
+
+    # Where each class was defined: a phase defined at a later timepoint
+    # (it appears during the experiment) is expected to be absent before.
+    born_at: Dict[str, int] = {}
+    for material in getattr(library, "classes", []) or []:
+        if getattr(material, "defined_at", None) is not None:
+            born_at[material.name] = int(material.defined_at)
+    first = min(entry.timepoint for entry in entries)
+    # A class predicted from attenuation coefficients has no region: it may
+    # appear at any point, and is checked from where it is first found.
+    predicted = set()
+    for material in getattr(library, "classes", []) or []:
+        if getattr(material, "source", "") != "physics":
+            continue
+        found = [e.timepoint for e in entries
+                 if e.voxel_counts.get(material.name, 0) > 0]
+        predicted.add(material.name)
+        if found:
+            born_at[material.name] = min(found)
+        else:
+            born_at[material.name] = max(e.timepoint for e in entries) + 1
+            report.findings.append(Finding(
+                "predicted classes", Status.WARN,
+                f"The material '{material.name}', placed from its attenuation "
+                "coefficients, was not found at any timepoint.",
+                "Either it is not in the sample, or the calibration or the "
+                "coefficients put it in the wrong place. Check the prediction "
+                "against the histogram.",
+            ))
+
+    # ── how the smoothing strength was chosen ────────────────────────────
+    choice = getattr(outcome, "smoothing_report", None)
+    if choice:
+        checked = ", ".join(f"T{t}" for t in choice.get("timepoints", []))
+        if choice.get("at_ceiling"):
+            report.findings.append(Finding(
+                "smoothing strength", Status.WARN,
+                f"The smoothing strength reached the top of the tested range "
+                f"({choice['strength']:g}) without the result settling.",
+                "More smoothing was still changing the result, so this is the "
+                "limit of the search rather than a measured optimum. Compare "
+                "with a weaker setting (Advanced) before relying on fine "
+                "structures.",
+            ))
+        elif choice.get("converged"):
+            report.findings.append(Finding(
+                "smoothing strength", Status.PASS,
+                f"Smoothing {choice['strength']:g}: {choice['reason']} "
+                f"(checked at {checked}).",
+            ))
+        else:
+            report.findings.append(Finding(
+                "smoothing strength", Status.PASS,
+                f"Smoothing {choice['strength']:g}: {choice['reason']} — "
+                f"thin structures and every class's volume were protected "
+                f"(checked at {checked}).",
+            ))
 
     # ── every class present at every timepoint ───────────────────────────
     missing: Dict[str, int] = {}
     for name in names:
+        start = born_at.get(name, first)
         for entry in entries:
+            if entry.timepoint < start:
+                continue
             if entry.voxel_counts.get(name, 0) == 0:
                 missing.setdefault(name, entry.timepoint)
                 break
+    for name, start in sorted(born_at.items(), key=lambda item: item[1]):
+        if start > first and name in names:
+            before = [e for e in entries if e.timepoint < start]
+            if name in predicted:
+                if len(before) < len(entries):
+                    report.findings.append(Finding(
+                        "phases that appear", Status.PASS,
+                        f"'{name}' (predicted from its coefficients) is first "
+                        f"found at timepoint {start}.",
+                    ))
+                continue
+            absent = sum(1 for e in before if e.voxel_counts.get(name, 0) == 0)
+            report.findings.append(Finding(
+                "phases that appear", Status.PASS,
+                f"'{name}' is defined at timepoint {start}, where it exists; "
+                f"it is absent at {absent} of the {len(before)} earlier "
+                f"timepoint(s).",
+            ))
     if missing:
         for name, timepoint in missing.items():
             entry = next(e for e in entries if e.timepoint == timepoint)

@@ -23,11 +23,27 @@ destructive parameter here: too high and a small class is simply erased,
 silently, with everything downstream still looking healthy. At ~1 % of the
 volume a minority phase is the first thing to go.
 
-:func:`auto_smoothing` therefore chooses it, by measuring rather than
-guessing: the strongest setting at which **no class loses more than a set
-share of its unsmoothed volume**, and the classes declared unchanging stay
-unchanged. The whole sweep is kept, because the answer is only trustworthy
-if you can see the curve it came from.
+:func:`auto_smoothing` therefore chooses it by measuring rather than
+guessing, with a lower and an upper criterion:
+
+* **guards** — a setting is acceptable only if no class loses more than a set
+  share of its unsmoothed volume, the classes declared unchanging stay
+  unchanged, and **thin structures survive**: components at most two voxels
+  thick everywhere (sheets, filaments, a layer that has just formed) and
+  larger than noise speckle must keep most of their voxels. Volume alone
+  cannot see these — a 1-voxel layer can vanish while every class keeps 99 %
+  of its volume;
+* **enough, not more** — the search stops at the first setting beyond which
+  more smoothing changes almost nothing (fewer than 0.2 % of voxels). Past
+  that point extra strength buys no cleanup and only risks structure, so
+  "the strongest acceptable value" is not the goal; convergence is.
+
+The guards are checked on every timepoint passed in (the application passes
+the reference and the last one, where a phase that formed during the
+experiment is thinnest relative to its region). If the choice ends at the
+top of the grid without having converged, that is reported rather than
+presented as a measured optimum. The whole sweep is kept, because the answer
+is only trustworthy if you can see the curve it came from.
 """
 
 from __future__ import annotations
@@ -44,6 +60,61 @@ from model.validity import ValidityPolicy, build_valid_mask, validity_report
 
 #: Default sweep for the automatic smoothing search.
 SMOOTHING_GRID = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+#: Below this share of changed voxels, one more step of smoothing is
+#: considered to change nothing.
+CONVERGED_FRACTION = 0.002
+
+#: A thin structure: every part at most this many voxels thick …
+THIN_THICKNESS = 2
+#: … and at least this many voxels, so it is not noise speckle.
+THIN_MIN_VOXELS = 30
+
+
+def smoothing_check_timepoints(num_timepoints: int, reference: int,
+                               definition_timepoints=(), limit: int = 5):
+    """Which timepoints the smoothing search checks its guards on.
+
+    The reference; every timepoint a class was defined at (a phase that
+    appeared later is thin around then); the middle and the last timepoint.
+    At most *limit*, reference first — each one repeats the sweep.
+    """
+    wanted = [int(reference)]
+    candidates = sorted(set(int(t) for t in definition_timepoints)) + [
+        num_timepoints // 2, num_timepoints - 1,
+    ]
+    for timepoint in candidates:
+        if 0 <= timepoint < num_timepoints and timepoint not in wanted:
+            wanted.append(timepoint)
+        if len(wanted) >= limit:
+            break
+    return wanted
+
+
+def thin_structure_mask(mask: np.ndarray, min_voxels: int = THIN_MIN_VOXELS) -> np.ndarray:
+    """Voxels of *mask* in components that are thin everywhere.
+
+    A component is thin when a morphological opening with a 3×3×3 ball
+    (which removes anything at most two voxels thick) removes it entirely,
+    and it has at least *min_voxels* voxels — a sheet, a filament or a
+    freshly formed layer, as opposed to isolated noise.
+    """
+    from scipy import ndimage
+
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return mask
+    structure = ndimage.generate_binary_structure(mask.ndim, 1)
+    opened = ndimage.binary_opening(mask, structure=structure)
+    components, count = ndimage.label(mask, structure=structure)
+    if count == 0:
+        return np.zeros_like(mask)
+    sizes = np.bincount(components.ravel(), minlength=count + 1)
+    surviving = np.bincount(components.ravel(), weights=opened.ravel(),
+                            minlength=count + 1)
+    thin = (surviving == 0) & (sizes >= min_voxels)
+    thin[0] = False
+    return thin[components]
 
 
 def _with_unclassified_row(cost: np.ndarray) -> np.ndarray:
@@ -166,6 +237,8 @@ class SeriesSegmentation:
     library: Optional[ClassLibrary] = None
     smoothing: float = 0.0
     smoothing_sweep: Optional[list] = None
+    #: How the smoothing strength was chosen (see auto_smoothing)
+    smoothing_report: Optional[dict] = None
     pairwise_cost: Optional[np.ndarray] = None
     mode: str = "locked"
 
@@ -239,6 +312,7 @@ class LockedSegmenter:
         self.unclassified_floor = float(unclassified_floor)
         self.neutron_edges: Optional[np.ndarray] = None
         self.xray_edges: Optional[np.ndarray] = None
+        self.last_smoothing_report: Optional[dict] = None
 
     # ── setup ────────────────────────────────────────────────────────────
     def set_grid(self, neutron_edges, xray_edges) -> None:
@@ -361,14 +435,27 @@ class LockedSegmenter:
         timepoint: int = 0,
         progress_callback=None,
         cancel_check=None,
+        extra_volumes: Sequence[tuple] = (),
+        min_thin_retention: float = 0.80,
+        converged_fraction: float = CONVERGED_FRACTION,
+        max_extensions: int = 2,
     ):
-        """Strongest smoothing that costs no class its volume.
+        """Enough smoothing to settle the labels, within the guards.
 
-        Returns ``(strength, sweep)``. *sweep* is one row per grid point:
-        the per-class volumes, each class's retention against the unsmoothed
-        result, the movement of the control materials, and whether that point
-        was acceptable. Keep it — it is the evidence for the choice, and the
-        curve is worth looking at directly.
+        Returns ``(strength, sweep)``; the reasoning is in
+        ``self.last_smoothing_report``. *sweep* has one row per grid point
+        per checked volume: per-class volumes and retention, thin-structure
+        retention, the movement of the control materials, the share of
+        voxels changed since the previous grid point, and whether the point
+        was acceptable. Keep it — it is the evidence for the choice.
+
+        *extra_volumes* are further ``(neutron, xray, timepoint)`` triples on
+        which every guard must also hold — the timepoints where a phase that
+        formed during the experiment is still thin.
+
+        When the top of *grid* is reached with every guard passing and the
+        labels still changing, the grid is extended by doubling, up to
+        *max_extensions* times, before the result is reported as unsettled.
         """
         if self.neutron_edges is None:
             raise RuntimeError("Call set_grid() before searching")
@@ -376,69 +463,168 @@ class LockedSegmenter:
         if 0.0 not in grid:
             grid = [0.0] + grid
 
-        valid = build_valid_mask(
-            neutron_volume, xray_volume, self.validity_policy
-        )
-        cache = build_histogram_cache(
-            neutron_volume, xray_volume,
-            self.neutron_edges, self.xray_edges,
-            valid_mask=valid, store_bin_index=True,
-        )
-        table = match_table(self.library, cache, self.unclassified_floor)
+        volumes = [(neutron_volume, xray_volume, timepoint)] + [
+            tuple(item) for item in extra_volumes
+        ]
+        prepared = []
+        for neutron, xray, when in volumes:
+            valid = build_valid_mask(neutron, xray, self.validity_policy)
+            cache = build_histogram_cache(
+                neutron, xray, self.neutron_edges, self.xray_edges,
+                valid_mask=valid, store_bin_index=True,
+            )
+            prepared.append((neutron, xray, when, valid,
+                             match_table(self.library, cache,
+                                         self.unclassified_floor)))
 
-        baseline: Optional[Dict[str, int]] = None
         sweep = []
-        chosen = 0.0
-        for position, value in enumerate(grid):
-            if cancel_check:
-                cancel_check()
-            result = self.segment_timepoint(
-                neutron_volume, xray_volume, timepoint=timepoint,
-                beta=value, table=table, cancel_check=cancel_check,
-            )
-            if baseline is None:
-                baseline = dict(result.voxel_counts)
+        state = []            # per volume: baseline counts, thin masks, previous labels
+        per_value_ok: List[bool] = []
+        per_value_change: List[float] = []
+        grid = list(grid)
+        total_steps = (len(grid) + max_extensions) * len(prepared)
+        step = 0
+        extensions = 0
+        position_in_grid = 0
+        while position_in_grid < len(grid):
+            value = grid[position_in_grid]
+            position_in_grid += 1
+            all_ok = True
+            changes = []
+            for index, (neutron, xray, when, valid, table) in enumerate(prepared):
+                if cancel_check:
+                    cancel_check()
+                result = self.segment_timepoint(
+                    neutron, xray, timepoint=when,
+                    beta=value, table=table, cancel_check=cancel_check,
+                )
+                if len(state) <= index:
+                    thin = {
+                        name: thin_structure_mask(result.labels == k)
+                        for k, name in enumerate(self.library.names, start=1)
+                    }
+                    state.append({"baseline": dict(result.voxel_counts),
+                                  "thin": thin, "previous": result.labels})
+                record = state[index]
+                baseline = record["baseline"]
+                retention = {
+                    name: (
+                        result.voxel_counts.get(name, 0) / baseline[name]
+                        if baseline.get(name) else 1.0
+                    )
+                    for name in self.library.names
+                }
+                thin_retention = {}
+                for k, name in enumerate(self.library.names, start=1):
+                    thin = record["thin"][name]
+                    if thin.any():
+                        thin_retention[name] = float(
+                            np.mean(result.labels[thin] == k)
+                        )
+                changed = float(np.mean(
+                    (result.labels != record["previous"])[valid]
+                )) if valid.any() else 0.0
+                record["previous"] = result.labels
+                changes.append(changed)
 
-            retention = {
-                name: (
-                    result.voxel_counts.get(name, 0) / baseline[name]
-                    if baseline.get(name) else 1.0
+                inert_shift = {
+                    name: abs(retention[name] - 1.0)
+                    for name in self.library.inert_names
+                }
+                unclassified = result.unclassified_fraction
+                worst = min(retention.values()) if retention else 1.0
+                thin_worst = min(thin_retention.values()) if thin_retention else 1.0
+                acceptable = (
+                    worst >= self.min_retention
+                    and thin_worst >= min_thin_retention
+                    and all(shift <= self.inert_tolerance
+                            for shift in inert_shift.values())
+                    and unclassified <= self.max_unclassified
                 )
-                for name in self.library.names
-            }
-            inert_shift = {
-                name: abs(retention[name] - 1.0)
-                for name in self.library.inert_names
-            }
-            unclassified = result.unclassified_fraction
-            worst = min(retention.values()) if retention else 1.0
-            acceptable = (
-                worst >= self.min_retention
-                and all(
-                    shift <= self.inert_tolerance for shift in inert_shift.values()
-                )
-                and unclassified <= self.max_unclassified
-            )
-            sweep.append({
-                "smoothing": value,
-                "volumes": dict(result.voxel_counts),
-                "retention": retention,
-                "worst_retention": worst,
-                "worst_class": (
-                    min(retention, key=retention.get) if retention else None
-                ),
-                "control_shift": inert_shift,
-                "unclassified_fraction": unclassified,
-                "acceptable": acceptable,
-            })
-            if acceptable:
-                chosen = value
-            if progress_callback:
-                progress_callback(
-                    int(100 * (position + 1) / len(grid)),
-                    f"Testing smoothing {value:g}",
-                )
+                all_ok = all_ok and acceptable
+                sweep.append({
+                    "smoothing": value,
+                    "timepoint": when,
+                    "volumes": dict(result.voxel_counts),
+                    "retention": retention,
+                    "worst_retention": worst,
+                    "worst_class": (
+                        min(retention, key=retention.get) if retention else None
+                    ),
+                    "thin_retention": thin_retention,
+                    "worst_thin_retention": thin_worst,
+                    "control_shift": inert_shift,
+                    "unclassified_fraction": unclassified,
+                    "changed_from_previous": changed,
+                    "acceptable": acceptable,
+                })
+                step += 1
+                if progress_callback:
+                    progress_callback(int(100 * step / total_steps),
+                                      f"Testing smoothing {value:g}")
+            per_value_ok.append(all_ok)
+            per_value_change.append(max(changes) if changes else 0.0)
+            # Still acceptable and still changing at the top: look further
+            if (position_in_grid == len(grid) and all_ok and value > 0
+                    and per_value_change[-1] >= converged_fraction
+                    and extensions < max_extensions):
+                grid.append(2.0 * value)
+                extensions += 1
+
+        chosen, reason, converged = self._choose_smoothing(
+            grid, per_value_ok, per_value_change, converged_fraction
+        )
+        position = grid.index(chosen)
+        neighbours = {}
+        if position + 1 < len(grid):
+            neighbours["next"] = per_value_change[position + 1]
+        if position > 0:
+            neighbours["previous"] = per_value_change[position]
+        self.last_smoothing_report = {
+            "strength": chosen,
+            "reason": reason,
+            "converged": converged,
+            "at_ceiling": chosen == grid[-1] and not converged,
+            "grid": list(grid),
+            "acceptable": dict(zip(grid, per_value_ok)),
+            "changed_from_previous": dict(zip(grid, per_value_change)),
+            # How much the answer depends on the exact grid point: share of
+            # voxels that differ from the neighbouring settings
+            "sensitivity": neighbours,
+            "timepoints": [when for _n, _x, when, _v, _t in prepared],
+            "extended": extensions,
+        }
         return chosen, sweep
+
+    @staticmethod
+    def _choose_smoothing(grid, acceptable, changes, converged_fraction):
+        """The rule behind auto_smoothing, separated so it can be tested.
+
+        Walk up the grid, skipping weak settings that fail a guard, through
+        the acceptable ones; stop at the first after which the next step
+        changes fewer than *converged_fraction* of the voxels (converged),
+        or at the last acceptable one before a guard fails again. Returns
+        ``(strength, reason, converged)``; 0 when nothing is acceptable.
+        """
+        chosen = 0.0
+        seen_acceptable = False
+        for index, value in enumerate(grid):
+            if not acceptable[index]:
+                # Weak settings can fail too (unmatched speckle is only
+                # absorbed once smoothing starts); skip until one passes
+                if not seen_acceptable:
+                    continue
+                return chosen, (
+                    f"strongest setting before a guard failed at {value:g}"
+                ), False
+            seen_acceptable = True
+            chosen = value
+            if index + 1 < len(grid) and changes[index + 1] < converged_fraction:
+                return chosen, (
+                    f"labels settled: the next setting changes "
+                    f"{100 * changes[index + 1]:.2f}% of voxels"
+                ), True
+        return chosen, "top of the tested range reached", False
 
     # ── the series ───────────────────────────────────────────────────────
     def segment_series(

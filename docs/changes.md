@@ -1,6 +1,53 @@
 # Bug-fix and cleanup notes
 
-## Every figure in SVG, with its data as CSV (latest)
+## Answering a methods review (latest)
+
+A review of BiTS for publication listed nine weaknesses. What changed for
+each:
+
+1. **No quantitative validation.** `validation/` builds a synthetic 4-D cell
+   with exact labels (a reaction product absent at T0 that grows) and
+   `python -m validation.run` scores every method on it; results and limits
+   in [validation.md](validation.md). The doc claims that rested on the
+   undistributed battery series are now labelled as such; the "frozen
+   boundary loses Air" claim is pinned by a test (and corrected: it happens
+   at the third timepoint, not the fourth).
+2. **No baselines.** Global and multi-level Otsu, K-means, GMM (both named
+   by oracle matching, so upper bounds), random walker, and an ilastik-style
+   random-forest pixel classifier. No U-Net (no labelled training volumes in
+   this setting — stated in the docs).
+3. **Auto smoothing ran to the grid ceiling.** It now has an upper rule
+   (stop when the next setting changes < 0.2% of labels), a thin-sheet guard
+   next to the volume guard, checks several timepoints, extends the grid
+   while labels are still changing, and reports the reason, the sensitivity
+   and a ceiling warning in the health check.
+4. **Classes only from T0; empty ones dropped silently.** Each material is
+   defined at the first timepoint where its region has voxels
+   (`ClassLibrary.from_sources`, `MaterialClass.defined_at`). A material that
+   cannot be defined raises `ClassDefinitionWarning` and fails the health
+   check by name.
+5. **Unimodal class model.** *Allow irregular material shapes*: each class
+   may be a Gaussian mixture of up to three components, chosen by BIC on its
+   own voxels. Helps when a cloud straddles another class; changes nothing
+   for one-blob classes (measured).
+6. **Co-registration assumed.** *Check Alignment…* measures the X-ray offset
+   by mutual information (`model/registration.py`) and corrects whole-voxel
+   offsets; misalignment sensitivity is in the validation.
+7. **MRF memory and no timing.** The spatial pass runs in z-slabs with a
+   halo of `n_sweeps + 1` slices, with results identical to a whole-volume
+   run; the budget planner uses measured memory (`32·K + 30` B/voxel for
+   mean-field, ≈ 75 for ICM — the old docstring's `K × 4` and `9` were
+   underestimates). `python -m validation.scaling` measures time and memory.
+8. **`from_physics` not exposed.** *Add Materials from Attenuation
+   Coefficients…* calibrates each modality linearly on two drawn materials
+   (`model/calibration.py`) and tracks the predicted materials with the
+   drawn ones.
+9. **CI and file size.** CI runs on Python 3.10–3.12 with and without PyQt5
+   (GUI tests offscreen), plus a reduced validation run.
+   `SliceViewerWidget` and the dialogs moved out of `main_window.py`
+   (re-exported there).
+
+## Every figure in SVG, with its data as CSV
 
 Every analysis figure now opens a small window before saving: **figure
 format** (SVG by default — vector, with editable text — or PDF, PNG, TIFF),

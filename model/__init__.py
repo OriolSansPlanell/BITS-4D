@@ -43,6 +43,7 @@ from model.mixture import (
 )
 from model.health_check import Finding, HealthReport, Status, run_health_check
 from model.likelihood import (
+    ClassDefinitionWarning,
     UNCLASSIFIED,
     ClassLibrary,
     MatchTable,
@@ -88,6 +89,7 @@ __all__ = [
     "estimate_floor",
     "MaterialClass",
     "ClassLibrary",
+    "ClassDefinitionWarning",
     "MatchTable",
     "match_table",
     "UNCLASSIFIED",

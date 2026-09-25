@@ -1,0 +1,11 @@
+scenario,setting,method,seconds,Air,Aluminium,Electrolyte,Lithium,Product,mean,unclassified,estimated_shift,applied_shift
+misregistration,"offset (0.0, 0.0, 0.0)",uncorrected,4.01,0.9752,0.9413,0.9942,0.9831,0.7884,0.9364,0.0379,,
+misregistration,"offset (0.0, 0.0, 0.0)",after Check Alignment,4.02,0.9752,0.9413,0.9942,0.9831,0.7884,0.9364,0.0379,+0.00 +0.01 +0.00,+0 +0 +0
+misregistration,"offset (0.0, 0.5, 0.5)",uncorrected,3.14,0.9703,0.9309,0.9802,0.97,0.7026,0.9108,0.0284,,
+misregistration,"offset (0.0, 0.5, 0.5)",after Check Alignment,3.19,0.9703,0.9309,0.9802,0.97,0.7026,0.9108,0.0284,+0.00 -0.44 -0.60,+0 +0 +0
+misregistration,"offset (0.0, 1.0, 1.0)",uncorrected,2.25,0.9499,0.8812,0.9657,0.9244,0.5499,0.8542,0.0152,,
+misregistration,"offset (0.0, 1.0, 1.0)",after Check Alignment,4.33,0.973,0.9437,0.9945,0.9823,0.7791,0.9345,0.0376,+0.00 -0.97 -1.01,+0 -1 -1
+misregistration,"offset (0.0, 2.0, 2.0)",uncorrected,2.94,0.9733,0.9202,0.9709,0.9336,0.6249,0.8846,0.0063,,
+misregistration,"offset (0.0, 2.0, 2.0)",after Check Alignment,4.34,0.97,0.9404,0.9946,0.9827,0.7902,0.9356,0.0401,+0.00 -1.98 -2.01,+0 -2 -2
+misregistration,"offset (2.0, 0.0, 0.0) (closed ends)",uncorrected,2.99,0.9705,0.8641,0.9665,0.8006,0.4676,0.8139,0.0002,,
+misregistration,"offset (2.0, 0.0, 0.0) (closed ends)",after Check Alignment,2.45,0.9758,0.8561,0.9661,0.8669,0.6268,0.8584,0.0705,-2.05 +0.01 -0.01,-2 +0 +0

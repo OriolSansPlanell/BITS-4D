@@ -8,7 +8,10 @@ coordinate conventions every module must respect, and how to extend it.
 ```
 main.py
 └── gui/                          PyQt5 presentation layer
-    ├── main_window.py            BiTS4DMainWindow + SliceViewerWidget
+    ├── main_window.py            BiTS4DMainWindow (re-exports the two below)
+    ├── slice_viewer.py           SliceViewerWidget
+    ├── dialogs.py                Anchor, export-options and figure-export dialogs
+    ├── physics_dialog.py         Materials from attenuation coefficients
     ├── runtime_fixes.py          Behavioural overrides applied at import time
     ├── dual_histogram_widget.py  Global/local histogram canvases + ROI tools
     ├── material_panel.py         Materials, their behaviour, and the run
@@ -34,6 +37,8 @@ Computation layer (GUI-independent, scriptable):
     segmentation/features.py      Composable FeatureSpec (texture ⟂ geometry)
     model/validity.py             Which voxels are measurements at all
     model/likelihood.py           Fixed material classes + the per-bin match table
+    model/calibration.py          Grey value ↔ attenuation coefficient; predicted classes
+    model/registration.py         Neutron/X-ray offset by mutual information
     model/locked.py               Locked-mode segmentation, auto smoothing, guards
     model/health_check.py         Automatic checks before results are shown
     model/histogram_cache.py      Per-bin sufficient statistics for the mixture
@@ -58,6 +63,13 @@ Computation layer (GUI-independent, scriptable):
     utils/segmentation_report.py  Text report describing an exported segmentation
     utils/figure_export.py        Histogram + slice two-panel figure (no Qt)
     utils/config.py               Application-wide defaults
+
+Validation (not imported by the application):
+    validation/phantom.py         Synthetic 4-D cell with exact labels
+    validation/methods.py         BiTS as the GUI runs it + baseline methods
+    validation/scoring.py         Dice, volume error, oracle cluster naming
+    validation/run.py             python -m validation.run → docs/validation.md
+    validation/scaling.py         Time and memory of the spatial pass vs size
 ```
 
 The GUI never re-implements numerics: every widget delegates to the
@@ -286,9 +298,16 @@ the design decisions worth knowing when extending it:
   setting means the same thing at every class size. Never expose κ₀ directly.
 - **The unary term is a per-bin table.** `UnaryScores` holds `[n_bins, K]`
   plus a per-voxel row lookup, so ICM never materialises `[Z, Y, X, K]`.
-  Mean-field does, and `ROIDerivedMRF.refine` chooses between them from a
-  memory budget. Anything added to the spatial pass should keep working
-  through `column(k)` rather than assuming a dense array.
+  Mean-field does, and `ROIDerivedMRF.refine` plans the pass from a memory
+  budget (`plan_slabs`): the whole volume if it fits, else **z-slabs with a
+  halo of `n_sweeps + 1` slices**, else ICM. Both solvers are synchronous,
+  so a slab's core is exact — chunked labels are identical to whole-volume
+  ones, and the edge-weight scale is accumulated over the whole volume
+  first so every slab uses the same one. Anything added to the spatial pass
+  must stay synchronous (or grow the halo) and keep working through
+  `column(k)` / `slab()` rather than assuming a dense array. Measured cost:
+  mean-field ≈ `32·K + 30` bytes per voxel of the slab plus 4 per voxel of
+  the volume; ICM ≈ 75 bytes per voxel (`python -m validation.scaling`).
 - **Mixels are fitted after their parents**, not jointly. That keeps the EM
   derivation intact and means a mispaired mixing line degrades a fractional
   map instead of destabilising the whole mixture.
@@ -316,7 +335,28 @@ Two invariants the guards depend on:
 `auto_smoothing` compares each candidate strength against the **unsmoothed
 result at the same timepoint**, never against the first timepoint — otherwise
 a genuine change in the sample would read as smoothing damage, and the guard
-would abort on exactly what the software exists to measure.
+would abort on exactly what the software exists to measure. It checks the
+timepoints `smoothing_check_timepoints` returns (reference, where late
+classes were defined, middle, last), applies two lower guards (class volume,
+thin-sheet retention via `thin_structure_mask`) and one upper rule (stop
+once the next setting changes fewer than `CONVERGED_FRACTION` of voxels),
+extends the grid while labels are still changing at its top, and leaves the
+whole decision in `last_smoothing_report`, which the health check reads.
+
+Classes are built by `ClassLibrary.from_sources`, each from **its own
+timepoint** (`MaterialClass.defined_at`); a class whose region selects
+nothing is recorded in `library.dropped` with the reason and raises
+`ClassDefinitionWarning` — it is never skipped silently. A class may be a
+BIC-chosen Gaussian mixture (`MaterialClass.components`); its overall
+`mu`/`sigma` are kept for everything that needs one centre. Classes from
+`model/calibration.py` have `source == "physics"`; the health check expects
+them absent until first found, and `merge_libraries` lets a drawn class
+override a predicted one of the same name.
+
+The pipeline assumes the two volumes are co-registered.
+`model/registration.py` measures a rigid offset (mutual information over
+whole-voxel shifts, parabolic sub-voxel refinement, per-axis support test)
+and the GUI applies only the whole-voxel part, without interpolation.
 
 ### The materials panel
 

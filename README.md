@@ -84,6 +84,20 @@ back to voxels.
   runs before any numbers are shown — a run that has gone wrong invisibly
   does not reach a results screen. Start with
   [docs/workflow.md](docs/workflow.md).
+- **Phases that appear, and phases you cannot draw** — a material is defined
+  at the first timepoint where it exists, so a reaction product absent at
+  the start can still be tracked (a material that cannot be defined is
+  reported, never dropped silently). A material with no region at all can be
+  placed from its **attenuation coefficients**, calibrated on two drawn
+  materials. Materials occupying more than one place on the histogram can be
+  described by several clouds (*Allow irregular material shapes*).
+- **Alignment check** — measures the offset between the X-ray and neutron
+  volumes (mutual information) and corrects whole-voxel offsets in memory.
+- **Validated reproducibly** — `python -m validation.run` scores BiTS and
+  seven other methods (Otsu, multi-Otsu, K-means, GMM, random walker, a
+  random-forest pixel classifier) on a synthetic 4-D cell with exact labels,
+  and measures what noise, smoothing, drift, misalignment and artefacts cost.
+  Results, and their limits, in [docs/validation.md](docs/validation.md).
 - **Big-dataset mode** — all histograms are computed once at load and served
   from memory; volumes larger than 1 GiB are median-binned for display (with
   segmentation still running at full resolution), so time scrolling and
@@ -185,12 +199,16 @@ refactoring pass.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest
+python -m pytest                           # GUI tests skip without PyQt5
+QT_QPA_PLATFORM=offscreen python -m pytest # with PyQt5: the whole suite
+python -m validation.run --quick           # the validation benchmark, reduced
 ```
 
 The suite covers histogram correctness against NumPy references, ROI
 containment and selection/segmentation parity, K-means and Random Forest
-pipelines, cancellation, and data loading.
+pipelines, cancellation, data loading, the GUI (offscreen), and the claims in
+the documentation that have numbers attached. CI runs it on Python 3.10–3.12,
+with and without PyQt5, plus a reduced validation run.
 
 ## Repository layout
 
@@ -199,7 +217,8 @@ main.py                  Application entry point
 data/                    TIFF loading and 4D dataset container
 histograms/              Chunked CPU/GPU 2-D histogram engine
 segmentation/            ROI segmentation, K-means→material conversion, legacy/
-model/                   Anchored mixture, MRF, drift tracking, sequential segmenter
+model/                   Locked segmentation, MRF, drift tracking, alignment, calibration
+validation/              Synthetic phantom, baseline methods, benchmark and scaling runs
 utils/                   ROI manager, clustering, region growing, metrics, exports
 gui/                     PyQt5 widgets (main window, histograms, viewers)
 tests/                   pytest suite

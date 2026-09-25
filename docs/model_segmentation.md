@@ -114,12 +114,17 @@ smoothing model charges the same for both.
 `beta` sets the strength. `0` turns it off and shows the raw mixture labels —
 useful once, to see what the spatial term is doing.
 
-Two solvers, chosen automatically from a memory budget:
+Two solvers, chosen automatically from a memory budget (measured with
+`python -m validation.scaling`):
 
 | Solver | Memory | Quality |
 | --- | --- | --- |
-| mean-field | `K × 4` bytes/voxel (~1.4 GB at 38 M voxels, 9 classes) | better |
-| ICM | ~9 bytes/voxel, independent of `K` | greedier |
+| mean-field | ≈ `32·K + 30` bytes/voxel on the whole volume; in z-slabs, that on the slab plus 4 bytes/voxel on the volume | better |
+| ICM | ≈ 75 bytes/voxel, independent of `K` | greedier |
+
+A volume too large for one pass is refined in z-slabs padded by
+`n_sweeps + 1` slices; the labels are identical to a whole-volume pass, so
+mean-field stays the default at any size.
 
 ## Between timepoints
 
