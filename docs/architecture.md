@@ -216,7 +216,8 @@ Two coordinate spaces follow from this, and the split is strict:
 `HistogramEngine4D.compute_masked_histogram()` builds the histogram of one
 segmented class on the **global** histogram's bin grid, which is what lets
 exported per-class histograms be compared bin-for-bin across classes and
-timepoints; `utils/histogram_export.py` writes them (`.npy` counts + `.png`)
+timepoints; `utils/histogram_export.py` writes them (`.npy` counts, a
+figure in the chosen format, optionally a CSV)
 together with the shared edges. Anything producing a histogram meant for
 comparison should go through that method rather than binning independently.
 
@@ -438,6 +439,31 @@ is testable without Qt, and anything that changes what the screen shows
 changes the figure the same way. The slice is the *displayed* one, so on a
 binned dataset the figure carries a note saying so. SVG is the default
 format, written with `svg.fonttype = none` so text stays editable.
+
+## Saving figures
+
+Every analysis figure goes through the same two pieces:
+
+- `gui/figure_save_dialog.py` — `ask_figure_output()` shows the pop-up
+  (format: SVG default, PDF, PNG, TIFF; resolution; "also save the data as
+  CSV") and then the save dialog, and returns a `FigureOutput` with
+  `figure_path` and `data_path(suffix)`. The answers are remembered for the
+  session (class attributes of `FigureSaveDialog`). A figure with its own
+  options subclasses the dialog and passes `extra_widgets`
+  (`FigureExportDialog` does, for the histogram + slice figure).
+- `utils/figure_io.py` — `save_figure()` (format from the extension, SVG
+  text kept as text, resolution for rasters and embedded images) and
+  `write_csv()`. No Qt.
+
+Each figure's module provides the matching CSV writer:
+`histogram_evolution.write_evolution_csv` / `write_marginal_csv`,
+`figure_export.write_histogram_slice_csv`,
+`SeriesClustering.write_timeline_csv`, `write_metrics_csv`. A new analysis
+figure should do the same: render with plain matplotlib, save through
+`save_figure`, and offer its numbers through `write_csv`.
+
+`tests/conftest.py` makes the pop-up fail a test instead of waiting forever
+when a test reaches it without stubbing `FigureSaveDialog.exec_`.
 
 ## Screen size
 

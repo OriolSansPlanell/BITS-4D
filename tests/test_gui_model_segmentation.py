@@ -288,6 +288,8 @@ def test_spatial_metrics_export(window, monkeypatch, tmp_path):
     window._segment_all_volumes()
 
     target = tmp_path / "spatial.csv"
+    from gui.figure_save_dialog import FigureSaveDialog
+    monkeypatch.setattr(FigureSaveDialog, "exec_", lambda self: QDialog.Accepted)
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName",
         staticmethod(lambda *a, **k: (str(target), "")),
@@ -301,7 +303,7 @@ def test_spatial_metrics_export(window, monkeypatch, tmp_path):
     assert {"com_z_k", "rg_k", "n_components_k", "sa_vol_k"} <= metrics
     classes = {record["class"] for record in records if record["class"]}
     assert {"Matrix", "Deposit"} <= classes
-    assert (tmp_path / "spatial_evolution.png").exists()
+    assert (tmp_path / "spatial.svg").exists()
 
 
 def test_spatial_metrics_need_a_segmentation(window, monkeypatch):

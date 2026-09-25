@@ -235,8 +235,48 @@ def save_histogram_slice_figure(
         path = path.with_name(path.name + DEFAULT_FORMAT)
     path.parent.mkdir(parents=True, exist_ok=True)
     figure = render_histogram_slice_figure(histogram, slice_panel, **kwargs)
-    import matplotlib
-    with matplotlib.rc_context({"svg.fonttype": "none"}):
-        figure.savefig(path, dpi=dpi, bbox_inches="tight")
+    from utils.figure_io import save_figure
+    save_figure(figure, path, dpi)
     return path
+
+
+def write_histogram_slice_csv(path, histogram: HistogramPanel,
+                              slice_panel: SlicePanel) -> str:
+    """The numbers behind the two-panel figure, one row per label.
+
+    Histogram labels: how many voxels of the local histogram fall inside the
+    label's region (bins whose centre is inside the outline), and their share.
+    Slice labels: how many pixels of the displayed slice are highlighted,
+    and their share of the slice.
+    """
+    from matplotlib.path import Path as MplPath
+    from utils.figure_io import write_csv
+
+    data = histogram.histogram_data
+    counts = np.asarray(data.histogram, dtype=np.float64)
+    total = max(counts.sum(), 1.0)
+    x_centers = 0.5 * (np.asarray(data.x_edges[:-1]) + np.asarray(data.x_edges[1:]))
+    y_centers = 0.5 * (np.asarray(data.y_edges[:-1]) + np.asarray(data.y_edges[1:]))
+    grid_x, grid_y = np.meshgrid(x_centers, y_centers)
+    centers = np.column_stack((grid_x.ravel(), grid_y.ravel()))
+
+    rows = []
+    for label, vertices, color in histogram.overlays:
+        if vertices is None or len(vertices) < 3:
+            continue
+        inside = MplPath(np.asarray(vertices, float)).contains_points(centers)
+        voxels = float(counts.ravel()[inside].sum())
+        rows.append(("histogram", label, mcolors.to_hex(_rgb(color)),
+                     int(voxels), voxels / total))
+    image = np.asarray(slice_panel.image)
+    for label, mask, color in slice_panel.overlays:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != image.shape:
+            continue
+        pixels = int(np.count_nonzero(mask))
+        rows.append(("slice", label, mcolors.to_hex(_rgb(color)),
+                     pixels, pixels / max(mask.size, 1)))
+    return write_csv(
+        path, ("panel", "label", "color", "count", "share"), rows,
+    )
 

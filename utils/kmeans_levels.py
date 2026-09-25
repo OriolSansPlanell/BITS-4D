@@ -298,7 +298,7 @@ def describe_presence(present: Sequence[int], all_timepoints: Sequence[int]) -> 
 
 
 def plot_timeline(result: "SeriesClustering", path, colors=None,
-                  names=None) -> None:
+                  names=None, dpi: Optional[int] = None) -> None:
     """Share of the sample in every cluster against time, saved to *path*.
 
     One line per cluster, in the cluster's overlay colour; transient phases
@@ -306,7 +306,6 @@ def plot_timeline(result: "SeriesClustering", path, colors=None,
     absent. The share axis is logarithmic so small phases stay readable. The
     format follows the extension (SVG recommended).
     """
-    import matplotlib
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
@@ -338,8 +337,8 @@ def plot_timeline(result: "SeriesClustering", path, colors=None,
     axes.grid(True, which='both', alpha=0.25, linewidth=0.5)
     axes.legend(fontsize=8, loc="best")
     figure.tight_layout()
-    with matplotlib.rc_context({"svg.fonttype": "none"}):
-        figure.savefig(path)
+    from utils.figure_io import save_figure
+    save_figure(figure, path, dpi)
 
 
 def series_bin_weights(histograms: Sequence[np.ndarray],

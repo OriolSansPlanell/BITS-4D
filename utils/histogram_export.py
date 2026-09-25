@@ -60,9 +60,14 @@ def save_class_histogram(
     title: str = "",
     write_image: bool = True,
     dpi: int = 130,
+    image_format: str = "png",
+    write_csv: bool = False,
 ) -> list:
-    """Save one class histogram as ``<output_path>.npy`` (+ ``.png``).
+    """Save one class histogram as ``<output_path>.npy`` (+ an image).
 
+    *image_format* is any figure format (``"svg"``, ``"pdf"``, ``"png"``,
+    ``"tif"``). With *write_csv* the counts are also written as
+    ``<output_path>.csv``, one row per non-empty bin (bin centres and count).
     *output_path* is a path without extension. Returns the file names written.
     """
     base = Path(output_path)
@@ -72,6 +77,22 @@ def save_class_histogram(
     counts_path = base.with_suffix(".npy")
     np.save(counts_path, np.asarray(histogram_data.histogram))
     written.append(counts_path.name)
+
+    if write_csv:
+        from utils.figure_io import write_csv as _write_csv
+        counts = np.asarray(histogram_data.histogram)
+        x_centers = 0.5 * (np.asarray(histogram_data.x_edges[:-1])
+                           + np.asarray(histogram_data.x_edges[1:]))
+        y_centers = 0.5 * (np.asarray(histogram_data.y_edges[:-1])
+                           + np.asarray(histogram_data.y_edges[1:]))
+        y_bins, x_bins = np.nonzero(counts)
+        csv_path = base.with_suffix(".csv")
+        _write_csv(
+            csv_path, ("neutron_center", "xray_center", "count"),
+            ((float(x_centers[ix]), float(y_centers[iy]), int(counts[iy, ix]))
+             for iy, ix in zip(y_bins, x_bins)),
+        )
+        written.append(csv_path.name)
 
     if not write_image:
         return written
@@ -96,7 +117,8 @@ def save_class_histogram(
     figure.colorbar(image, ax=axes, label="log10(counts + 1)")
     figure.tight_layout()
 
-    image_path = base.with_suffix(".png")
-    figure.savefig(image_path)
+    from utils.figure_io import save_figure
+    image_path = base.with_suffix("." + image_format.lstrip("."))
+    save_figure(figure, image_path, dpi)
     written.append(image_path.name)
     return written

@@ -31,6 +31,7 @@ from gui.time_navigation_widget import TimeNavigationWidget
 from gui.dual_histogram_widget import DualHistogramWidget
 from gui.material_panel import MaterialPanel, describe_strength
 from gui.responsive import fit_to_screen, flow_row, scrollable
+from gui.figure_save_dialog import FigureSaveDialog, ask_figure_output
 
 
 def _group_labelled(widgets, max_follow=2):
@@ -1533,7 +1534,7 @@ class ExportOptionsDialog(QDialog):
             "at every timepoint, and how the segmentation was produced."
         )
         self._histogram_cb = QCheckBox(
-            "Bimodal histogram of the class  (.npy + .png)"
+            "Bimodal histogram of the class  (.npy + figure)"
         )
         self._histogram_cb.setToolTip(
             "For every selected class and timepoint, compute the 2-D\n"
@@ -1554,6 +1555,34 @@ class ExportOptionsDialog(QDialog):
         mod_vbox.addWidget(self._xray_cb)
         mod_vbox.addWidget(self._labels_cb)
         mod_vbox.addWidget(self._histogram_cb)
+
+        # Format of the histogram figures, and their counts as CSV
+        from utils.figure_io import FIGURE_FORMATS
+        hist_row = QHBoxLayout()
+        hist_row.setContentsMargins(24, 0, 0, 0)
+        hist_row.addWidget(QLabel("Figure format:"))
+        self._histogram_format = QComboBox()
+        for ext, label in FIGURE_FORMATS:
+            self._histogram_format.addItem(label.split(" — ")[0], ext)
+        index = self._histogram_format.findData(FigureSaveDialog.last_format)
+        self._histogram_format.setCurrentIndex(max(index, 0))
+        hist_row.addWidget(self._histogram_format)
+        self._histogram_csv_cb = QCheckBox("+ counts as CSV")
+        self._histogram_csv_cb.setToolTip(
+            "Also write each class histogram as a CSV: one row per non-empty\n"
+            "bin, with its neutron and X-ray centre and its count."
+        )
+        hist_row.addWidget(self._histogram_csv_cb)
+        hist_row.addStretch()
+        mod_vbox.addLayout(hist_row)
+
+        def _histogram_toggled(_state=None):
+            enabled = self._histogram_cb.isChecked()
+            self._histogram_format.setEnabled(enabled)
+            self._histogram_csv_cb.setEnabled(enabled)
+        self._histogram_cb.stateChanged.connect(_histogram_toggled)
+        _histogram_toggled()
+
         mod_vbox.addWidget(self._report_cb)
 
         mod_group.setLayout(mod_vbox)
@@ -1568,7 +1597,8 @@ class ExportOptionsDialog(QDialog):
         for cb, *_ in self._layer_cbs:
             cb.stateChanged.connect(self._update_preview)
         for cb in (self._mask_cb, self._neutron_cb, self._xray_cb,
-                   self._labels_cb, self._histogram_cb, self._report_cb):
+                   self._labels_cb, self._histogram_cb, self._report_cb,
+                   self._histogram_csv_cb):
             cb.stateChanged.connect(self._update_preview)
         self._update_preview()
 
@@ -1591,9 +1621,10 @@ class ExportOptionsDialog(QDialog):
         n_mods   = sum([self._mask_cb.isChecked(),
                         self._neutron_cb.isChecked(),
                         self._xray_cb.isChecked()])
-        # A histogram export writes a counts file and an image per layer
+        # A histogram export writes a counts file and an image per layer,
+        # plus a CSV when asked for
         if self._histogram_cb.isChecked():
-            n_mods += 2
+            n_mods += 3 if self._histogram_csv_cb.isChecked() else 2
         n_label  = 1 if self._labels_cb.isChecked() else 0
         per_tp   = n_layers * n_mods + n_label
         self._preview_label.setText(
@@ -1613,46 +1644,22 @@ class ExportOptionsDialog(QDialog):
         self.export_xray    = self._xray_cb.isChecked()
         self.export_labels  = self._labels_cb.isChecked()
         self.export_histogram = self._histogram_cb.isChecked()
+        self.histogram_format = self._histogram_format.currentData()
+        self.histogram_csv = self._histogram_csv_cb.isChecked()
         self.export_report = self._report_cb.isChecked()
         self.accept()
 
 
-class FigureExportDialog(QDialog):
-    """Options for the side-by-side histogram + slice figure export.
+class FigureExportDialog(FigureSaveDialog):
+    """The format pop-up, plus the options of the histogram + slice figure.
 
-    After exec_() returns Accepted, read ``dpi``, ``show_legend``,
-    ``outline_highlights`` and ``include_active_roi``.
+    After exec_() returns Accepted, read ``fmt``, ``dpi``, ``save_csv``,
+    ``show_legend``, ``outline_highlights`` and ``include_active_roi``.
     """
 
     def __init__(self, has_active_roi=False, parent=None):
-        super().__init__(parent)
-        from PyQt5.QtWidgets import QSpinBox
-
-        self.setWindowTitle("Export Histogram + Slice Figure")
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            "Left: the local histogram of this timepoint with every label's\n"
-            "selection on top.  Right: the slice on screen with the same\n"
-            "labels highlighted."
-        ))
-
-        dpi_row = QHBoxLayout()
-        dpi_row.addWidget(QLabel("Resolution (DPI):"))
-        self._dpi_spin = QSpinBox()
-        self._dpi_spin.setRange(72, 1200)
-        self._dpi_spin.setSingleStep(50)
-        self._dpi_spin.setValue(300)
-        self._dpi_spin.setToolTip(
-            "Resolution of the histogram and slice images. In an SVG or PDF\n"
-            "the outlines, text and legends stay vector graphics."
-        )
-        dpi_row.addWidget(self._dpi_spin)
-        dpi_row.addStretch()
-        layout.addLayout(dpi_row)
-
         self._legend_cb = QCheckBox("Show legends")
         self._legend_cb.setChecked(True)
-        layout.addWidget(self._legend_cb)
 
         self._outline_cb = QCheckBox("Outline the slice highlights")
         self._outline_cb.setChecked(True)
@@ -1660,26 +1667,33 @@ class FigureExportDialog(QDialog):
             "Draw a thin contour around each highlighted label, so it stays\n"
             "readable in print and in greyscale."
         )
-        layout.addWidget(self._outline_cb)
 
         self._active_cb = QCheckBox("Include ROIs drawn but not saved")
         self._active_cb.setChecked(has_active_roi)
         self._active_cb.setEnabled(has_active_roi)
-        layout.addWidget(self._active_cb)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _on_accept(self):
-        self.dpi = self._dpi_spin.value()
-        self.show_legend = self._legend_cb.isChecked()
-        self.outline_highlights = self._outline_cb.isChecked()
-        self.include_active_roi = (
-            self._active_cb.isEnabled() and self._active_cb.isChecked()
+        super().__init__(
+            "Export Histogram + Slice Figure",
+            csv_label="Also save the label counts as CSV",
+            note=("Left: the local histogram of this timepoint with every "
+                  "label's selection on top. Right: the slice on screen with "
+                  "the same labels highlighted."),
+            parent=parent,
+            extra_widgets=(QLabel("<b>Figure options</b>"), self._legend_cb,
+                           self._outline_cb, self._active_cb),
         )
-        self.accept()
+
+    @property
+    def show_legend(self):
+        return self._legend_cb.isChecked()
+
+    @property
+    def outline_highlights(self):
+        return self._outline_cb.isChecked()
+
+    @property
+    def include_active_roi(self):
+        return self._active_cb.isEnabled() and self._active_cb.isChecked()
 
 
 class BiTS4DMainWindow(QMainWindow):
@@ -2015,8 +2029,9 @@ class BiTS4DMainWindow(QMainWindow):
         self.kmeans_timeline_btn = QPushButton("📈 Export Cluster Timeline...")
         self.kmeans_timeline_btn.setEnabled(False)
         self.kmeans_timeline_btn.setToolTip(
-            "After a time-series run: every cluster's voxel count and share\n"
-            "of the sample at every timepoint (CSV), plus a plot (SVG)."
+            "After a time-series run: a plot of every cluster's share of the\n"
+            "sample over time (SVG, PDF, PNG or TIFF), and optionally the\n"
+            "voxel counts and shares as CSV."
         )
         self.kmeans_timeline_btn.clicked.connect(self._export_kmeans_timeline)
         km_layout.addWidget(self.kmeans_timeline_btn)
@@ -3649,23 +3664,26 @@ class BiTS4DMainWindow(QMainWindow):
                 "Run K-means with the Time series scope first."
             )
             return
-        path, _filter = QFileDialog.getSaveFileName(
-            self, "Export Cluster Timeline", "kmeans_timeline.csv",
-            "CSV (*.csv)"
+        output = ask_figure_output(
+            self, "Export Cluster Timeline", "kmeans_timeline",
+            csv_label="Also save each cluster's share over time as CSV",
         )
-        if not path:
+        if output is None:
             return
         from utils.kmeans_levels import plot_timeline
-        base = path[:-4] if path.lower().endswith(".csv") else path
-        csv_path, plot_path = base + ".csv", base + ".svg"
+        written = []
         try:
-            result.write_timeline_csv(csv_path)
-            plot_timeline(result, plot_path,
-                          colors=getattr(self, "_kmeans_series_colors", None))
+            plot_timeline(result, str(output.figure_path),
+                          colors=getattr(self, "_kmeans_series_colors", None),
+                          dpi=output.dpi)
+            written.append(str(output.figure_path))
+            if output.save_csv:
+                result.write_timeline_csv(output.data_path())
+                written.append(str(output.data_path()))
         except OSError as exc:
             QMessageBox.critical(self, "Export Error", f"Could not write:\n{exc}")
             return
-        self.status_bar.showMessage(f"Timeline saved: {csv_path}, {plot_path}")
+        self.status_bar.showMessage("Timeline saved: " + ", ".join(written))
 
     @pyqtSlot()
     def _convert_kmeans_clusters_to_materials(self):
@@ -4934,7 +4952,8 @@ class BiTS4DMainWindow(QMainWindow):
         )
 
     def _export_class_histogram(self, timepoint, name, mask_3d, output_dir,
-                                path_prefix):
+                                path_prefix, image_format="svg",
+                                write_csv=False):
         """Write the bimodal histogram of one segmented class.
 
         Computed on the full-resolution volumes and on the global
@@ -4954,6 +4973,8 @@ class BiTS4DMainWindow(QMainWindow):
             class_hist,
             f"{path_prefix}_hist",
             title=f"{name} — T={timepoint}  ({class_hist.num_voxels:,} voxels)",
+            image_format=image_format,
+            write_csv=write_csv,
         )
 
     def _export_current_timepoint(self):
@@ -5034,7 +5055,9 @@ class BiTS4DMainWindow(QMainWindow):
                     files_written.append(os.path.basename(p))
                 if do_histogram:
                     files_written += self._export_class_histogram(
-                        current_t, name, mask_bool, output_dir, pfx
+                        current_t, name, mask_bool, output_dir, pfx,
+                        image_format=dlg.histogram_format,
+                        write_csv=dlg.histogram_csv,
                     )
 
             if do_labels:
@@ -5207,7 +5230,9 @@ class BiTS4DMainWindow(QMainWindow):
                         total_files += 1
                     if do_histogram:
                         total_files += len(self._export_class_histogram(
-                            t, name, mask_bool, output_dir, pfx
+                            t, name, mask_bool, output_dir, pfx,
+                            image_format=dlg.histogram_format,
+                            write_csv=dlg.histogram_csv,
                         ))
 
                 exported_layers[t] = t_layers
@@ -5339,9 +5364,16 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        has_active = self.dual_histogram.get_roi_manager().has_roi()
+        has_active = self.dual_histogram.get_roi_manager().unsaved_count() > 0
         dialog = FigureExportDialog(has_active_roi=has_active, parent=self)
-        if dialog.exec_() != QDialog.Accepted:
+        timepoint = self.dataset.current_timepoint
+        axis = self.slice_viewer.current_axis
+        index = self.slice_viewer.current_slice_index
+        output = ask_figure_output(
+            self, "Save Histogram + Slice Figure",
+            f"histogram_slice_T{timepoint:03d}_{axis}{index}", dialog=dialog,
+        )
+        if output is None:
             return
 
         panels = self._histogram_slice_figure_panels(dialog.include_active_roi)
@@ -5352,26 +5384,20 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        timepoint = self.dataset.current_timepoint
-        axis = self.slice_viewer.current_axis
-        index = self.slice_viewer.current_slice_index
-        default_name = f"histogram_slice_T{timepoint:03d}_{axis}{index}.svg"
-        path, _filter = QFileDialog.getSaveFileName(
-            self, "Save Histogram + Slice Figure", default_name,
-            "SVG vector (*.svg);;PDF document (*.pdf);;PNG image (*.png);;"
-            "TIFF image (*.tif *.tiff);;All files (*)",
+        from utils.figure_export import (
+            save_histogram_slice_figure, write_histogram_slice_csv,
         )
-        if not path:
-            return
-
-        from utils.figure_export import save_histogram_slice_figure
         try:
-            written = save_histogram_slice_figure(
-                path, *panels,
-                dpi=dialog.dpi,
+            written = [str(save_histogram_slice_figure(
+                output.figure_path, *panels,
+                dpi=output.dpi,
                 show_legend=dialog.show_legend,
                 outline_highlights=dialog.outline_highlights,
-            )
+            ))]
+            if output.save_csv:
+                written.append(write_histogram_slice_csv(
+                    output.data_path(), *panels
+                ))
         except Exception as exc:
             QMessageBox.critical(
                 self, "Export Error", f"Could not save the figure:\n{exc}"
@@ -5379,7 +5405,7 @@ class BiTS4DMainWindow(QMainWindow):
             import traceback; traceback.print_exc()
             return
 
-        self.status_bar.showMessage(f"Figure saved to {written}")
+        self.status_bar.showMessage("Saved: " + ", ".join(written))
 
     # ========== v14.0: Selection Library & Reporting Methods ==========
 
@@ -5612,14 +5638,15 @@ class BiTS4DMainWindow(QMainWindow):
     # ========== v14.1: Advanced Analytics Methods ==========
     
     def _run_histogram_time_analysis(self, title, dialog_caption, render,
-                                     explanation):
+                                     explanation, default_name=None,
+                                     csv_label="Also save the data as CSV"):
         """Shared driver for the temporal histogram analyses.
 
-        Collects every timepoint's local histogram (from cache, computing any
-        that are missing), then hands the list to *render*, which draws the
-        figure and returns the saved path.
+        Asks the figure format (and whether to save the data as CSV), then
+        collects every timepoint's local histogram (from cache, computing any
+        that are missing) and hands the list to *render(histograms, output)*,
+        which saves the figure (and CSV) and returns the paths written.
         """
-        from PyQt5.QtWidgets import QFileDialog
         from utils.cancellation import OperationCancelled, OperationFailed
 
         if not self.dataset or not self.histogram_engine:
@@ -5638,13 +5665,13 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, dialog_caption, "", "PNG Files (*.png);;All Files (*)"
+        output = ask_figure_output(
+            self, dialog_caption,
+            default_name or title.lower().replace(" ", "_"),
+            csv_label=csv_label,
         )
-        if not filepath:
+        if output is None:
             return
-        if not filepath.lower().endswith((".png", ".jpg", ".pdf", ".svg")):
-            filepath += ".png"
 
         def operation(progress_callback=None, cancel_check=None):
             histograms = []
@@ -5668,7 +5695,7 @@ class BiTS4DMainWindow(QMainWindow):
                     )
             if progress_callback:
                 progress_callback(95, "Rendering figure...")
-            return render(histograms, filepath)
+            return render(histograms, output)
 
         try:
             saved = run_with_progress(
@@ -5678,10 +5705,11 @@ class BiTS4DMainWindow(QMainWindow):
             return
 
         if saved:
-            self.status_bar.showMessage(f"{title} saved: {saved}")
+            files = "\n".join(str(path) for path in saved)
+            self.status_bar.showMessage(f"{title} saved: {saved[0]}")
             QMessageBox.information(
-                self, "Image Saved",
-                f"{title} saved to:\n{saved}\n\n{explanation}"
+                self, "Saved",
+                f"{title} saved to:\n{files}\n\n{explanation}"
             )
 
     def _collect_metrics_rows(self, progress_callback=None, cancel_check=None):
@@ -5779,21 +5807,22 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save Metrics CSV", "", "CSV Files (*.csv);;All Files (*)"
+        output = ask_figure_output(
+            self, "Save Histogram & Segmentation Metrics", "metrics",
+            csv_label="Also save the metric values as CSV",
         )
-        if not filepath:
+        if output is None:
             return
-        if not filepath.lower().endswith(".csv"):
-            filepath += ".csv"
-        plot_path = filepath[:-4] + "_evolution.png"
+        filepath = str(output.data_path()) if output.save_csv else None
+        plot_path = str(output.figure_path)
 
         def operation(progress_callback=None, cancel_check=None):
             rows = self._collect_metrics_rows(progress_callback, cancel_check)
             if progress_callback:
                 progress_callback(97, "Writing CSV and plots...")
-            write_metrics_csv(rows, filepath)
-            return rows, plot_metric_evolution(rows, plot_path)
+            if filepath:
+                write_metrics_csv(rows, filepath)
+            return rows, plot_metric_evolution(rows, plot_path, dpi=output.dpi)
 
         try:
             result = run_with_progress(
@@ -5810,8 +5839,8 @@ class BiTS4DMainWindow(QMainWindow):
             1 for row in rows if row.scope == "timepoint" and row.per_class.get("voxels_k")
         )
         message = (
-            f"Metrics written to:\n{filepath}\n\n"
-            f"{len(rows) - 1} timepoint(s) analysed, "
+            (f"Metric values written to:\n{filepath}\n\n" if filepath else "")
+            + f"{len(rows) - 1} timepoint(s) analysed, "
             f"{segmented} with segmentation classes."
         )
         if saved_plot:
@@ -5824,7 +5853,9 @@ class BiTS4DMainWindow(QMainWindow):
                 "segmented classes; only the histogram shape metrics were "
                 "computed."
             )
-        self.status_bar.showMessage(f"Metrics saved: {filepath}")
+        self.status_bar.showMessage(
+            f"Metrics saved: {saved_plot or filepath or 'nothing written'}"
+        )
         QMessageBox.information(self, "Metrics Saved", message)
 
     # ── model-based time-series segmentation ─────────────────────────────
@@ -6387,14 +6418,14 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save Spatial Metrics", "", "CSV Files (*.csv);;All Files (*)"
+        output = ask_figure_output(
+            self, "Save Spatial Metrics", "spatial_metrics",
+            csv_label="Also save the metric values as CSV",
         )
-        if not filepath:
+        if output is None:
             return
-        if not filepath.lower().endswith(".csv"):
-            filepath += ".csv"
-        plot_path = filepath[:-4] + "_evolution.png"
+        filepath = str(output.data_path()) if output.save_csv else None
+        plot_path = str(output.figure_path)
 
         def operation(progress_callback=None, cancel_check=None):
             if progress_callback:
@@ -6403,12 +6434,13 @@ class BiTS4DMainWindow(QMainWindow):
             info, scalars, per_class = combined_registry()
             if progress_callback:
                 progress_callback(85, "Writing CSV and plot...")
-            write_metrics_csv(
-                rows, filepath, metric_info=info,
-                scalar_metrics=scalars, per_class_metrics=per_class,
-            )
+            if filepath:
+                write_metrics_csv(
+                    rows, filepath, metric_info=info,
+                    scalar_metrics=scalars, per_class_metrics=per_class,
+                )
             saved = plot_metric_evolution(
-                rows, plot_path, metric_info=info,
+                rows, plot_path, dpi=output.dpi, metric_info=info,
                 scalar_metrics=scalars, per_class_metrics=per_class,
             )
             return rows, saved
@@ -6424,43 +6456,76 @@ class BiTS4DMainWindow(QMainWindow):
             return
 
         rows, saved_plot = result
-        message = f"Spatial metrics written to:\n{filepath}\n\n"
+        message = (f"Spatial metric values written to:\n{filepath}\n\n"
+                   if filepath else "")
         message += f"{len(rows)} timepoint(s) measured."
         if saved_plot:
             message += f"\n\nEvolution plot:\n{saved_plot}"
         else:
             message += "\n\n(No evolution plot — it needs at least 2 timepoints.)"
-        self.status_bar.showMessage(f"Spatial metrics saved: {filepath}")
+        self.status_bar.showMessage(
+            f"Spatial metrics saved: {saved_plot or filepath or 'nothing written'}"
+        )
         QMessageBox.information(self, "Spatial Metrics Saved", message)
+
+    @staticmethod
+    def _joint_evolution_renderer(reference_mode):
+        """Save the joint-histogram panels, and optionally their data: a
+        per-timepoint summary CSV and a per-bin CSV (``_bins``)."""
+        def render(histograms, output):
+            from utils.histogram_evolution import (
+                save_histogram_evolution_image, write_evolution_csv,
+            )
+            written = [save_histogram_evolution_image(
+                histograms, str(output.figure_path), dpi=output.dpi,
+                reference_mode=reference_mode,
+            )]
+            if output.save_csv:
+                written += write_evolution_csv(
+                    histograms, output.data_path(), output.data_path("_bins"),
+                    reference_mode=reference_mode,
+                )
+            return written
+        return render
+
+    @staticmethod
+    def _marginal_evolution_renderer(reference_mode):
+        """Save the marginal kymographs, and optionally their data."""
+        def render(histograms, output):
+            from utils.histogram_evolution import (
+                save_marginal_evolution_image, write_marginal_csv,
+            )
+            written = [save_marginal_evolution_image(
+                histograms, str(output.figure_path), dpi=output.dpi,
+                reference_mode=reference_mode,
+            )]
+            if output.save_csv:
+                written.append(write_marginal_csv(
+                    histograms, output.data_path(), reference_mode=reference_mode,
+                ))
+            return written
+        return render
 
     def _on_export_histogram_evolution(self):
         """Save each timepoint's log-histogram change against T0."""
-        from utils.histogram_evolution import (
-            REFERENCE_FIRST, save_histogram_evolution_image,
-        )
+        from utils.histogram_evolution import REFERENCE_FIRST
 
         self._run_histogram_time_analysis(
             "Histogram Evolution",
-            "Save Histogram Evolution Image",
-            lambda histograms, path: save_histogram_evolution_image(
-                histograms, path, reference_mode=REFERENCE_FIRST
-            ),
+            "Save Histogram Evolution",
+            self._joint_evolution_renderer(REFERENCE_FIRST),
             "Red areas gained voxels relative to T0, blue areas lost them "
             "(log scale). This is the cumulative drift from the start.",
         )
 
     def _on_export_histogram_increment(self):
         """Save each timepoint's log-histogram change against the previous one."""
-        from utils.histogram_evolution import (
-            REFERENCE_PREVIOUS, save_histogram_evolution_image,
-        )
+        from utils.histogram_evolution import REFERENCE_PREVIOUS
 
         self._run_histogram_time_analysis(
             "Incremental Histogram Change",
-            "Save Incremental Histogram Change Image",
-            lambda histograms, path: save_histogram_evolution_image(
-                histograms, path, reference_mode=REFERENCE_PREVIOUS
-            ),
+            "Save Incremental Histogram Change",
+            self._joint_evolution_renderer(REFERENCE_PREVIOUS),
             "Each panel compares a timepoint with the one before it, so the "
             "steps where change actually happens stand out instead of being "
             "buried in cumulative drift.",
@@ -6468,16 +6533,12 @@ class BiTS4DMainWindow(QMainWindow):
 
     def _on_export_marginal_evolution(self):
         """Save marginal kymographs of each modality against T0."""
-        from utils.histogram_evolution import (
-            REFERENCE_FIRST, save_marginal_evolution_image,
-        )
+        from utils.histogram_evolution import REFERENCE_FIRST
 
         self._run_histogram_time_analysis(
             "Marginal Evolution",
-            "Save Marginal Evolution Image",
-            lambda histograms, path: save_marginal_evolution_image(
-                histograms, path, reference_mode=REFERENCE_FIRST
-            ),
+            "Save Marginal Evolution",
+            self._marginal_evolution_renderer(REFERENCE_FIRST),
             "Each panel stacks one modality's 1-D histogram against time "
             "(log2 vs T0). Red intensity bands grew, blue bands shrank — "
             "this separates a shift in neutron from a shift in X-ray.",
@@ -6485,16 +6546,12 @@ class BiTS4DMainWindow(QMainWindow):
 
     def _on_export_marginal_increment(self):
         """Save marginal kymographs comparing each timepoint with the previous."""
-        from utils.histogram_evolution import (
-            REFERENCE_PREVIOUS, save_marginal_evolution_image,
-        )
+        from utils.histogram_evolution import REFERENCE_PREVIOUS
 
         self._run_histogram_time_analysis(
             "Incremental Marginal Change",
-            "Save Incremental Marginal Change Image",
-            lambda histograms, path: save_marginal_evolution_image(
-                histograms, path, reference_mode=REFERENCE_PREVIOUS
-            ),
+            "Save Incremental Marginal Change",
+            self._marginal_evolution_renderer(REFERENCE_PREVIOUS),
             "Each column compares a timepoint with the one before it, so the "
             "steps where an intensity band actually moves stand out. T0 is "
             "blank because it has no predecessor.",
@@ -6839,6 +6896,8 @@ class BiTS4DMainWindow(QMainWindow):
         canvas = FigureCanvasQTAgg(fig)
         layout.addWidget(canvas)
         
+        plotted = []  # (name, timepoints, values) currently drawn
+
         def do_plot():
             selected_names = [name for cb, name in checkboxes if cb.isChecked()]
             
@@ -6846,6 +6905,7 @@ class BiTS4DMainWindow(QMainWindow):
                 return
             
             ax.clear()
+            plotted.clear()
             
             for name in selected_names:
                 timepoints, values = self.time_series_analyzer.get_time_series(
@@ -6854,6 +6914,7 @@ class BiTS4DMainWindow(QMainWindow):
                 
                 if len(timepoints) > 0:
                     ax.plot(timepoints, values, 'o-', label=name, linewidth=2)
+                    plotted.append((name, timepoints, values))
             
             ax.set_xlabel('Timepoint')
             ax.set_ylabel('Neutron Mean Intensity')
@@ -6864,6 +6925,38 @@ class BiTS4DMainWindow(QMainWindow):
             canvas.draw()
         
         plot_btn.clicked.connect(do_plot)
+
+        save_btn = QPushButton("💾 Save Figure...")
+        save_btn.setToolTip(
+            "Save the plot (SVG, PDF, PNG or TIFF) and, optionally, the\n"
+            "plotted values as CSV."
+        )
+
+        def do_save():
+            if not plotted:
+                do_plot()
+            if not plotted:
+                return
+            output = ask_figure_output(
+                dialog, "Save Time Series Plot", "time_series",
+                csv_label="Also save the plotted values as CSV",
+            )
+            if output is None:
+                return
+            from utils.figure_io import save_figure, write_csv
+            written = [save_figure(fig, output.figure_path, output.dpi)]
+            if output.save_csv:
+                written.append(write_csv(
+                    output.data_path(),
+                    ("selection", "timepoint", "neutron_mean"),
+                    ((name, int(t), float(v))
+                     for name, times, values in plotted
+                     for t, v in zip(times, values)),
+                ))
+            self.status_bar.showMessage("Saved: " + ", ".join(written))
+
+        save_btn.clicked.connect(do_save)
+        layout.addWidget(save_btn)
         
         dialog.setLayout(layout)
         dialog.exec_()

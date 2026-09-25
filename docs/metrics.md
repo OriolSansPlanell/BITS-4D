@@ -11,8 +11,10 @@ Two families, sharing one CSV schema so their outputs concatenate:
 
 *Analytics → Histogram Time Analysis → Histogram & Segmentation Metrics…*
 
-Pick a CSV filename; BiTS 4D writes that file plus `<name>_evolution.png`
-alongside it. Two scopes are analysed:
+A small window asks the figure format (SVG by default; PDF, PNG or TIFF) and
+whether to also save the metric values as CSV; then pick a name. BiTS 4D
+writes the evolution plot as `<name>.svg` (or the chosen format) and the
+values as `<name>.csv`. Two scopes are analysed:
 
 - **global** — the whole-dataset bimodal histogram, with the classes of the
   first segmented timepoint;

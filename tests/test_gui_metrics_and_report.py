@@ -132,6 +132,8 @@ def test_hidden_classes_are_left_out_of_the_metrics(window, monkeypatch):
 def test_metrics_export_writes_csv_and_plot(window, monkeypatch, tmp_path):
     _segment_all_as(window, "Lithium", monkeypatch)
     target = tmp_path / "metrics.csv"
+    from gui.figure_save_dialog import FigureSaveDialog
+    monkeypatch.setattr(FigureSaveDialog, "exec_", lambda self: QDialog.Accepted)
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName",
         staticmethod(lambda *a, **k: (str(target), "")),
@@ -139,7 +141,8 @@ def test_metrics_export_writes_csv_and_plot(window, monkeypatch, tmp_path):
     window._on_export_histogram_metrics()
 
     assert target.exists()
-    plot = tmp_path / "metrics_evolution.png"
+    # The figure is saved in the format picked in the pop-up (SVG default)
+    plot = tmp_path / "metrics.svg"
     assert plot.exists() and plot.stat().st_size > 5000
 
     with open(target, newline="", encoding="utf-8") as handle:
@@ -153,6 +156,8 @@ def test_metrics_export_writes_csv_and_plot(window, monkeypatch, tmp_path):
 def test_metrics_export_appends_the_csv_suffix(window, monkeypatch, tmp_path):
     target = tmp_path / "metrics"
     shown = []
+    from gui.figure_save_dialog import FigureSaveDialog
+    monkeypatch.setattr(FigureSaveDialog, "exec_", lambda self: QDialog.Accepted)
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName",
         staticmethod(lambda *a, **k: (str(target), "")),

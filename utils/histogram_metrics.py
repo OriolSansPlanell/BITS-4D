@@ -495,5 +495,6 @@ def plot_metric_evolution(rows: Sequence[MetricsRow], output_path,
         "Bimodal histogram and segmentation metrics over time", fontsize=14
     )
     figure.tight_layout()
-    figure.savefig(output_path, bbox_inches="tight")
+    from utils.figure_io import save_figure
+    save_figure(figure, output_path, dpi)
     return str(output_path)

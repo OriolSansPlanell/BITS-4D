@@ -1,6 +1,35 @@
 # Bug-fix and cleanup notes
 
-## Clear Highlight really clears; K-means clusters become classes (latest)
+## Every figure in SVG, with its data as CSV (latest)
+
+Every analysis figure now opens a small window before saving: **figure
+format** (SVG by default — vector, with editable text — or PDF, PNG, TIFF),
+**resolution**, and **"Also save the data as CSV"**. The answers are
+remembered for the session. This covers the four histogram time analyses
+(which were PNG only and had no data export), the histogram & segmentation
+metrics and spatial metrics plots (PNG only), the histogram + slice figure,
+the K-means cluster timeline (always SVG + CSV) and the time-series plot
+(which could not be saved at all). The per-class histograms in *File →
+Export* get a format choice and a *counts as CSV* option in the export
+dialog itself.
+
+New CSVs, holding the numbers each figure is drawn from:
+
+- **histogram evolution / change vs previous** — per timepoint, the share of
+  voxels that changed bin (total-variation distance of the normalised
+  histograms), plus a per-bin file with both counts and the plotted
+  log-difference;
+- **marginal evolution / change** — per timepoint, modality and intensity
+  bin, the share of voxels and the plotted log2 change;
+- **histogram + slice figure** — per label, voxels inside its histogram
+  region and pixels highlighted on the slice;
+- **time-series plot** — the plotted values;
+- **per-class histograms** — one row per non-empty bin.
+
+All figures are saved through `utils/figure_io.save_figure`, so SVG text is
+editable everywhere, not only in the figures that already did it.
+
+## Clear Highlight really clears; K-means clusters become classes
 
 **Fixed — cleared highlights came back.** Clear Highlight only wiped the
 screen: the layers stayed visible, so the next redraw — unticking a class,

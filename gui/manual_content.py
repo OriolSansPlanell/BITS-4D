@@ -413,10 +413,46 @@ material you want left out — hidden materials are left out of both panels.
 You can also include the regions you have drawn but not saved, set the
 resolution, and turn the legends and the outlines around the highlights on or
 off.</p>
-<p>The figure is saved as <b>SVG</b>: outlines, text and legends stay vector
-graphics, and the text stays editable in Inkscape or Illustrator. The
-resolution you choose applies to the two images inside it (the histogram and
-the slice). PDF, PNG and TIFF can still be picked in the save dialog.</p>
+<p>Like every figure (below), it is saved as <b>SVG</b> by default, and the
+label counts can be saved alongside as CSV.</p>
+
+<h2>Saving any figure: format and CSV</h2>
+<p>Every analysis figure — the histogram time analyses, both metric plots,
+the histogram + slice figure, the K-means cluster timeline and the time-series
+plot — first opens a small window asking:</p>
+<ul>
+<li><b>Figure format</b> — <b>SVG</b> (recommended: outlines, text and
+    legends stay vector graphics and the text stays editable in Inkscape or
+    Illustrator), PDF, PNG or TIFF.</li>
+<li><b>Resolution</b> — for PNG and TIFF, the image resolution; in SVG and
+    PDF, the resolution of any image inside the figure (a histogram), while
+    lines and text stay vector.</li>
+<li><b>Also save the data as CSV</b> — the numbers the figure is drawn from,
+    written next to it with the same name, so the plot can be redrawn or
+    checked in another program.</li>
+</ul>
+<p>The window remembers your last answers. What the CSV holds:</p>
+<table>
+<tr><th>Figure</th><th>CSV</th></tr>
+<tr><td>Histogram evolution / change vs previous</td><td><code>name.csv</code>:
+    per timepoint, the share of voxels that changed bin against the
+    reference; <code>name_bins.csv</code>: every non-empty bin with both
+    counts and the plotted log-difference.</td></tr>
+<tr><td>Marginal evolution / change</td><td>Per timepoint, modality and
+    intensity bin: its share of the voxels and the plotted log2
+    change.</td></tr>
+<tr><td>Histogram &amp; segmentation metrics, spatial metrics</td><td>Every
+    metric value (the long-format metrics table).</td></tr>
+<tr><td>Histogram + slice figure</td><td>Per label: voxels inside its
+    histogram region, and pixels highlighted on the slice.</td></tr>
+<tr><td>K-means cluster timeline</td><td>Per timepoint and cluster: voxels,
+    share, and whether it is present.</td></tr>
+<tr><td>Time-series plot</td><td>The plotted values per selection and
+    timepoint.</td></tr>
+</table>
+<p>In <i>File → Export</i>, the per-class histograms have their own format
+choice and a <i>counts as CSV</i> option, since one export writes many of
+them.</p>
 
 <h2>Quality metrics</h2>
 <p><i>Analytics → Histogram Time Analysis</i>:</p>

@@ -49,6 +49,11 @@ back to voxels.
   **`segmentation_report.txt`** recording each class's name, its integer
   value in the exported label volumes, its voxel count at every timepoint,
   and the settings the segmentation was made with.
+- **Every figure as SVG, with its data as CSV** — each analysis figure
+  (histogram time analyses, metric plots, histogram + slice figure, K-means
+  timeline, time-series plot) opens a small window asking the format — SVG
+  by default, or PDF, PNG, TIFF — and whether to also save the plotted numbers
+  as CSV next to it.
 - **Histogram + slice figure** — *File → Export Histogram + Slice Figure*
   (Ctrl+Shift+F) saves a two-panel **SVG** figure: on the left the local
   bimodal histogram with every label's selection drawn on top, on the right
@@ -138,7 +143,8 @@ python main.py
    as CSV/Excel; reports as PDF; and a histogram + slice figure of what is on
    screen (*File → Export Histogram + Slice Figure*).
 6. **Measure (optional)** — *Analytics → Histogram Time Analysis →
-   Histogram & Segmentation Metrics* for the metrics CSV and evolution plot.
+   Histogram & Segmentation Metrics* for the evolution plot (SVG by default)
+   and the metrics CSV.
 
 ## Library usage (no GUI)
 
