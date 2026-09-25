@@ -107,7 +107,10 @@ class PDFReporter:
         
         # Plot histogram
         extent = [n_edges[0], n_edges[-1], x_edges[0], x_edges[-1]]
-        im = ax.imshow(np.log10(hist.T + 1), origin='lower', extent=extent,
+        # Stored as [xray_bin, neutron_bin]: with origin='lower' that puts
+        # neutron on x and X-ray on y — the coordinates the ROIs are in. A
+        # transpose here drew the histogram mirrored about the diagonal.
+        im = ax.imshow(np.log10(hist + 1), origin='lower', extent=extent,
                       aspect='auto', cmap='hot')
         
         ax.set_xlabel('Neutron Intensity', fontsize=13)
@@ -117,8 +120,8 @@ class PDFReporter:
         plt.colorbar(im, ax=ax, label='log10(Count + 1)')
         
         # Overlay ROIs
-        import matplotlib.cm as cm
-        cmap = cm.get_cmap('tab10')
+        import matplotlib
+        cmap = matplotlib.colormaps['tab10']
         
         for i, sel in enumerate(selections[:10]):  # Max 10 for readability
             if sel.histogram_roi is not None:
@@ -152,8 +155,8 @@ class PDFReporter:
         
         # Neutron + masks
         axes[1, 0].imshow(neutron_data, cmap='gray')
-        import matplotlib.cm as cm
-        cmap = cm.get_cmap('tab10')
+        import matplotlib
+        cmap = matplotlib.colormaps['tab10']
         for i, sel in enumerate(selections[:8]):
             if sel.spatial_mask is not None:
                 color = sel.color if sel.color else cmap(i/10)

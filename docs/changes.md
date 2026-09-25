@@ -1,6 +1,45 @@
 # Bug-fix and cleanup notes
 
-## Fits a laptop screen; several ROIs, keyboard editing; SVG figures (latest)
+## K-means at three scales, transient phases, and two report fixes (latest)
+
+**K-means at slice, volume or time-series scale.** One set of controls on
+the *Auto Seg* tab (the viewer's *🔍 Auto-Detect* opens it) with a scope:
+
+- **Slice** — the slice on screen, in seconds; clusters become 2-D
+  selections pinned to that slice, each with its histogram region.
+- **Volume** — every voxel of the current timepoint; 3-D selections that
+  *Copy K-means Clusters to Materials* turns into materials.
+- **Time series** — every timepoint with one shared clustering, so a cluster
+  keeps its identity and colour through time; it becomes a segmentation layer
+  at every timepoint where it has voxels.
+
+The time-series scope also finds **phases present only in some timepoints**.
+K-means alone cannot: it spends its centres on the bulk of the voxels, so a
+phase holding a fraction of a percent of one frame never gets one — shown
+by `test_kmeans_alone_misses_that_phase`. Such phases are found by time
+instead: islands of the histogram that are occupied at fewer than half of
+the timepoints, stand five times the counting noise above their usual
+content, and (nearly) vanish at some timepoint. On synthetic series it finds
+a 32-voxel phase (0.25 % of one of six timepoints) next to a broad majority
+phase, and invents none in 64 steady series with broad phases and slow
+drift. *Export Cluster Timeline* writes each cluster's share of the sample
+at every timepoint (CSV) and a log-scale plot (SVG). Method:
+`utils/kmeans_levels.py`; formulas in the manual (*Mathematics → K-means at
+three scales*). The old 2-D/3-D/hybrid Auto-Detect code is replaced.
+
+**Fixed — Auto-Detect and the PDF report crashed** on matplotlib 3.9 and
+later, which removed `matplotlib.cm.get_cmap`. Colormaps now come from
+`matplotlib.colormaps`, and `requirements.txt` asks for matplotlib ≥ 3.5.
+
+**Fixed — the PDF report drew the histogram transposed.** Histograms are
+stored `[xray_bin, neutron_bin]`; the report transposed that before drawing,
+so the image was mirrored about the diagonal and the selection outlines did
+not sit on their data (`tests/test_pdf_reporter.py`).
+
+**Requirements.** The `numpy < 2` pin is dropped (everything runs on NumPy
+2), and the K-means code needs scikit-learn ≥ 1.0.
+
+## Fits a laptop screen; several ROIs, keyboard editing; SVG figures
 
 **The window fits a 14" or 16" laptop.** Its minimum size was 3839×1038 px
 — long single rows of controls, two histograms side by side at 400 px each,

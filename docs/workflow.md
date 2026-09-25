@@ -73,6 +73,22 @@ Two things worth knowing:
 Anything you draw can also come from the slice viewer: draw a box or grow a
 region there and convert it into a histogram region.
 
+Or let K-means propose the regions (*Auto Seg* tab, or *🔍 Auto-Detect*
+under the slice), at the scale the question needs:
+
+| Scope | Clusters | Use it when |
+| --- | --- | --- |
+| **Slice** | the slice on screen | a quick look at which phases a slice holds |
+| **Volume** | every voxel of this timepoint | defining materials at the reference timepoint (*Copy K-means Clusters to Materials*) |
+| **Time series** | every timepoint, one shared clustering | following phases through the experiment, including phases that exist only in some timepoints |
+
+The time-series scope writes a layer per cluster at every timepoint, keeps
+each cluster's colour throughout, and flags the phases present only in some
+timepoints (a reaction product, a deposit). *Export Cluster Timeline* writes
+each cluster's share of the sample over time. A large instrument drift can
+look like a new phase, so run *Check Instrument Stability* when one appears
+unexpectedly.
+
 ## 4. Mark control materials
 
 On the **🧱 Materials** tab every material is listed with where it came from,
