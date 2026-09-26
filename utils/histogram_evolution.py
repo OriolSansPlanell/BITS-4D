@@ -24,6 +24,8 @@ import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
+from utils.figure_io import save_figure, write_csv
+
 # Reference modes for the panel figures
 REFERENCE_FIRST = "first"
 REFERENCE_PREVIOUS = "previous"
@@ -149,7 +151,7 @@ def save_histogram_evolution_image(
         "Histogram evolution (log scale, normalized to first timepoint)",
         fontsize=14,
     )
-    fig.savefig(output_path, bbox_inches="tight")
+    save_figure(fig, output_path, dpi)
     return output_path
 
 
@@ -277,5 +279,104 @@ def save_marginal_evolution_image(
         fontsize=14,
     )
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
+    save_figure(fig, output_path, dpi)
     return output_path
+
+
+# ── the numbers behind the figures ───────────────────────────────────────────
+
+def _reference_index(t_index: int, reference: str) -> int:
+    return 0 if reference == REFERENCE_FIRST else t_index - 1
+
+
+def write_evolution_csv(histograms: Sequence, summary_path, bins_path=None,
+                        reference_mode: str = REFERENCE_FIRST) -> list:
+    """The data behind the joint-histogram evolution figure.
+
+    *summary_path* gets one row per compared timepoint: its voxel count,
+    the reference timepoint, and the share of voxels that changed bin —
+    the total-variation distance ``0.5 * sum |p_t - p_ref|`` between the two
+    count-normalised histograms (0: identical, 1: no overlap).
+
+    *bins_path* (optional) gets every bin that is non-empty in either
+    histogram: its centre, both counts, and the plotted
+    ``log10(h_t + 1) - log10(h_ref + 1)``.
+
+    Returns the paths written.
+    """
+    differences = compute_log_differences(histograms, reference_mode)
+    written = []
+    summary = []
+    for offset, difference in enumerate(differences):
+        t_index = offset + 1
+        ref_index = _reference_index(t_index, reference_mode)
+        current = histograms[t_index].histogram.astype(np.float64)
+        reference = histograms[ref_index].histogram.astype(np.float64)
+        p_current = current / max(current.sum(), 1.0)
+        p_reference = reference / max(reference.sum(), 1.0)
+        summary.append((
+            t_index, ref_index, int(current.sum()),
+            float(0.5 * np.abs(p_current - p_reference).sum()),
+            float(difference.max()), float(difference.min()),
+        ))
+    written.append(write_csv(
+        summary_path,
+        ("timepoint", "reference_timepoint", "voxels",
+         "share_of_voxels_changed", "max_log10_gain", "max_log10_loss"),
+        summary,
+    ))
+    if bins_path is not None:
+        first = histograms[0]
+        x_centers = np.asarray(first.x_centers)
+        y_centers = np.asarray(first.y_centers)
+
+        def rows():
+            for offset, difference in enumerate(differences):
+                t_index = offset + 1
+                ref_index = _reference_index(t_index, reference_mode)
+                current = histograms[t_index].histogram
+                reference = histograms[ref_index].histogram
+                y_bins, x_bins = np.nonzero((current > 0) | (reference > 0))
+                for iy, ix in zip(y_bins, x_bins):
+                    yield (t_index, ref_index, float(x_centers[ix]),
+                           float(y_centers[iy]), int(current[iy, ix]),
+                           int(reference[iy, ix]),
+                           float(difference[iy, ix]))
+
+        written.append(write_csv(
+            bins_path,
+            ("timepoint", "reference_timepoint", "neutron_center",
+             "xray_center", "count", "reference_count", "log10_difference"),
+            rows(),
+        ))
+    return written
+
+
+def write_marginal_csv(histograms: Sequence, path,
+                       reference_mode: str = REFERENCE_FIRST) -> str:
+    """The data behind the marginal kymographs, one row per
+    (timepoint, modality, intensity bin): the bin's share of that
+    timepoint's voxels and the plotted log2 change (blank where it is
+    undefined)."""
+    neutron_marginals, xray_marginals = compute_marginals(histograms)
+    reference = histograms[0]
+
+    def rows():
+        for modality, marginals, centers in (
+            ("neutron", neutron_marginals, reference.x_centers),
+            ("xray", xray_marginals, reference.y_centers),
+        ):
+            change = compute_marginal_changes(marginals, reference_mode)
+            for t_index in range(marginals.shape[0]):
+                for b_index, center in enumerate(centers):
+                    value = change[t_index, b_index]
+                    yield (t_index, modality, float(center),
+                           float(marginals[t_index, b_index]),
+                           "" if not np.isfinite(value) else float(value))
+
+    return write_csv(
+        path,
+        ("timepoint", "modality", "intensity_center", "share_of_voxels",
+         "log2_change"),
+        rows(),
+    )

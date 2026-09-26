@@ -1,6 +1,82 @@
 # Bug-fix and cleanup notes
 
-## Clear Highlight really clears; K-means clusters become classes (latest)
+## Answering a methods review (latest)
+
+A review of BiTS for publication listed nine weaknesses. What changed for
+each:
+
+1. **No quantitative validation.** `validation/` builds a synthetic 4-D cell
+   with exact labels (a reaction product absent at T0 that grows) and
+   `python -m validation.run` scores every method on it; results and limits
+   in [validation.md](validation.md). The doc claims that rested on the
+   undistributed battery series are now labelled as such; the "frozen
+   boundary loses Air" claim is pinned by a test (and corrected: it happens
+   at the third timepoint, not the fourth).
+2. **No baselines.** Global and multi-level Otsu, K-means, GMM (both named
+   by oracle matching, so upper bounds), random walker, and an ilastik-style
+   random-forest pixel classifier. No U-Net (no labelled training volumes in
+   this setting — stated in the docs).
+3. **Auto smoothing ran to the grid ceiling.** It now has an upper rule
+   (stop when the next setting changes < 0.2% of labels), a thin-sheet guard
+   next to the volume guard, checks several timepoints, extends the grid
+   while labels are still changing, and reports the reason, the sensitivity
+   and a ceiling warning in the health check.
+4. **Classes only from T0; empty ones dropped silently.** Each material is
+   defined at the first timepoint where its region has voxels
+   (`ClassLibrary.from_sources`, `MaterialClass.defined_at`). A material that
+   cannot be defined raises `ClassDefinitionWarning` and fails the health
+   check by name.
+5. **Unimodal class model.** *Allow irregular material shapes*: each class
+   may be a Gaussian mixture of up to three components, chosen by BIC on its
+   own voxels. Helps when a cloud straddles another class; changes nothing
+   for one-blob classes (measured).
+6. **Co-registration assumed.** *Check Alignment…* measures the X-ray offset
+   by mutual information (`model/registration.py`) and corrects whole-voxel
+   offsets; misalignment sensitivity is in the validation.
+7. **MRF memory and no timing.** The spatial pass runs in z-slabs with a
+   halo of `n_sweeps + 1` slices, with results identical to a whole-volume
+   run; the budget planner uses measured memory (`32·K + 30` B/voxel for
+   mean-field, ≈ 75 for ICM — the old docstring's `K × 4` and `9` were
+   underestimates). `python -m validation.scaling` measures time and memory.
+8. **`from_physics` not exposed.** *Add Materials from Attenuation
+   Coefficients…* calibrates each modality linearly on two drawn materials
+   (`model/calibration.py`) and tracks the predicted materials with the
+   drawn ones.
+9. **CI and file size.** CI runs on Python 3.10–3.12 with and without PyQt5
+   (GUI tests offscreen), plus a reduced validation run.
+   `SliceViewerWidget` and the dialogs moved out of `main_window.py`
+   (re-exported there).
+
+## Every figure in SVG, with its data as CSV
+
+Every analysis figure now opens a small window before saving: **figure
+format** (SVG by default — vector, with editable text — or PDF, PNG, TIFF),
+**resolution**, and **"Also save the data as CSV"**. The answers are
+remembered for the session. This covers the four histogram time analyses
+(which were PNG only and had no data export), the histogram & segmentation
+metrics and spatial metrics plots (PNG only), the histogram + slice figure,
+the K-means cluster timeline (always SVG + CSV) and the time-series plot
+(which could not be saved at all). The per-class histograms in *File →
+Export* get a format choice and a *counts as CSV* option in the export
+dialog itself.
+
+New CSVs, holding the numbers each figure is drawn from:
+
+- **histogram evolution / change vs previous** — per timepoint, the share of
+  voxels that changed bin (total-variation distance of the normalised
+  histograms), plus a per-bin file with both counts and the plotted
+  log-difference;
+- **marginal evolution / change** — per timepoint, modality and intensity
+  bin, the share of voxels and the plotted log2 change;
+- **histogram + slice figure** — per label, voxels inside its histogram
+  region and pixels highlighted on the slice;
+- **time-series plot** — the plotted values;
+- **per-class histograms** — one row per non-empty bin.
+
+All figures are saved through `utils/figure_io.save_figure`, so SVG text is
+editable everywhere, not only in the figures that already did it.
+
+## Clear Highlight really clears; K-means clusters become classes
 
 **Fixed — cleared highlights came back.** Clear Highlight only wiped the
 screen: the layers stayed visible, so the next redraw — unticking a class,

@@ -31,1655 +31,12 @@ from gui.time_navigation_widget import TimeNavigationWidget
 from gui.dual_histogram_widget import DualHistogramWidget
 from gui.material_panel import MaterialPanel, describe_strength
 from gui.responsive import fit_to_screen, flow_row, scrollable
-
-
-def _group_labelled(widgets, max_follow=2):
-    """Join each bare QLabel to (at most *max_follow*) controls after it.
-
-    The result goes into a wrapping row: a label and the control it names
-    then move to the next line together instead of being split, while long
-    runs of buttons after a label can still wrap.
-    """
-    from gui.responsive import group
-
-    grouped, current = [], []
-
-    def flush():
-        if current:
-            grouped.append(group(*current) if len(current) > 1 else current[0])
-            current.clear()
-
-    for widget in widgets:
-        if isinstance(widget, QLabel):
-            flush()
-            current.append(widget)
-        elif current and len(current) <= max_follow:
-            current.append(widget)
-        else:
-            flush()
-            grouped.append(widget)
-    flush()
-    return grouped
-
-
-class SliceViewerWidget(QWidget):
-    """
-    Slice viewer widget with segmentation overlay and axis selection
-    """
-    
-    # Signal emitted when user wants to create histogram ROI from spatial selection
-    # Arguments: (spatial_coords, axis, slice_index)
-    spatial_roi_to_histogram = pyqtSignal(tuple, str, int)
-    
-    # Signal emitted when clusters are detected (for selection manager)
-    # Arguments: (list of (name, spatial_mask, histogram_roi, cluster_id, color))
-    clusters_detected = pyqtSignal(list)
-
-    # The Auto-Detect button: K-means is configured and run by the window
-    kmeans_requested = pyqtSignal()
-
-    # The Clear Highlight button: the window hides the layers behind it
-    highlight_cleared = pyqtSignal()
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.current_slice_data = None
-        self.segmentation_mask = None
-        self.current_axis = 'z'  # 'z', 'y', or 'x'
-        self.current_slice_index = None
-        self.volume_shape = None
-        self.view_mode = 'neutron'  # 'neutron' or 'xray'
-        self.vmin = None  # Dynamic range
-        self.vmax = None
-        # >1 when the displayed volumes are median-binned copies of the data
-        self.display_bin_factor = 1
-
-        # Debounce slice-slider updates: while dragging, only the label
-        # follows instantly; the full redraw runs once the slider settles.
-        from PyQt5.QtCore import QTimer
-        self._redraw_timer = QTimer(self)
-        self._redraw_timer.setSingleShot(True)
-        self._redraw_timer.setInterval(30)
-        self._redraw_timer.timeout.connect(self._update_display)
-
-        self.init_ui()
-        
-    def init_ui(self):
-        layout = QVBoxLayout()
-        
-        # Controls for axis selection
-        controls = []
-        
-        controls.append(QLabel("View Axis:"))
-        
-        from PyQt5.QtWidgets import QRadioButton, QButtonGroup, QSlider
-        from PyQt5.QtCore import Qt
-        
-        self.axis_group = QButtonGroup()
-        
-        self.z_axis_btn = QRadioButton("XY (Z-slice)")
-        self.z_axis_btn.setChecked(True)
-        self.z_axis_btn.toggled.connect(lambda: self._on_axis_changed('z'))
-        self.axis_group.addButton(self.z_axis_btn)
-        controls.append(self.z_axis_btn)
-        
-        self.y_axis_btn = QRadioButton("XZ (Y-slice)")
-        self.y_axis_btn.toggled.connect(lambda: self._on_axis_changed('y'))
-        self.axis_group.addButton(self.y_axis_btn)
-        controls.append(self.y_axis_btn)
-        
-        self.x_axis_btn = QRadioButton("YZ (X-slice)")
-        self.x_axis_btn.toggled.connect(lambda: self._on_axis_changed('x'))
-        self.axis_group.addButton(self.x_axis_btn)
-        controls.append(self.x_axis_btn)
-        
-        
-        # Slice index slider
-        controls.append(QLabel("Slice:"))
-        self.slice_slider = QSlider(Qt.Horizontal)
-        self.slice_slider.setMinimum(0)
-        self.slice_slider.setMaximum(100)
-        self.slice_slider.setValue(50)
-        self.slice_slider.valueChanged.connect(self._on_slice_changed)
-        self.slice_slider.setEnabled(False)
-        self.slice_slider.setMinimumWidth(120)
-        controls.append(self.slice_slider)
-        
-        self.slice_label = QLabel("0")
-        controls.append(self.slice_label)
-        
-        
-        # View mode selection
-        controls.append(QLabel("Data:"))
-        
-        self.view_group = QButtonGroup()
-        
-        self.neutron_view_btn = QRadioButton("Neutron")
-        self.neutron_view_btn.setChecked(True)
-        self.neutron_view_btn.toggled.connect(lambda: self._on_view_mode_changed('neutron'))
-        self.view_group.addButton(self.neutron_view_btn)
-        controls.append(self.neutron_view_btn)
-        
-        self.xray_view_btn = QRadioButton("X-ray")
-        self.xray_view_btn.toggled.connect(lambda: self._on_view_mode_changed('xray'))
-        self.view_group.addButton(self.xray_view_btn)
-        controls.append(self.xray_view_btn)
-        
-        
-        # Dynamic range controls
-        from PyQt5.QtWidgets import QDoubleSpinBox
-        
-        controls.append(QLabel("Range:"))
-        self.slice_vmin = QDoubleSpinBox()
-        self.slice_vmin.setRange(0, 1e10)
-        self.slice_vmin.setValue(0)
-        self.slice_vmin.setPrefix("Min: ")
-        self.slice_vmin.setMaximumWidth(130)
-        self.slice_vmin.valueChanged.connect(self._on_range_changed)
-        controls.append(self.slice_vmin)
-        
-        self.slice_vmax = QDoubleSpinBox()
-        self.slice_vmax.setRange(0, 1e10)
-        self.slice_vmax.setValue(65535)
-        self.slice_vmax.setPrefix("Max: ")
-        self.slice_vmax.setMaximumWidth(130)
-        self.slice_vmax.valueChanged.connect(self._on_range_changed)
-        controls.append(self.slice_vmax)
-        
-        slice_auto_btn = QPushButton("Auto Range")
-        slice_auto_btn.clicked.connect(self._auto_range_slice)
-        controls.append(slice_auto_btn)
-        
-        # Show/hide the spatial-selection row: on a short screen the slice
-        # needs that height more than tools that are not always in use.
-        from PyQt5.QtWidgets import QToolButton
-        self.spatial_tools_btn = QToolButton()
-        self.spatial_tools_btn.setText("🛠 Spatial tools")
-        self.spatial_tools_btn.setCheckable(True)
-        self.spatial_tools_btn.setChecked(True)
-        self.spatial_tools_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.spatial_tools_btn.setToolTip(
-            "Show or hide the spatial selection tools (rectangle, region\n"
-            "growing, auto-detect) to give the slice more room."
-        )
-        controls.append(self.spatial_tools_btn)
-
-        # Group each label with what it names, so they wrap as a unit
-        controls = _group_labelled(controls)
-        layout.addWidget(flow_row(*controls))
-        
-        # Spatial ROI tools
-        spatial = []
-        
-        spatial.append(QLabel("Spatial Selection:"))
-        
-        self.rect_tool_btn = QPushButton("□ Rectangle")
-        self.rect_tool_btn.setCheckable(True)
-        self.rect_tool_btn.setToolTip("Draw rectangle on slice to select spatial region")
-        self.rect_tool_btn.clicked.connect(self._on_rect_tool_clicked)
-        spatial.append(self.rect_tool_btn)
-        
-        self.region_grow_btn = QPushButton("🪄 Region Grow")
-        self.region_grow_btn.setCheckable(True)
-        self.region_grow_btn.setToolTip("Click a seed point to grow connected region")
-        self.region_grow_btn.clicked.connect(self._on_region_grow_clicked)
-        spatial.append(self.region_grow_btn)
-        
-        # Bivariate mode checkbox
-        self.bivariate_cb = QCheckBox("Bivariate")
-        self.bivariate_cb.setToolTip("Use both neutron AND X-ray values (more selective)")
-        self.bivariate_cb.setChecked(False)
-        self.bivariate_cb.stateChanged.connect(self._on_bivariate_changed)
-        self.bivariate_cb.setEnabled(False)
-        spatial.append(self.bivariate_cb)
-        
-        # 3D mode checkbox (NEW for v15.0)
-        self.mode_3d_cb = QCheckBox("3D Volume")
-        self.mode_3d_cb.setToolTip("Apply to entire 3D volume instead of current slice")
-        self.mode_3d_cb.setChecked(False)
-        self.mode_3d_cb.setEnabled(False)
-        spatial.append(self.mode_3d_cb)
-        
-        # Tolerance control for region growing
-        spatial.append(QLabel("Tol:"))
-        self.tolerance_spinbox = QDoubleSpinBox()
-        self.tolerance_spinbox.setRange(1, 10000)
-        self.tolerance_spinbox.setValue(1000)
-        self.tolerance_spinbox.setSingleStep(100)
-        self.tolerance_spinbox.setToolTip("Intensity tolerance for region growing")
-        self.tolerance_spinbox.setEnabled(False)
-        self.tolerance_spinbox.setMaximumWidth(80)
-        spatial.append(self.tolerance_spinbox)
-        
-        # Second tolerance (for bivariate mode)
-        self.tolerance2_label = QLabel("Tol2:")
-        self.tolerance2_label.setToolTip("Tolerance for other modality (bivariate mode)")
-        self.tolerance2_label.setVisible(False)
-        spatial.append(self.tolerance2_label)
-        
-        self.tolerance2_spinbox = QDoubleSpinBox()
-        self.tolerance2_spinbox.setRange(1, 10000)
-        self.tolerance2_spinbox.setValue(1000)
-        self.tolerance2_spinbox.setSingleStep(100)
-        self.tolerance2_spinbox.setToolTip("Tolerance for other modality (bivariate mode)")
-        self.tolerance2_spinbox.setEnabled(False)
-        self.tolerance2_spinbox.setVisible(False)
-        self.tolerance2_spinbox.setMaximumWidth(80)
-        spatial.append(self.tolerance2_spinbox)
-        
-        # Show/hide mask toggle
-        self.show_mask_cb = QCheckBox("Show Mask")
-        self.show_mask_cb.setChecked(True)
-        self.show_mask_cb.setToolTip("Toggle region growing mask overlay")
-        self.show_mask_cb.stateChanged.connect(self._on_show_mask_changed)
-        self.show_mask_cb.setEnabled(False)
-        spatial.append(self.show_mask_cb)
-        
-        # Auto-detect features button
-        self.auto_detect_btn = QPushButton("🔍 Auto-Detect")
-        self.auto_detect_btn.setToolTip(
-            "K-means clustering of the (neutron, X-ray) values: on this slice,\n"
-            "on this timepoint's volume, or on the whole time series.\n"
-            "Opens the K-means settings on the Auto Seg tab."
-        )
-        self.auto_detect_btn.clicked.connect(self._on_auto_detect)
-        spatial.append(self.auto_detect_btn)
-        
-        self.clear_spatial_roi_btn = QPushButton("✕ Clear")
-        self.clear_spatial_roi_btn.setToolTip("Clear spatial ROI")
-        self.clear_spatial_roi_btn.clicked.connect(self._clear_spatial_roi)
-        self.clear_spatial_roi_btn.setEnabled(False)
-        spatial.append(self.clear_spatial_roi_btn)
-
-        self.clear_highlight_btn = QPushButton("🧹 Clear Highlight")
-        self.clear_highlight_btn.setToolTip(
-            "Hide every coloured overlay: segmentation layers, saved\n"
-            "selections and the region-grow mask. Classes are unticked, so\n"
-            "the next segmentation shows only what you select next.\n"
-            "Tick a class to bring its layers back; nothing is deleted."
-        )
-        self.clear_highlight_btn.setEnabled(False)
-        self.clear_highlight_btn.clicked.connect(self._on_clear_highlight_clicked)
-        spatial.append(self.clear_highlight_btn)
-        
-        
-        self.create_hist_roi_btn = QPushButton("→ Histogram ROI")
-        self.create_hist_roi_btn.setToolTip(
-            "Create Histogram ROI from Selection: extract the values inside\n"
-            "the spatial selection and turn them into a histogram ROI."
-        )
-        self.create_hist_roi_btn.clicked.connect(self._create_histogram_roi_from_spatial)
-        self.create_hist_roi_btn.setEnabled(False)
-        spatial.append(self.create_hist_roi_btn)
-        
-        spatial = _group_labelled(spatial)
-        self.spatial_tools_row = flow_row(*spatial)
-        layout.addWidget(self.spatial_tools_row)
-        self.spatial_tools_btn.toggled.connect(self.set_spatial_tools_visible)
-        
-        # Create matplotlib figure
-        self.fig = Figure(figsize=(8, 6))
-        self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvas(self.fig)
-        self.canvas.setMinimumSize(240, 200)
-        layout.addWidget(self.canvas, stretch=1)
-        
-        # Initialize spatial ROI state
-        self.spatial_roi_selector = None
-        self.spatial_roi_coords = None
-        
-        # Region growing state
-        self.region_grow_mode = False
-        self.region_grow_mask = None
-        self.region_grow_mask_3d = None  # For 3D region growing (v15.0)
-        # (axis, slice_index) a 2-D grown mask belongs to, so it is only
-        # redrawn on that slice
-        self.region_grow_plane = None
-        self.mask_overlay = None  # Matplotlib artist for mask display
-        
-        # Multiple mask overlays (segmentation layers + selection manager).
-        # Masks may be 3-D (whole-volume layers, re-sliced on every redraw so
-        # the highlight follows the plane/slice) or 2-D (single-slice
-        # selections, shown only on a matching slice).
-        self.mask_overlays = []  # List of (name, mask, color) tuples
-        self.overlay_artists = []  # Matplotlib artists for overlays
-        self._visible_mask_pixels = 0  # Highlighted pixels on the current slice
-        
-        # Auto-detected features
-        self.detected_features = []  # List of (y, x) coordinates
-        self.feature_markers = []  # List of matplotlib artists for feature markers
-        self.cluster_map = None  # 2D cluster labels (from k-means)
-        self.cluster_map_3d = None  # 3D cluster labels (v15.0)
-        self.cluster_centers = None  # Cluster centers
-        self.num_clusters = 0  # Number of clusters
-        
-        # Zoom state
-        self.zoom_level = 1.0
-        self.zoom_center = None  # (x, y) in data coordinates
-        
-        # Info label
-        self.info_label = QLabel("Load dataset to view slices")
-        self.info_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.info_label)
-        
-        # Pixel value indicator
-        self.pixel_value_label = QLabel("Pixel value: -- | Position: (---, ---)")
-        self.pixel_value_label.setAlignment(Qt.AlignCenter)
-        self.pixel_value_label.setStyleSheet("QLabel { color: #666; font-size: 10pt; }")
-        layout.addWidget(self.pixel_value_label)
-        
-        self.setLayout(layout)
-        self._setup_plot()
-    
-    def set_spatial_tools_visible(self, visible):
-        """Show or hide the spatial-selection tool row."""
-        visible = bool(visible)
-        self.spatial_tools_row.setVisible(visible)
-        if self.spatial_tools_btn.isChecked() != visible:
-            self.spatial_tools_btn.setChecked(visible)
-
-    def _setup_plot(self):
-        """Setup the plot appearance"""
-        self.ax.set_title("Volume Slice")
-        self.ax.axis('off')
-        
-        # Connect motion event to show pixel values
-        self.cid_motion = self.canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
-        
-        # Connect scroll event for zoom
-        self.cid_scroll = self.canvas.mpl_connect('scroll_event', self._on_scroll_zoom)
-
-        # Keep the title inside the canvas when it is resized
-        self.canvas.mpl_connect('resize_event', self._on_canvas_resize)
-
-    def _on_canvas_resize(self, _event=None):
-        try:
-            self.fig.tight_layout()
-        except Exception:
-            pass
-    
-    def _on_mouse_move(self, event):
-        """Display pixel value under cursor"""
-        if event.inaxes != self.ax:
-            return
-        
-        if event.xdata is None or event.ydata is None:
-            return
-        
-        if not hasattr(self, 'current_slice') or self.current_slice is None:
-            return
-        
-        # Get pixel coordinates
-        x_pixel = int(round(event.xdata))
-        y_pixel = int(round(event.ydata))
-        
-        # Check bounds
-        if (x_pixel >= 0 and x_pixel < self.current_slice.shape[1] and
-            y_pixel >= 0 and y_pixel < self.current_slice.shape[0]):
-            
-            # Get pixel value for displayed modality
-            pixel_value = self.current_slice[y_pixel, x_pixel]
-            
-            # Check if bivariate mode is enabled
-            if hasattr(self, 'bivariate_cb') and self.bivariate_cb.isChecked():
-                # Show BOTH neutron and X-ray values
-                if self.current_slice_data is not None:
-                    neutron_vol, xray_vol = self.current_slice_data
-                    
-                    # Extract both slices
-                    if self.current_axis == 'z':
-                        neutron_val = neutron_vol[self.current_slice_index, y_pixel, x_pixel]
-                        xray_val = xray_vol[self.current_slice_index, y_pixel, x_pixel]
-                    elif self.current_axis == 'y':
-                        neutron_val = neutron_vol[y_pixel, self.current_slice_index, x_pixel]
-                        xray_val = xray_vol[y_pixel, self.current_slice_index, x_pixel]
-                    else:  # 'x'
-                        neutron_val = neutron_vol[y_pixel, x_pixel, self.current_slice_index]
-                        xray_val = xray_vol[y_pixel, x_pixel, self.current_slice_index]
-                    
-                    # Display both values
-                    self.pixel_value_label.setText(
-                        f"Neutron: {neutron_val:.0f} | X-ray: {xray_val:.0f} | Pos: ({x_pixel}, {y_pixel})"
-                    )
-                else:
-                    # Fallback if slice data not available
-                    self.pixel_value_label.setText(
-                        f"Pixel value: {pixel_value:.0f} | Position: ({x_pixel}, {y_pixel})"
-                    )
-            else:
-                # Show only current modality
-                modality = "Neutron" if self.view_mode == 'neutron' else "X-ray"
-                self.pixel_value_label.setText(
-                    f"{modality}: {pixel_value:.0f} | Position: ({x_pixel}, {y_pixel})"
-                )
-    
-    def _on_scroll_zoom(self, event):
-        """Handle mouse wheel zoom"""
-        if event.inaxes != self.ax:
-            return
-        
-        if event.xdata is None or event.ydata is None:
-            return
-        
-        # Get current axis limits
-        xlim = self.ax.get_xlim()
-        ylim = self.ax.get_ylim()
-        
-        # Get cursor position
-        xdata = event.xdata
-        ydata = event.ydata
-        
-        # Zoom factor
-        zoom_factor = 1.2 if event.button == 'up' else 1/1.2
-        
-        # Calculate new limits centered on cursor
-        x_range = (xlim[1] - xlim[0]) / zoom_factor
-        y_range = (ylim[1] - ylim[0]) / zoom_factor
-        
-        # Center on cursor position
-        x_center_ratio = (xdata - xlim[0]) / (xlim[1] - xlim[0])
-        y_center_ratio = (ydata - ylim[0]) / (ylim[1] - ylim[0])
-        
-        new_xlim = [xdata - x_range * x_center_ratio, 
-                    xdata + x_range * (1 - x_center_ratio)]
-        new_ylim = [ydata - y_range * y_center_ratio,
-                    ydata + y_range * (1 - y_center_ratio)]
-        
-        # Apply limits
-        self.ax.set_xlim(new_xlim)
-        self.ax.set_ylim(new_ylim)
-        
-        # Update zoom level
-        if hasattr(self, 'current_slice') and self.current_slice is not None:
-            full_width = self.current_slice.shape[1]
-            current_width = new_xlim[1] - new_xlim[0]
-            self.zoom_level = full_width / current_width
-        
-        # Redraw
-        self.canvas.draw_idle()
-    
-    def _on_auto_detect(self):
-        """Ask for K-means clustering (slice, volume or time series).
-
-        The clustering itself lives in the main window, which has the whole
-        dataset and the histogram engine — the time-series level needs both.
-        """
-        self.kmeans_requested.emit()
-
-    def set_volume_shape(self, shape):
-        """Set the volume shape for slider configuration"""
-        self.volume_shape = shape
-        self._configure_slider()
-        
-    def _configure_slider(self):
-        """Configure slider based on current axis and volume shape"""
-        if self.volume_shape is None:
-            return
-        
-        axis_map = {'z': 0, 'y': 1, 'x': 2}
-        max_val = self.volume_shape[axis_map[self.current_axis]] - 1
-        
-        self.slice_slider.setMaximum(max_val)
-        self.slice_slider.setValue(max_val // 2)
-        self.slice_slider.setEnabled(True)
-        self.current_slice_index = max_val // 2
-        self.slice_label.setText(str(self.current_slice_index))
-    
-    def _on_axis_changed(self, axis):
-        """Handle axis selection change"""
-        print(f"Axis changed to: {axis}", file=sys.stderr)
-        self.current_axis = axis
-        self._configure_slider()
-        self._update_display()
-    
-    def _on_slice_changed(self, value):
-        """Handle slice index change (debounced while dragging)"""
-        self.current_slice_index = value
-        self.slice_label.setText(str(value))
-        self._redraw_timer.start()
-    
-    def _on_view_mode_changed(self, mode):
-        """Handle view mode change (neutron vs X-ray)"""
-        print(f"View mode changed to: {mode}", file=sys.stderr)
-        self.view_mode = mode
-        self._update_display()
-    
-    def _on_range_changed(self):
-        """Handle manual range change"""
-        self.vmin = self.slice_vmin.value()
-        self.vmax = self.slice_vmax.value()
-        self._update_display()
-    
-    def _auto_range_slice(self):
-        """Auto-set range based on current slice"""
-        if self.current_slice_data is None:
-            return
-        
-        # Get the current volume based on view mode
-        neutron_vol, xray_vol = self.current_slice_data
-        vol = neutron_vol if self.view_mode == 'neutron' else xray_vol
-        
-        # Set range to volume min/max
-        vmin = float(vol.min())
-        vmax = float(vol.max())
-        
-        self.slice_vmin.setValue(vmin)
-        self.slice_vmax.setValue(vmax)
-        self.vmin = vmin
-        self.vmax = vmax
-        self._update_display()
-    
-    def _on_rect_tool_clicked(self, checked):
-        """Handle rectangle tool activation"""
-        import sys
-        print(f"Rectangle tool clicked: {checked}", file=sys.stderr)
-        
-        if checked:
-            # Activate rectangle selector
-            from matplotlib.widgets import RectangleSelector
-            
-            # Disconnect previous selector if exists
-            if self.spatial_roi_selector is not None:
-                try:
-                    self.spatial_roi_selector.set_active(False)
-                except:
-                    pass
-            
-            # Create new rectangle selector
-            # Note: Compatible with matplotlib 3.5+
-            try:
-                self.spatial_roi_selector = RectangleSelector(
-                    self.ax,
-                    self._on_rectangle_selected,
-                    useblit=True,
-                    button=[1],  # Left mouse button
-                    minspanx=5,
-                    minspany=5,
-                    interactive=True,
-                    props=dict(facecolor='green', edgecolor='green', 
-                              alpha=0.3, linewidth=2)
-                )
-                print("  Rectangle selector activated (modern API)", file=sys.stderr)
-            except TypeError as e:
-                # Fallback for older matplotlib versions
-                print(f"  Warning: {e}", file=sys.stderr)
-                print("  Trying fallback initialization...", file=sys.stderr)
-                self.spatial_roi_selector = RectangleSelector(
-                    self.ax,
-                    self._on_rectangle_selected,
-                    interactive=True
-                )
-                print("  Rectangle selector activated (fallback)", file=sys.stderr)
-            
-            self.info_label.setText("Draw rectangle on slice to select spatial region")
-            print("  Rectangle selector ready", file=sys.stderr)
-        else:
-            # Deactivate
-            if self.spatial_roi_selector is not None:
-                self.spatial_roi_selector.set_active(False)
-            self.info_label.setText("Rectangle tool deactivated")
-    
-    def _on_rectangle_selected(self, eclick, erelease):
-        """Callback when rectangle is drawn"""
-        import sys
-        print(f"Rectangle selected:", file=sys.stderr)
-        print(f"  eclick: ({eclick.xdata}, {eclick.ydata})", file=sys.stderr)
-        print(f"  erelease: ({erelease.xdata}, {erelease.ydata})", file=sys.stderr)
-        
-        # Store rectangle coordinates
-        x1, y1 = eclick.xdata, eclick.ydata
-        x2, y2 = erelease.xdata, erelease.ydata
-        
-        self.spatial_roi_coords = (x1, y1, x2, y2)
-        
-        # Enable buttons
-        self.clear_spatial_roi_btn.setEnabled(True)
-        self.create_hist_roi_btn.setEnabled(True)
-        
-        # Update info
-        width = abs(x2 - x1)
-        height = abs(y2 - y1)
-        self.info_label.setText(
-            f"Spatial ROI: {width:.0f} × {height:.0f} pixels selected"
-        )
-        
-        print(f"  Spatial ROI stored: {self.spatial_roi_coords}", file=sys.stderr)
-    
-    def _clear_spatial_roi(self):
-        """Clear spatial ROI (rectangle or region growing)"""
-        import sys
-        print("Clearing spatial ROI", file=sys.stderr)
-        
-        # Clear rectangle coordinates
-        self.spatial_roi_coords = None
-        
-        # Clear region growing state
-        self.region_grow_mask = None
-        self.region_grow_mask_3d = None
-        self.region_grow_plane = None
-        if self.mask_overlay is not None:
-            try:
-                self.mask_overlay.remove()
-            except:
-                pass
-            self.mask_overlay = None
-        
-        # Clear detected features
-        self.detected_features = []
-        for marker in self.feature_markers:
-            try:
-                marker.remove()
-            except:
-                pass
-        self.feature_markers = []
-        
-        # Clear cluster overlay
-        if hasattr(self, 'cluster_overlay') and self.cluster_overlay is not None:
-            try:
-                self.cluster_overlay.remove()
-            except:
-                pass
-            self.cluster_overlay = None
-        
-        # Deactivate and clear selector
-        if self.spatial_roi_selector is not None:
-            try:
-                # Set inactive
-                self.spatial_roi_selector.set_active(False)
-                # Clear the selection (removes visual rectangle)
-                self.spatial_roi_selector.clear()
-                # Force canvas redraw
-                self.canvas.draw_idle()
-                print("  Rectangle selector cleared and canvas redrawn", file=sys.stderr)
-            except Exception as e:
-                print(f"  Warning clearing selector: {e}", file=sys.stderr)
-                # Fallback: just redraw the display
-                self._update_display()
-        
-        # Uncheck tool buttons
-        self.rect_tool_btn.setChecked(False)
-        self.region_grow_btn.setChecked(False)
-        
-        # Disable buttons
-        self.clear_spatial_roi_btn.setEnabled(False)
-        self.create_hist_roi_btn.setEnabled(False)
-        self.tolerance_spinbox.setEnabled(False)
-        self.show_mask_cb.setEnabled(False)
-
-        # Redraw to remove mask
-        self._update_display()
-
-        self.info_label.setText("Spatial ROI cleared")
-
-    def _on_clear_highlight_clicked(self):
-        """The Clear Highlight button: clear now, and let the window hide the
-        layers so the next redraw does not bring them straight back."""
-        self._clear_highlight()
-        self.highlight_cleared.emit()
-
-    def _clear_highlight(self):
-        """Remove all coloured overlays from the slice view without affecting the ROI.
-
-        Only what is drawn right now: the window re-composes the overlays on
-        the next redraw. The button goes through _on_clear_highlight_clicked,
-        which also asks the window to keep them hidden.
-        """
-        # Clear single region-grow overlay
-        self.region_grow_mask = None
-        self.region_grow_mask_3d = None
-        self.region_grow_plane = None
-        if self.mask_overlay is not None:
-            try:
-                self.mask_overlay.remove()
-            except Exception:
-                pass
-            self.mask_overlay = None
-
-        # Clear multi-ROI selection overlays
-        self.mask_overlays = []
-        self._clear_overlay_artists()
-
-        self.clear_highlight_btn.setEnabled(False)
-        self.canvas.draw_idle()
-        self.info_label.setText("Highlight cleared")
-    
-    def _on_region_grow_clicked(self, checked):
-        """Handle region grow tool button"""
-        import sys
-        print(f"Region grow tool: {checked}", file=sys.stderr)
-        
-        if checked:
-            # Deactivate rectangle tool if active
-            if self.rect_tool_btn.isChecked():
-                self.rect_tool_btn.setChecked(False)
-            
-            # Activate region grow mode
-            self.region_grow_mode = True
-            self.tolerance_spinbox.setEnabled(True)
-            self.bivariate_cb.setEnabled(True)
-            self.mode_3d_cb.setEnabled(True)  # Enable 3D mode option
-            self.info_label.setText("Click on slice to select seed point")
-            
-            # Connect click event
-            self.cid_click = self.canvas.mpl_connect('button_press_event', self._on_seed_click)
-            print("  Region grow mode activated", file=sys.stderr)
-        else:
-            # Deactivate
-            self.region_grow_mode = False
-            self.tolerance_spinbox.setEnabled(False)
-            self.bivariate_cb.setEnabled(False)
-            self.tolerance2_spinbox.setEnabled(False)
-            
-            # Disconnect click event
-            if hasattr(self, 'cid_click'):
-                self.canvas.mpl_disconnect(self.cid_click)
-            
-            self.info_label.setText("Region grow tool deactivated")
-    
-    def _on_bivariate_changed(self, state):
-        """Handle bivariate mode toggle"""
-        import sys
-        
-        is_bivariate = (state == 2)  # Qt.Checked
-        print(f"Bivariate mode: {is_bivariate}", file=sys.stderr)
-        
-        # Show/hide second tolerance control
-        self.tolerance2_label.setVisible(is_bivariate)
-        self.tolerance2_spinbox.setVisible(is_bivariate)
-        self.tolerance2_spinbox.setEnabled(is_bivariate and self.region_grow_mode)
-        
-        # Update tooltip
-        if is_bivariate:
-            self.tolerance_spinbox.setToolTip("Tolerance for displayed modality")
-            self.info_label.setText("Bivariate mode: Both neutron AND X-ray checked")
-        else:
-            self.tolerance_spinbox.setToolTip("Intensity tolerance for region growing")
-            if self.region_grow_mode:
-                self.info_label.setText("Click on slice to select seed point")
-    
-    def _on_seed_click(self, event):
-        """Handle seed point click for region growing"""
-        import sys
-        
-        if not self.region_grow_mode:
-            return
-        
-        if event.inaxes != self.ax or event.button != 1:  # Left click only
-            return
-        
-        if event.xdata is None or event.ydata is None:
-            return
-        
-        print(f"Seed click at: ({event.xdata}, {event.ydata})", file=sys.stderr)
-        
-        # Get current slice
-        if self.current_slice is None:
-            print("  No slice data", file=sys.stderr)
-            return
-        
-        # Convert to pixel coordinates
-        x_pixel = int(round(event.xdata))
-        y_pixel = int(round(event.ydata))
-        
-        print(f"  Pixel coordinates: ({x_pixel}, {y_pixel})", file=sys.stderr)
-        
-        # Check bounds
-        if x_pixel < 0 or x_pixel >= self.current_slice.shape[1]:
-            print(f"  X out of bounds", file=sys.stderr)
-            return
-        if y_pixel < 0 or y_pixel >= self.current_slice.shape[0]:
-            print(f"  Y out of bounds", file=sys.stderr)
-            return
-        
-        # Perform region growing
-        self._grow_region_from_seed(y_pixel, x_pixel)
-    
-    def _grow_region_from_seed(self, y_pixel, x_pixel):
-        """Grow region from seed point (univariate or bivariate, 2D or 3D)"""
-        import sys
-        from utils.region_growing import RegionGrowing
-        
-        print(f"Growing region from seed: ({y_pixel}, {x_pixel})", file=sys.stderr)
-        
-        # Check if 3D mode
-        is_3d_mode = self.mode_3d_cb.isChecked()
-        is_bivariate = self.bivariate_cb.isChecked()
-        
-        if is_3d_mode:
-            # 3D VOLUME MODE
-            from utils.region_growing_3d import RegionGrowing3D
-            
-            print("  Using 3D VOLUME mode", file=sys.stderr)
-            
-            if self.current_slice_data is None:
-                print("  ERROR: No volume data", file=sys.stderr)
-                return
-            
-            # Get volumes
-            neutron_vol, xray_vol = self.current_slice_data
-            
-            # Convert 2D seed to 3D seed
-            if self.current_axis == 'z':
-                seed_3d = (self.current_slice_index, y_pixel, x_pixel)
-            elif self.current_axis == 'y':
-                seed_3d = (y_pixel, self.current_slice_index, x_pixel)
-            else:  # 'x'
-                seed_3d = (y_pixel, x_pixel, self.current_slice_index)
-            
-            print(f"  3D seed point: {seed_3d}", file=sys.stderr)
-            
-            if is_bivariate:
-                # 3D Bivariate
-                neutron_tolerance = self.tolerance_spinbox.value()
-                xray_tolerance = self.tolerance2_spinbox.value()
-                
-                print(f"  3D Bivariate: N_tol={neutron_tolerance}, X_tol={xray_tolerance}", file=sys.stderr)
-                
-                mask_3d = RegionGrowing3D.bivariate_region_growing_3d(
-                    neutron_vol,
-                    xray_vol,
-                    seed_3d,
-                    neutron_tolerance,
-                    xray_tolerance,
-                    connectivity=1  # 6-connected for speed
-                )
-            else:
-                # 3D Univariate
-                tolerance = self.tolerance_spinbox.value()
-                
-                # Use displayed modality
-                if self.current_view_mode == 'neutron':
-                    volume = neutron_vol
-                else:
-                    volume = xray_vol
-                
-                print(f"  3D Univariate: tolerance={tolerance}", file=sys.stderr)
-                
-                mask_3d = RegionGrowing3D.univariate_region_growing_3d(
-                    volume,
-                    seed_3d,
-                    tolerance,
-                    connectivity=1
-                )
-            
-            # Store 3D mask
-            self.region_grow_mask_3d = mask_3d
-            
-            # Extract 2D slice for display
-            self.region_grow_mask = RegionGrowing3D.extract_slice_from_3d_mask(
-                mask_3d,
-                self.current_axis,
-                self.current_slice_index
-            )
-            
-            print(f"  3D result: {np.sum(mask_3d):,} voxels total", file=sys.stderr)
-            print(f"  2D slice: {np.sum(self.region_grow_mask):,} pixels", file=sys.stderr)
-            
-        else:
-            # 2D SLICE MODE (original behavior)
-            if is_bivariate:
-                # Bivariate mode - need both neutron and X-ray slices
-                print("  Using BIVARIATE mode", file=sys.stderr)
-                
-                if self.current_slice_data is None:
-                    print("  ERROR: No slice data", file=sys.stderr)
-                    return
-                
-                # Get both volumes
-                neutron_vol, xray_vol = self.current_slice_data
-                
-                # Extract both slices
-                if self.current_axis == 'z':
-                    neutron_slice = neutron_vol[self.current_slice_index, :, :]
-                    xray_slice = xray_vol[self.current_slice_index, :, :]
-                elif self.current_axis == 'y':
-                    neutron_slice = neutron_vol[:, self.current_slice_index, :]
-                    xray_slice = xray_vol[:, self.current_slice_index, :]
-                else:  # 'x'
-                    neutron_slice = neutron_vol[:, :, self.current_slice_index]
-                    xray_slice = xray_vol[:, :, self.current_slice_index]
-                
-                # Get tolerances
-                neutron_tolerance = self.tolerance_spinbox.value()
-                xray_tolerance = self.tolerance2_spinbox.value()
-                
-                print(f"  Neutron tolerance: {neutron_tolerance}", file=sys.stderr)
-                print(f"  X-ray tolerance: {xray_tolerance}", file=sys.stderr)
-                
-                # Grow region using BOTH modalities
-                self.region_grow_mask = RegionGrowing.flood_fill_bivariate(
-                    neutron_slice,
-                    xray_slice,
-                    (y_pixel, x_pixel),
-                    neutron_tolerance,
-                    xray_tolerance,
-                    connectivity=2  # 8-connected
-                )
-            else:
-                # Univariate mode - use only displayed modality
-                print("  Using UNIVARIATE mode", file=sys.stderr)
-                
-                # Get tolerance
-                tolerance = self.tolerance_spinbox.value()
-                
-                # Grow region
-                self.region_grow_mask = RegionGrowing.flood_fill_tolerance(
-                    self.current_slice,
-                    (y_pixel, x_pixel),
-                    tolerance,
-                    connectivity=2  # 8-connected
-                )
-            
-            # No 3D mask in 2D mode
-            self.region_grow_mask_3d = None
-        
-        self.region_grow_plane = (self.current_axis, self.current_slice_index)
-
-        num_pixels = np.sum(self.region_grow_mask)
-        print(f"  Region grown: {num_pixels} pixels", file=sys.stderr)
-        
-        if num_pixels == 0:
-            mode_str = "bivariate" if is_bivariate else "univariate"
-            QMessageBox.warning(
-                self,
-                "No Region Found",
-                f"No connected region found at seed point ({mode_str} mode).\n"
-                f"Try adjusting the tolerance(s)."
-            )
-            return
-        
-        # Display mask overlay
-        self._display_mask_overlay()
-        
-        # Enable buttons
-        self.clear_spatial_roi_btn.setEnabled(True)
-        self.create_hist_roi_btn.setEnabled(True)
-        self.show_mask_cb.setEnabled(True)
-        
-        # Update info
-        mode_str = "bivariate" if is_bivariate else "univariate"
-        self.info_label.setText(f"Region selected: {num_pixels:,} pixels ({mode_str})")
-        
-        # Store that we have a region (for histogram ROI creation)
-        # We'll use region_grow_mask instead of spatial_roi_coords
-    
-    def _region_grow_display_slice(self):
-        """The grown region's 2-D mask for the current view, or None.
-
-        A 3-D grown region is re-sliced for the current plane; a 2-D one is
-        shown only on the slice it was grown on.
-        """
-        if self.region_grow_mask_3d is not None:
-            return self._slice_mask_for_display(self.region_grow_mask_3d)
-        if self.region_grow_mask is None:
-            return None
-        return self._slice_mask_for_display(
-            self.region_grow_mask, self.region_grow_plane
-        )
-
-    def _display_mask_overlay(self):
-        """Display region growing mask overlay on slice"""
-        if self.region_grow_mask is None:
-            return
-
-        # Remove old overlay
-        if self.mask_overlay is not None:
-            try:
-                self.mask_overlay.remove()
-            except Exception:
-                pass
-            self.mask_overlay = None
-
-        # Show mask if checkbox is checked
-        mask_2d = self._region_grow_display_slice()
-        if (self.show_mask_cb.isChecked() and mask_2d is not None
-                and self.ax.images):
-            # Create colored overlay
-            mask_rgba = np.zeros((*mask_2d.shape, 4))
-            mask_rgba[mask_2d.astype(bool)] = [0, 1, 0, 0.4]  # Green with alpha
-
-            # Display overlay
-            self.mask_overlay = self.ax.imshow(
-                mask_rgba,
-                extent=self.ax.images[0].get_extent(),
-                zorder=10,
-                interpolation='nearest'
-            )
-
-        self.clear_highlight_btn.setEnabled(True)
-        self.canvas.draw_idle()
-
-    def _on_show_mask_changed(self, state):
-        """Toggle mask overlay visibility"""
-        if self.region_grow_mask is not None:
-            self._display_mask_overlay()
-
-    def set_mask_overlays(self, overlays, redraw=True):
-        """
-        Set multiple mask overlays for display
-
-        Args:
-            overlays: List of (name, mask, color) tuples
-                     mask: 3-D volume mask (re-sliced for the current view)
-                           or a 2-D single-slice mask
-                     color: matplotlib color (tuple or string)
-            redraw:  Draw the overlays now. Pass False when a full
-                     _update_display() follows, so they render only once.
-        """
-        self.mask_overlays = overlays
-        # Enable clear-highlight whenever overlays are non-empty
-        self.clear_highlight_btn.setEnabled(bool(overlays))
-        if redraw:
-            self._display_mask_overlays()
-
-    def clear_mask_overlays(self):
-        """Clear all mask overlays"""
-        self.mask_overlays = []
-        self._clear_overlay_artists()
-        self.clear_highlight_btn.setEnabled(False)
-        self.canvas.draw_idle()
-    
-    def _clear_overlay_artists(self):
-        """Remove overlay artists from plot"""
-        for artist in self.overlay_artists:
-            try:
-                artist.remove()
-            except:
-                pass
-        self.overlay_artists = []
-    
-    def _slice_mask_for_display(self, mask, plane=None):
-        """Return the 2-D view of *mask* matching the current axis and slice.
-
-        3-D masks (whole-volume layers) are sliced on demand so the highlight
-        follows slice-index and viewing-plane changes.
-
-        2-D masks belong to the single slice they were created on. When
-        *plane* is given as ``(axis, slice_index)`` the mask is shown only
-        there; without it, only the shape is checked — which is not enough on
-        an isotropic volume, where a stale mask would be drawn on the wrong
-        plane. Returns None when the mask cannot be shown in the current view.
-        """
-        if mask is None or self.current_slice is None:
-            return None
-
-        mask = np.asarray(mask)
-
-        if mask.ndim == 2 and plane is not None:
-            source_axis, source_index = plane
-            if source_axis != self.current_axis:
-                return None
-            if source_index is not None and source_index != self.current_slice_index:
-                return None
-
-        if mask.ndim == 3:
-            index = self.current_slice_index
-            if index is None:
-                return None
-            axis_position = {'z': 0, 'y': 1, 'x': 2}.get(self.current_axis, 0)
-            if not 0 <= index < mask.shape[axis_position]:
-                return None
-            if self.current_axis == 'z':
-                slice_2d = mask[index, :, :]
-            elif self.current_axis == 'y':
-                slice_2d = mask[:, index, :]
-            else:
-                slice_2d = mask[:, :, index]
-        elif mask.ndim == 2:
-            slice_2d = mask
-        else:
-            return None
-
-        if slice_2d.shape != self.current_slice.shape:
-            return None
-        return slice_2d
-
-    def _display_mask_overlays(self):
-        """Display multiple mask overlays with different colours.
-
-        Masks are re-sliced from their stored form on every redraw, so the
-        highlight stays correct while scrolling slices or switching planes.
-        """
-        self._clear_overlay_artists()
-        self._visible_mask_pixels = 0
-
-        if not self.ax.images or len(self.ax.images) == 0:
-            return
-
-        if self.current_slice is None:
-            return
-
-        # Use the same extent / origin / aspect as the base image
-        extent = self.ax.images[0].get_extent()
-
-        import matplotlib.colors as mcolors
-
-        for entry in self.mask_overlays:
-            # Entries are (name, mask, color) or (name, mask, color, plane),
-            # where plane is (axis, slice_index) for single-slice masks.
-            name, mask, color = entry[0], entry[1], entry[2]
-            plane = entry[3] if len(entry) > 3 else None
-            slice_2d = self._slice_mask_for_display(mask, plane)
-            if slice_2d is None:
-                continue
-            visible = int(np.count_nonzero(slice_2d))
-            if visible == 0:
-                # Nothing of this layer intersects the current slice
-                continue
-            self._visible_mask_pixels += visible
-
-            # Parse colour to RGBA float
-            try:
-                r, g, b, _ = mcolors.to_rgba(color, alpha=None)
-                a = color[3] if (isinstance(color, (tuple, list)) and len(color) > 3) else 0.5
-            except Exception:
-                r, g, b, a = 1.0, 0.0, 0.0, 0.5
-
-            overlay_rgba = np.zeros((*slice_2d.shape, 4), dtype=np.float32)
-            overlay_rgba[slice_2d] = [r, g, b, a]
-
-            artist = self.ax.imshow(
-                overlay_rgba,
-                extent=extent,
-                origin='upper',
-                aspect='equal',
-                zorder=11,
-                interpolation='nearest'
-            )
-            self.overlay_artists.append(artist)
-
-        self.canvas.draw_idle()
-    
-    def _create_histogram_roi_from_spatial(self):
-        """Extract values from spatial ROI and create histogram ROI"""
-        import sys
-        
-        print("=" * 60, file=sys.stderr)
-        print("Creating histogram ROI from spatial selection", file=sys.stderr)
-        print("=" * 60, file=sys.stderr)
-        
-        # Check if we have rectangle or region growing selection
-        has_rectangle = (self.spatial_roi_coords is not None)
-        has_region = (self.region_grow_mask is not None)
-        
-        if not has_rectangle and not has_region:
-            print("  ERROR: No spatial ROI defined", file=sys.stderr)
-            return
-        
-        if self.current_slice_data is None:
-            print("  ERROR: No slice data loaded", file=sys.stderr)
-            return
-        
-        if has_region:
-            # Region growing mode - emit the mask instead of coords.
-            # Prefer the 3-D mask when the region was grown through the
-            # volume: building the histogram ROI from the current slice
-            # alone would describe only the few voxels visible here, giving
-            # an ROI far narrower than the region actually selected.
-            mask = (
-                self.region_grow_mask_3d
-                if self.region_grow_mask_3d is not None
-                else self.region_grow_mask
-            )
-            print(f"  Using region growing mask "
-                  f"({np.count_nonzero(mask):,} voxels, {mask.ndim}-D)",
-                  file=sys.stderr)
-
-            self.spatial_roi_to_histogram.emit(
-                ('mask', mask),
-                self.current_axis,
-                self.current_slice_index
-            )
-        else:
-            # Rectangle mode - emit coords as before
-            print(f"  Using rectangle coords: {self.spatial_roi_coords}", file=sys.stderr)
-            print(f"  Emitting signal with: coords={self.spatial_roi_coords}, axis={self.current_axis}, slice={self.current_slice_index}", file=sys.stderr)
-            self.spatial_roi_to_histogram.emit(
-                self.spatial_roi_coords,
-                self.current_axis,
-                self.current_slice_index
-            )
-        
-    def set_slice_data(self, neutron_vol, xray_vol, segmentation_vol=None):
-        """Update slice data - now receives full 3D volumes"""
-        self.current_slice_data = (neutron_vol, xray_vol)
-        self.segmentation_mask = segmentation_vol
-        
-        if self.volume_shape is None or self.volume_shape != neutron_vol.shape:
-            self.set_volume_shape(neutron_vol.shape)
-        
-        self._update_display()
-    
-    def _update_display(self):
-        """Update the display"""
-        if self.current_slice_data is None:
-            return
-
-        neutron_vol, xray_vol = self.current_slice_data
-        
-        # Select volume based on view mode
-        data_vol = neutron_vol if self.view_mode == 'neutron' else xray_vol
-        view_label = "Neutron" if self.view_mode == 'neutron' else "X-ray"
-        
-        # Extract the appropriate slice
-        if self.current_slice_index is None:
-            self.current_slice_index = data_vol.shape[0] // 2 if self.current_axis == 'z' else data_vol.shape[1] // 2
-        
-        # Clamp the index so switching to a shorter axis cannot go out of range
-        axis_position = {'z': 0, 'y': 1, 'x': 2}[self.current_axis]
-        self.current_slice_index = int(
-            min(max(self.current_slice_index, 0),
-                data_vol.shape[axis_position] - 1)
-        )
-
-        if self.current_axis == 'z':
-            data_slice = data_vol[self.current_slice_index, :, :]
-            title = f"XY Slice (Z={self.current_slice_index}, {view_label})"
-        elif self.current_axis == 'y':
-            data_slice = data_vol[:, self.current_slice_index, :]
-            title = f"XZ Slice (Y={self.current_slice_index}, {view_label})"
-        else:  # 'x'
-            data_slice = data_vol[:, :, self.current_slice_index]
-            title = f"YZ Slice (X={self.current_slice_index}, {view_label})"
-
-
-        # Store current slice for region growing
-        self.current_slice = data_slice
-        
-        self.ax.clear()
-        # ax.clear() already detached the region-grow artist
-        self.mask_overlay = None
-        self.ax.set_title(title)
-        self.ax.axis('off')
-        
-        # Determine vmin/vmax for display
-        if self.vmin is not None and self.vmax is not None and self.vmax > self.vmin:
-            vmin_display = self.vmin
-            vmax_display = self.vmax
-        else:
-            vmin_display = None
-            vmax_display = None
-        
-        # Define explicit extent to ensure perfect alignment
-        # extent = [left, right, bottom, top] for origin='upper'
-        extent = [0, data_slice.shape[1], data_slice.shape[0], 0]
-        
-        im = self.ax.imshow(
-            data_slice, 
-            cmap='gray', 
-            interpolation='nearest',
-            vmin=vmin_display,
-            vmax=vmax_display,
-            extent=extent,
-            origin='upper',
-            aspect='equal'  # Preserve aspect ratio - no distortion
-        )
-        
-        # Draw multi-colour mask overlays; 3-D masks are re-sliced here so the
-        # highlight tracks the current plane and slice index.
-        self._display_mask_overlays()
-        # The grown region survives redraws (contrast, slice, plane changes)
-        if self.region_grow_mask is not None:
-            self._display_mask_overlay()
-
-        # Report what is actually highlighted on this slice
-        if self._visible_mask_pixels > 0:
-            pct = 100.0 * self._visible_mask_pixels / data_slice.size
-            info = (
-                f"{view_label} | Segmented here: "
-                f"{self._visible_mask_pixels:,} pixels ({pct:.1f}%)"
-            )
-        else:
-            info = (
-                f"{view_label} | Shape: {data_slice.shape} | "
-                f"Range: [{data_slice.min():.0f}, {data_slice.max():.0f}]"
-            )
-
-        if self.display_bin_factor > 1:
-            info += (
-                f" | display binned x{self.display_bin_factor} (median) — "
-                "segmentation runs at full resolution"
-            )
-
-        self.info_label.setText(info)
-
-        self.fig.tight_layout()
-        self.canvas.draw_idle()
-
-
-def _plain_validation_summary(validation) -> str:
-    """Held-out scores, said without the vocabulary of the method."""
-    return (
-        f"Tested on {validation.n_folds} region(s) the classifier never saw "
-        f"during training: {100 * validation.accuracy:.1f}% of voxels "
-        f"correct, {100 * validation.mean_iou:.1f}% average overlap with the "
-        f"materials you drew."
-    )
-
-
-class AnchorSelectionDialog(QDialog):
-    """Pick the materials that cannot change during the experiment.
-
-    An anchor is a phase that cannot really change during the experiment, so
-    any movement of its histogram centroid must be instrumental. Picking a
-    reactive class here would fit the physics away as if it were drift, which
-    is why the choice is the user's and not a default.
-    """
-
-    def __init__(self, class_names, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Control Materials")
-        self.anchor_classes = []
-        self.estimate_scale = False
-
-        layout = QVBoxLayout(self)
-        explanation = QLabel(
-            "Choose the materials that cannot change during the experiment "
-            "— a container, a support, a structural metal. If one of these "
-            "appears to move, it is the instrument that moved, not the "
-            "sample.\n\n"
-            "Do not choose a material that reacts: its real change would be "
-            "subtracted from every other material as though it were an "
-            "instrument effect."
-        )
-        explanation.setWordWrap(True)
-        layout.addWidget(explanation)
-
-        self._checkboxes = []
-        for name in class_names:
-            box = QCheckBox(name)
-            layout.addWidget(box)
-            self._checkboxes.append((name, box))
-
-        self.scale_box = QCheckBox(
-            "Also correct for a change in scale (needs two or more "
-            "separated control materials)"
-        )
-        self.scale_box.setToolTip(
-            "Some instrument changes stretch the histogram as well as\n"
-            "shifting it. With a single control material this cannot be\n"
-            "separated from a plain shift, so it is left alone."
-        )
-        layout.addWidget(self.scale_box)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self
-        )
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _accept(self):
-        self.anchor_classes = [
-            name for name, box in self._checkboxes if box.isChecked()
-        ]
-        self.estimate_scale = self.scale_box.isChecked()
-        if not self.anchor_classes:
-            QMessageBox.warning(
-                self, "No Control Materials",
-                "Select at least one material to use as a control."
-            )
-            return
-        self.accept()
-
-
-class ExportOptionsDialog(QDialog):
-    """
-    Dialog that lets the user choose which segmentation layers and which
-    output modalities to include in an export.
-
-    Parameters
-    ----------
-    layers : list of (mask_3d, color, name) tuples
-        The available segmentation layers.
-    parent : QWidget, optional
-
-    After exec_() returns Accepted, read:
-        dialog.selected_layers  → list of (mask_3d, color, name) for chosen layers
-        dialog.export_mask      → bool – write binary mask TIFF
-        dialog.export_neutron   → bool – write masked neutron TIFF
-        dialog.export_xray      → bool – write masked X-ray TIFF
-        dialog.export_labels    → bool – write per-layer integer label TIFF
-    """
-
-    def __init__(self, layers, parent=None):
-        super().__init__(parent)
-        self.layers = layers
-        self.setWindowTitle("Export Options")
-        self.setMinimumWidth(400)
-        self._build_ui()
-
-    def _build_ui(self):
-        from PyQt5.QtWidgets import (
-            QScrollArea, QDialogButtonBox, QFrame
-        )
-        from PyQt5.QtGui import QColor, QPalette
-        from PyQt5.QtCore import Qt
-
-        main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(10)
-
-        # ── Layers ─────────────────────────────────────────────────────────────
-        layers_group = QGroupBox("Layers to export")
-        layers_vbox = QVBoxLayout()
-        layers_vbox.setSpacing(4)
-
-        # "Select all" convenience checkbox
-        self._all_layers_cb = QCheckBox("Select / deselect all")
-        self._all_layers_cb.setChecked(True)
-        self._all_layers_cb.stateChanged.connect(self._toggle_all_layers)
-        layers_vbox.addWidget(self._all_layers_cb)
-
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
-        layers_vbox.addWidget(sep)
-
-        self._layer_cbs = []
-        scroll_widget = QWidget()
-        scroll_vbox = QVBoxLayout(scroll_widget)
-        scroll_vbox.setSpacing(3)
-        scroll_vbox.setContentsMargins(2, 2, 2, 2)
-
-        for mask_3d, color, name in self.layers:
-            row = QHBoxLayout()
-
-            # Colour swatch
-            swatch = QLabel("  ")
-            try:
-                import matplotlib.colors as mcolors
-                r, g, b, _ = mcolors.to_rgba(color)
-                hex_col = "#{:02x}{:02x}{:02x}".format(
-                    int(r * 255), int(g * 255), int(b * 255)
-                )
-                swatch.setStyleSheet(
-                    f"background-color: {hex_col}; border: 1px solid #888;"
-                )
-            except Exception:
-                pass
-            swatch.setFixedSize(16, 16)
-            row.addWidget(swatch)
-
-            n_vox = int(np.sum(mask_3d))
-            cb = QCheckBox(f"{name}  ({n_vox:,} voxels)")
-            cb.setChecked(True)
-            self._layer_cbs.append((cb, mask_3d, color, name))
-            row.addWidget(cb)
-            row.addStretch()
-            scroll_vbox.addLayout(row)
-
-        scroll_area = QScrollArea()
-        scroll_area.setWidget(scroll_widget)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setMaximumHeight(160)
-        scroll_area.setFrameShape(QFrame.NoFrame)
-        layers_vbox.addWidget(scroll_area)
-        layers_group.setLayout(layers_vbox)
-        main_layout.addWidget(layers_group)
-
-        # ── Modalities ─────────────────────────────────────────────────────────
-        mod_group = QGroupBox("Output files (per selected layer)")
-        mod_vbox = QVBoxLayout()
-        mod_vbox.setSpacing(4)
-
-        self._mask_cb    = QCheckBox("Binary mask  (0/255 TIFF)")
-        self._neutron_cb = QCheckBox("Neutron volume  (masked intensity)")
-        self._xray_cb    = QCheckBox("X-ray volume  (masked intensity)")
-        self._labels_cb  = QCheckBox("Integer label volume  (all selected layers combined)")
-        self._report_cb = QCheckBox(
-            "Text report  (class names, label values, voxels per timepoint)"
-        )
-        self._report_cb.setToolTip(
-            "Write a segmentation_report.txt describing each class: its name,\n"
-            "the integer value it takes in the label volumes, its voxel count\n"
-            "at every timepoint, and how the segmentation was produced."
-        )
-        self._histogram_cb = QCheckBox(
-            "Bimodal histogram of the class  (.npy + .png)"
-        )
-        self._histogram_cb.setToolTip(
-            "For every selected class and timepoint, compute the 2-D\n"
-            "neutron/X-ray histogram of that class's segmented voxels.\n"
-            "The bins and limits are the same as the main histogram, so the\n"
-            "files can be compared bin-for-bin across classes and time."
-        )
-
-        self._mask_cb.setChecked(True)
-        self._neutron_cb.setChecked(True)
-        self._xray_cb.setChecked(True)
-        self._labels_cb.setChecked(False)
-        self._histogram_cb.setChecked(False)
-        self._report_cb.setChecked(True)
-
-        mod_vbox.addWidget(self._mask_cb)
-        mod_vbox.addWidget(self._neutron_cb)
-        mod_vbox.addWidget(self._xray_cb)
-        mod_vbox.addWidget(self._labels_cb)
-        mod_vbox.addWidget(self._histogram_cb)
-        mod_vbox.addWidget(self._report_cb)
-
-        mod_group.setLayout(mod_vbox)
-        main_layout.addWidget(mod_group)
-
-        # ── File-count preview ────────────────────────────────────────────────
-        self._preview_label = QLabel()
-        self._preview_label.setStyleSheet("color: #555; font-style: italic; font-size: 9pt;")
-        main_layout.addWidget(self._preview_label)
-
-        # Connect all checkboxes to the preview update
-        for cb, *_ in self._layer_cbs:
-            cb.stateChanged.connect(self._update_preview)
-        for cb in (self._mask_cb, self._neutron_cb, self._xray_cb,
-                   self._labels_cb, self._histogram_cb, self._report_cb):
-            cb.stateChanged.connect(self._update_preview)
-        self._update_preview()
-
-        # ── Buttons ────────────────────────────────────────────────────────────
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        main_layout.addWidget(buttons)
-
-    def _toggle_all_layers(self, state):
-        checked = (state == 2)
-        for cb, *_ in self._layer_cbs:
-            cb.blockSignals(True)
-            cb.setChecked(checked)
-            cb.blockSignals(False)
-        self._update_preview()
-
-    def _update_preview(self):
-        n_layers = sum(1 for cb, *_ in self._layer_cbs if cb.isChecked())
-        n_mods   = sum([self._mask_cb.isChecked(),
-                        self._neutron_cb.isChecked(),
-                        self._xray_cb.isChecked()])
-        # A histogram export writes a counts file and an image per layer
-        if self._histogram_cb.isChecked():
-            n_mods += 2
-        n_label  = 1 if self._labels_cb.isChecked() else 0
-        per_tp   = n_layers * n_mods + n_label
-        self._preview_label.setText(
-            f"→  {n_layers} layer(s) × {n_mods} file(s) each"
-            + (f" + 1 label file" if n_label else "")
-            + f"  =  {per_tp} file(s) per timepoint"
-        )
-
-    def _on_accept(self):
-        self.selected_layers = [
-            (mask_3d, color, name)
-            for cb, mask_3d, color, name in self._layer_cbs
-            if cb.isChecked()
-        ]
-        self.export_mask    = self._mask_cb.isChecked()
-        self.export_neutron = self._neutron_cb.isChecked()
-        self.export_xray    = self._xray_cb.isChecked()
-        self.export_labels  = self._labels_cb.isChecked()
-        self.export_histogram = self._histogram_cb.isChecked()
-        self.export_report = self._report_cb.isChecked()
-        self.accept()
-
-
-class FigureExportDialog(QDialog):
-    """Options for the side-by-side histogram + slice figure export.
-
-    After exec_() returns Accepted, read ``dpi``, ``show_legend``,
-    ``outline_highlights`` and ``include_active_roi``.
-    """
-
-    def __init__(self, has_active_roi=False, parent=None):
-        super().__init__(parent)
-        from PyQt5.QtWidgets import QSpinBox
-
-        self.setWindowTitle("Export Histogram + Slice Figure")
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            "Left: the local histogram of this timepoint with every label's\n"
-            "selection on top.  Right: the slice on screen with the same\n"
-            "labels highlighted."
-        ))
-
-        dpi_row = QHBoxLayout()
-        dpi_row.addWidget(QLabel("Resolution (DPI):"))
-        self._dpi_spin = QSpinBox()
-        self._dpi_spin.setRange(72, 1200)
-        self._dpi_spin.setSingleStep(50)
-        self._dpi_spin.setValue(300)
-        self._dpi_spin.setToolTip(
-            "Resolution of the histogram and slice images. In an SVG or PDF\n"
-            "the outlines, text and legends stay vector graphics."
-        )
-        dpi_row.addWidget(self._dpi_spin)
-        dpi_row.addStretch()
-        layout.addLayout(dpi_row)
-
-        self._legend_cb = QCheckBox("Show legends")
-        self._legend_cb.setChecked(True)
-        layout.addWidget(self._legend_cb)
-
-        self._outline_cb = QCheckBox("Outline the slice highlights")
-        self._outline_cb.setChecked(True)
-        self._outline_cb.setToolTip(
-            "Draw a thin contour around each highlighted label, so it stays\n"
-            "readable in print and in greyscale."
-        )
-        layout.addWidget(self._outline_cb)
-
-        self._active_cb = QCheckBox("Include ROIs drawn but not saved")
-        self._active_cb.setChecked(has_active_roi)
-        self._active_cb.setEnabled(has_active_roi)
-        layout.addWidget(self._active_cb)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _on_accept(self):
-        self.dpi = self._dpi_spin.value()
-        self.show_legend = self._legend_cb.isChecked()
-        self.outline_highlights = self._outline_cb.isChecked()
-        self.include_active_roi = (
-            self._active_cb.isEnabled() and self._active_cb.isChecked()
-        )
-        self.accept()
+from gui.figure_save_dialog import FigureSaveDialog, ask_figure_output
+
+from gui.slice_viewer import SliceViewerWidget, _group_labelled  # noqa: F401
+from gui.dialogs import (  # noqa: F401  (re-exported)
+    AnchorSelectionDialog, ExportOptionsDialog, FigureExportDialog,
+)
 
 
 class BiTS4DMainWindow(QMainWindow):
@@ -1700,6 +57,9 @@ class BiTS4DMainWindow(QMainWindow):
         self._cluster_timepoint = None
         # Latest time-series K-means result (utils.kmeans_levels)
         self.kmeans_series_result = None
+        # Materials placed from attenuation coefficients:
+        # {"references": {name: (μn, μx)}, "targets": {name: (μn, μx)}}
+        self.physics_materials = None
 
         # Current state
         self.global_histogram = None
@@ -2015,8 +375,9 @@ class BiTS4DMainWindow(QMainWindow):
         self.kmeans_timeline_btn = QPushButton("📈 Export Cluster Timeline...")
         self.kmeans_timeline_btn.setEnabled(False)
         self.kmeans_timeline_btn.setToolTip(
-            "After a time-series run: every cluster's voxel count and share\n"
-            "of the sample at every timepoint (CSV), plus a plot (SVG)."
+            "After a time-series run: a plot of every cluster's share of the\n"
+            "sample over time (SVG, PDF, PNG or TIFF), and optionally the\n"
+            "voxel counts and shares as CSV."
         )
         self.kmeans_timeline_btn.clicked.connect(self._export_kmeans_timeline)
         km_layout.addWidget(self.kmeans_timeline_btn)
@@ -2419,6 +780,25 @@ class BiTS4DMainWindow(QMainWindow):
         check_action.triggered.connect(self._on_check_data)
         model_menu.addAction(check_action)
 
+        align_action = QAction("Check Alignment...", self)
+        align_action.setToolTip(
+            "Whether the X-ray volumes sit exactly on the neutron volumes.\n"
+            "Even a one-voxel offset pairs voxels from different materials\n"
+            "at every interface and smears the histogram. Measures the\n"
+            "offset and offers to correct it."
+        )
+        align_action.triggered.connect(self._on_check_alignment)
+        model_menu.addAction(align_action)
+
+        physics_action = QAction("Add Materials from Attenuation Coefficients...", self)
+        physics_action.setToolTip(
+            "Place a material on the histogram from its neutron and X-ray\n"
+            "attenuation coefficients, calibrated on two materials you have\n"
+            "drawn — for a phase with no region to draw."
+        )
+        physics_action.triggered.connect(self._on_physics_materials)
+        model_menu.addAction(physics_action)
+
         model_run_action = QAction("Track Materials Across Time...", self)
         model_run_action.setToolTip(
             "Follow the materials you defined through every timepoint.\n"
@@ -2696,6 +1076,7 @@ class BiTS4DMainWindow(QMainWindow):
         self.model_result = None
         self._last_kmeans_cluster_selections = []
         self._cluster_timepoint = None
+        self.physics_materials = None
         self.copy_clusters_btn.setEnabled(False)
         self.material_panel.set_clusters_available(False)
         self.material_panel.clear_result()
@@ -3649,23 +2030,26 @@ class BiTS4DMainWindow(QMainWindow):
                 "Run K-means with the Time series scope first."
             )
             return
-        path, _filter = QFileDialog.getSaveFileName(
-            self, "Export Cluster Timeline", "kmeans_timeline.csv",
-            "CSV (*.csv)"
+        output = ask_figure_output(
+            self, "Export Cluster Timeline", "kmeans_timeline",
+            csv_label="Also save each cluster's share over time as CSV",
         )
-        if not path:
+        if output is None:
             return
         from utils.kmeans_levels import plot_timeline
-        base = path[:-4] if path.lower().endswith(".csv") else path
-        csv_path, plot_path = base + ".csv", base + ".svg"
+        written = []
         try:
-            result.write_timeline_csv(csv_path)
-            plot_timeline(result, plot_path,
-                          colors=getattr(self, "_kmeans_series_colors", None))
+            plot_timeline(result, str(output.figure_path),
+                          colors=getattr(self, "_kmeans_series_colors", None),
+                          dpi=output.dpi)
+            written.append(str(output.figure_path))
+            if output.save_csv:
+                result.write_timeline_csv(output.data_path())
+                written.append(str(output.data_path()))
         except OSError as exc:
             QMessageBox.critical(self, "Export Error", f"Could not write:\n{exc}")
             return
-        self.status_bar.showMessage(f"Timeline saved: {csv_path}, {plot_path}")
+        self.status_bar.showMessage("Timeline saved: " + ", ".join(written))
 
     @pyqtSlot()
     def _convert_kmeans_clusters_to_materials(self):
@@ -4934,7 +3318,8 @@ class BiTS4DMainWindow(QMainWindow):
         )
 
     def _export_class_histogram(self, timepoint, name, mask_3d, output_dir,
-                                path_prefix):
+                                path_prefix, image_format="svg",
+                                write_csv=False):
         """Write the bimodal histogram of one segmented class.
 
         Computed on the full-resolution volumes and on the global
@@ -4954,6 +3339,8 @@ class BiTS4DMainWindow(QMainWindow):
             class_hist,
             f"{path_prefix}_hist",
             title=f"{name} — T={timepoint}  ({class_hist.num_voxels:,} voxels)",
+            image_format=image_format,
+            write_csv=write_csv,
         )
 
     def _export_current_timepoint(self):
@@ -5034,7 +3421,9 @@ class BiTS4DMainWindow(QMainWindow):
                     files_written.append(os.path.basename(p))
                 if do_histogram:
                     files_written += self._export_class_histogram(
-                        current_t, name, mask_bool, output_dir, pfx
+                        current_t, name, mask_bool, output_dir, pfx,
+                        image_format=dlg.histogram_format,
+                        write_csv=dlg.histogram_csv,
                     )
 
             if do_labels:
@@ -5207,7 +3596,9 @@ class BiTS4DMainWindow(QMainWindow):
                         total_files += 1
                     if do_histogram:
                         total_files += len(self._export_class_histogram(
-                            t, name, mask_bool, output_dir, pfx
+                            t, name, mask_bool, output_dir, pfx,
+                            image_format=dlg.histogram_format,
+                            write_csv=dlg.histogram_csv,
                         ))
 
                 exported_layers[t] = t_layers
@@ -5339,9 +3730,16 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        has_active = self.dual_histogram.get_roi_manager().has_roi()
+        has_active = self.dual_histogram.get_roi_manager().unsaved_count() > 0
         dialog = FigureExportDialog(has_active_roi=has_active, parent=self)
-        if dialog.exec_() != QDialog.Accepted:
+        timepoint = self.dataset.current_timepoint
+        axis = self.slice_viewer.current_axis
+        index = self.slice_viewer.current_slice_index
+        output = ask_figure_output(
+            self, "Save Histogram + Slice Figure",
+            f"histogram_slice_T{timepoint:03d}_{axis}{index}", dialog=dialog,
+        )
+        if output is None:
             return
 
         panels = self._histogram_slice_figure_panels(dialog.include_active_roi)
@@ -5352,26 +3750,20 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        timepoint = self.dataset.current_timepoint
-        axis = self.slice_viewer.current_axis
-        index = self.slice_viewer.current_slice_index
-        default_name = f"histogram_slice_T{timepoint:03d}_{axis}{index}.svg"
-        path, _filter = QFileDialog.getSaveFileName(
-            self, "Save Histogram + Slice Figure", default_name,
-            "SVG vector (*.svg);;PDF document (*.pdf);;PNG image (*.png);;"
-            "TIFF image (*.tif *.tiff);;All files (*)",
+        from utils.figure_export import (
+            save_histogram_slice_figure, write_histogram_slice_csv,
         )
-        if not path:
-            return
-
-        from utils.figure_export import save_histogram_slice_figure
         try:
-            written = save_histogram_slice_figure(
-                path, *panels,
-                dpi=dialog.dpi,
+            written = [str(save_histogram_slice_figure(
+                output.figure_path, *panels,
+                dpi=output.dpi,
                 show_legend=dialog.show_legend,
                 outline_highlights=dialog.outline_highlights,
-            )
+            ))]
+            if output.save_csv:
+                written.append(write_histogram_slice_csv(
+                    output.data_path(), *panels
+                ))
         except Exception as exc:
             QMessageBox.critical(
                 self, "Export Error", f"Could not save the figure:\n{exc}"
@@ -5379,7 +3771,7 @@ class BiTS4DMainWindow(QMainWindow):
             import traceback; traceback.print_exc()
             return
 
-        self.status_bar.showMessage(f"Figure saved to {written}")
+        self.status_bar.showMessage("Saved: " + ", ".join(written))
 
     # ========== v14.0: Selection Library & Reporting Methods ==========
 
@@ -5612,14 +4004,15 @@ class BiTS4DMainWindow(QMainWindow):
     # ========== v14.1: Advanced Analytics Methods ==========
     
     def _run_histogram_time_analysis(self, title, dialog_caption, render,
-                                     explanation):
+                                     explanation, default_name=None,
+                                     csv_label="Also save the data as CSV"):
         """Shared driver for the temporal histogram analyses.
 
-        Collects every timepoint's local histogram (from cache, computing any
-        that are missing), then hands the list to *render*, which draws the
-        figure and returns the saved path.
+        Asks the figure format (and whether to save the data as CSV), then
+        collects every timepoint's local histogram (from cache, computing any
+        that are missing) and hands the list to *render(histograms, output)*,
+        which saves the figure (and CSV) and returns the paths written.
         """
-        from PyQt5.QtWidgets import QFileDialog
         from utils.cancellation import OperationCancelled, OperationFailed
 
         if not self.dataset or not self.histogram_engine:
@@ -5638,13 +4031,13 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, dialog_caption, "", "PNG Files (*.png);;All Files (*)"
+        output = ask_figure_output(
+            self, dialog_caption,
+            default_name or title.lower().replace(" ", "_"),
+            csv_label=csv_label,
         )
-        if not filepath:
+        if output is None:
             return
-        if not filepath.lower().endswith((".png", ".jpg", ".pdf", ".svg")):
-            filepath += ".png"
 
         def operation(progress_callback=None, cancel_check=None):
             histograms = []
@@ -5668,7 +4061,7 @@ class BiTS4DMainWindow(QMainWindow):
                     )
             if progress_callback:
                 progress_callback(95, "Rendering figure...")
-            return render(histograms, filepath)
+            return render(histograms, output)
 
         try:
             saved = run_with_progress(
@@ -5678,10 +4071,11 @@ class BiTS4DMainWindow(QMainWindow):
             return
 
         if saved:
-            self.status_bar.showMessage(f"{title} saved: {saved}")
+            files = "\n".join(str(path) for path in saved)
+            self.status_bar.showMessage(f"{title} saved: {saved[0]}")
             QMessageBox.information(
-                self, "Image Saved",
-                f"{title} saved to:\n{saved}\n\n{explanation}"
+                self, "Saved",
+                f"{title} saved to:\n{files}\n\n{explanation}"
             )
 
     def _collect_metrics_rows(self, progress_callback=None, cancel_check=None):
@@ -5779,21 +4173,22 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save Metrics CSV", "", "CSV Files (*.csv);;All Files (*)"
+        output = ask_figure_output(
+            self, "Save Histogram & Segmentation Metrics", "metrics",
+            csv_label="Also save the metric values as CSV",
         )
-        if not filepath:
+        if output is None:
             return
-        if not filepath.lower().endswith(".csv"):
-            filepath += ".csv"
-        plot_path = filepath[:-4] + "_evolution.png"
+        filepath = str(output.data_path()) if output.save_csv else None
+        plot_path = str(output.figure_path)
 
         def operation(progress_callback=None, cancel_check=None):
             rows = self._collect_metrics_rows(progress_callback, cancel_check)
             if progress_callback:
                 progress_callback(97, "Writing CSV and plots...")
-            write_metrics_csv(rows, filepath)
-            return rows, plot_metric_evolution(rows, plot_path)
+            if filepath:
+                write_metrics_csv(rows, filepath)
+            return rows, plot_metric_evolution(rows, plot_path, dpi=output.dpi)
 
         try:
             result = run_with_progress(
@@ -5810,8 +4205,8 @@ class BiTS4DMainWindow(QMainWindow):
             1 for row in rows if row.scope == "timepoint" and row.per_class.get("voxels_k")
         )
         message = (
-            f"Metrics written to:\n{filepath}\n\n"
-            f"{len(rows) - 1} timepoint(s) analysed, "
+            (f"Metric values written to:\n{filepath}\n\n" if filepath else "")
+            + f"{len(rows) - 1} timepoint(s) analysed, "
             f"{segmented} with segmentation classes."
         )
         if saved_plot:
@@ -5824,7 +4219,9 @@ class BiTS4DMainWindow(QMainWindow):
                 "segmented classes; only the histogram shape metrics were "
                 "computed."
             )
-        self.status_bar.showMessage(f"Metrics saved: {filepath}")
+        self.status_bar.showMessage(
+            f"Metrics saved: {saved_plot or filepath or 'nothing written'}"
+        )
         QMessageBox.information(self, "Metrics Saved", message)
 
     # ── model-based time-series segmentation ─────────────────────────────
@@ -5903,7 +4300,217 @@ class BiTS4DMainWindow(QMainWindow):
             QMessageBox.information(self, "Data Check", message)
         return reports
 
+    def _on_check_alignment(self):
+        """Measure the neutron/X-ray offset and offer to remove it."""
+        from utils.cancellation import OperationCancelled, OperationFailed
+        from model.registration import check_series_alignment
+
+        if not self.dataset:
+            QMessageBox.information(self, "No Data", "Load a dataset first.")
+            return
+
+        def operation(progress_callback=None, cancel_check=None):
+            if progress_callback:
+                progress_callback(10, "Comparing the two instruments' edges...")
+            return check_series_alignment(self.dataset, cancel_check=cancel_check)
+
+        try:
+            results = run_with_progress(
+                self, "Check Alignment",
+                "Measuring the offset between the neutron and X-ray volumes...",
+                operation,
+            )
+        except (OperationCancelled, OperationFailed):
+            return
+        if not results:
+            return
+        self.alignment_results = results
+
+        lines = [f"T{t}: {a.describe()}" for t, a in results]
+        shifts = np.array([a.correction for _t, a in results], dtype=float)
+        needs = [a.worth_correcting for _t, a in results]
+        if not any(needs):
+            QMessageBox.information(
+                self, "Alignment",
+                "The two instruments are aligned (no offset of a whole voxel "
+                "or more that mutual information confirms; a smaller offset is "
+                "better left than interpolated away).\n\n"
+                + "\n".join(lines),
+            )
+            self.status_bar.showMessage("Alignment: no correction needed")
+            return
+
+        spread = float(np.max(np.ptp(shifts, axis=0))) if len(shifts) > 1 else 0.0
+        constant = spread < 0.5
+        advice = (
+            "The offset is the same throughout the series — a mounting "
+            "offset. Correcting it shifts every X-ray volume by the same "
+            "whole number of voxels."
+            if constant else
+            "The offset changes during the series, so something moved during "
+            "the experiment. Correcting it measures and removes the offset "
+            "at every timepoint separately."
+        )
+        reply = QMessageBox.question(
+            self, "Alignment",
+            "The X-ray volumes are offset from the neutron volumes:\n\n"
+            + "\n".join(lines) + "\n\n" + advice
+            + "\n\nCorrect the X-ray volumes now? The histograms are then "
+            "recomputed; the files on disk are not changed.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._correct_alignment(
+            [float(np.round(v)) for v in shifts.mean(axis=0)] if constant
+            else None
+        )
+
+    def _correct_alignment(self, shift=None):
+        """Shift the X-ray volumes onto the neutron volumes, in memory.
+
+        *shift* applies one offset to every timepoint; None measures and
+        applies each timepoint's own. Shifts are whole voxels (see
+        :mod:`model.registration`), so no value is interpolated. Voxels shifted in from outside the
+        field become NaN and are excluded like any unmeasured voxel.
+        """
+        from utils.cancellation import OperationCancelled, OperationFailed
+        from model.registration import apply_shift, estimate_alignment
+
+        dataset = self.dataset
+
+        def operation(progress_callback=None, cancel_check=None):
+            corrected = np.empty(dataset.xray_data.shape, dtype=np.float32)
+            applied = []
+            for t in range(dataset.num_timepoints):
+                if cancel_check:
+                    cancel_check()
+                neutron, xray = dataset.get_volume_at_time(t)
+                offset = shift
+                if offset is None:
+                    offset = estimate_alignment(neutron, xray).correction
+                corrected[t] = apply_shift(xray, offset)
+                applied.append(tuple(offset))
+                if progress_callback:
+                    progress_callback(int(100 * (t + 1) / dataset.num_timepoints),
+                                      f"Aligned timepoint {t + 1}")
+            return corrected, applied
+
+        try:
+            outcome = run_with_progress(self, "Correct Alignment",
+                                        "Shifting the X-ray volumes...", operation)
+        except (OperationCancelled, OperationFailed):
+            return
+        if outcome is None:
+            return
+        corrected, applied = outcome
+        dataset.xray_data = corrected
+        dataset.metadata["xray_alignment_shift"] = applied
+        self.alignment_applied = applied
+
+        # Everything computed from the X-ray intensities is now stale
+        from histograms import HistogramEngine4D
+        self.histogram_engine = HistogramEngine4D(
+            bins=self.histogram_engine.bins,
+            cache_size=self.histogram_engine.cache_size,
+            use_gpu=self.histogram_engine.use_gpu,
+        )
+        self.global_histogram = None
+        self._derived_outline_cache = {}
+        self._compute_global_histogram()
+        self._precompute_local_histograms()
+        self._prepare_display_volumes()
+        self._update_current_timepoint(dataset.current_timepoint)
+        self.status_bar.showMessage(
+            "X-ray volumes aligned to the neutron volumes; histograms "
+            "recomputed"
+        )
+
     _CLUSTER_PREFIXES = ("K-means cluster", "3D Cluster", "Cluster ")
+
+    def _physics_library(self, sources):
+        """Classes placed from coefficients, calibrated on *sources*.
+
+        *sources* is ``{name: (neutron, xray, mask, valid, timepoint)}`` —
+        the drawn materials, measured afresh on every run so a correction
+        of the data (alignment) also moves the predictions. None when no
+        material is placed from coefficients.
+        """
+        entry = self.physics_materials
+        if not entry or not entry.get("targets"):
+            return None
+        from model.calibration import (
+            fit_calibration, predicted_classes, reference_from_region,
+        )
+        references = []
+        for name, coefficients in entry["references"].items():
+            if name not in sources:
+                continue
+            neutron, xray, mask, valid, _t = sources[name]
+            references.append(reference_from_region(
+                name, coefficients, neutron, xray, mask & valid))
+        if len(references) < 2:
+            return None
+        calibration = fit_calibration(references)
+        self.physics_calibration = calibration
+        return predicted_classes(entry["targets"], calibration)
+
+    def _on_physics_materials(self):
+        """Place materials on the histogram from attenuation coefficients."""
+        if not self.dataset or self.global_histogram is None:
+            QMessageBox.information(self, "No Data",
+                                    "Load a dataset and compute the histogram first.")
+            return
+        reference = self._material_reference_timepoint()
+        definitions = self._material_definitions(reference)
+        if len(definitions) < 2:
+            QMessageBox.information(
+                self, "Materials from Coefficients",
+                "Draw and segment at least two materials whose attenuation "
+                "coefficients you know (air and aluminium are ideal). They "
+                "calibrate the grey scale of each instrument.",
+            )
+            return
+        from gui.physics_dialog import PhysicsMaterialsDialog
+        dialog = PhysicsMaterialsDialog(list(definitions),
+                                        self.physics_materials, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        references, targets, problems = dialog.values()
+        if problems:
+            return
+        from model.validity import build_valid_mask
+
+        sources = {}
+        for name in references:
+            timepoint, mask = definitions[name]
+            neutron, xray = self.dataset.get_volume_at_time(timepoint)
+            sources[name] = (neutron, xray, mask,
+                             build_valid_mask(neutron, xray), timepoint)
+        previous = self.physics_materials
+        self.physics_materials = {"references": references, "targets": targets}
+        try:
+            library = self._physics_library(sources)
+        except ValueError as error:
+            self.physics_materials = previous
+            QMessageBox.warning(self, "Materials from Coefficients", str(error))
+            return
+        calibration = self.physics_calibration
+        lines = [calibration.describe(), "", "Predicted positions (neutron, X-ray):"]
+        for material in library:
+            spread = np.sqrt(np.diag(material.sigma))
+            lines.append(f"  {material.name}: ({material.mu[0]:.4g}, "
+                         f"{material.mu[1]:.4g}) ± ({spread[0]:.3g}, "
+                         f"{spread[1]:.3g})")
+        lines += ["", "They are tracked with the drawn materials from the next "
+                  "run (locked definitions). A predicted material is expected "
+                  "to be absent until it forms; the health check warns if it "
+                  "is never found."]
+        QMessageBox.information(self, "Materials from Coefficients",
+                                "\n".join(lines))
+        self._refresh_material_panel()
+        self.status_bar.showMessage(
+            f"{len(targets)} material(s) placed from attenuation coefficients")
 
     def _material_source(self, name: str) -> str:
         """Where a material came from, for the panel's second column."""
@@ -5912,6 +4519,28 @@ class BiTS4DMainWindow(QMainWindow):
         if name.startswith("Otsu"):
             return "Otsu"
         return "drawn"
+
+    def _material_definitions(self, reference):
+        """Every material and the timepoint it is defined at.
+
+        ``{name: (timepoint, mask)}``, in panel order. A material present at
+        the reference timepoint is defined there. One that is not — a phase
+        that only appears later, like a reaction product or a time-series
+        transient phase — is defined at the first timepoint where it has
+        voxels, instead of being impossible to define at all.
+        """
+        definitions = {}
+        order = [reference] + [
+            t for t in range(self.dataset.num_timepoints) if t != reference
+        ]
+        for timepoint in order:
+            for mask, _color, name in self._visible_layers(timepoint):
+                if name in definitions:
+                    continue
+                mask = np.asarray(mask, dtype=bool)
+                if mask.any():
+                    definitions[name] = (timepoint, mask)
+        return definitions
 
     def _material_reference_timepoint(self) -> int:
         """The timepoint the material definitions are taken from."""
@@ -5934,11 +4563,19 @@ class BiTS4DMainWindow(QMainWindow):
         materials = [
             {
                 "name": name,
-                "source": self._material_source(name),
+                "source": self._material_source(name) + (
+                    "" if timepoint == reference else f" (T{timepoint})"
+                ),
                 "voxels": int(np.count_nonzero(mask)),
             }
-            for mask, _color, name in self._visible_layers(reference)
+            for name, (timepoint, mask)
+            in self._material_definitions(reference).items()
         ]
+        drawn = {m["name"] for m in materials}
+        for name in (self.physics_materials or {}).get("targets", {}):
+            if name not in drawn:
+                materials.append({"name": name, "source": "coefficients",
+                                  "voxels": None})
         self.material_panel.set_materials(materials)
         self.material_panel.set_clusters_available(
             bool(self._last_kmeans_cluster_selections)
@@ -5969,7 +4606,8 @@ class BiTS4DMainWindow(QMainWindow):
 
         reference = self._material_reference_timepoint()
         masks = self._model_class_masks(reference)
-        if not masks:
+        definitions = self._material_definitions(reference)
+        if not definitions:
             QMessageBox.information(
                 self, "No Materials",
                 "Draw and segment at least one material first. The materials "
@@ -5981,7 +4619,7 @@ class BiTS4DMainWindow(QMainWindow):
         settings = self.material_panel.settings()
         # Only materials still on screen can be controls
         settings["control_materials"] = [
-            name for name in settings["control_materials"] if name in masks
+            name for name in settings["control_materials"] if name in definitions
         ]
 
         if not settings["lock_definitions"]:
@@ -6001,10 +4639,31 @@ class BiTS4DMainWindow(QMainWindow):
             if progress_callback:
                 progress_callback(2, "Reading the materials you defined...")
             valid = build_valid_mask(neutron_reference, xray_reference)
-            library = ClassLibrary.from_masks(
-                neutron_reference, xray_reference, masks,
-                valid_mask=valid, inert=settings["control_materials"],
-            )
+            # Each material from the timepoint it exists at, so a phase that
+            # appears later can still be defined and tracked
+            volumes = {reference: (neutron_reference, xray_reference, valid)}
+            sources = {}
+            for name, (timepoint, mask) in definitions.items():
+                if timepoint not in volumes:
+                    n_t, x_t = self.dataset.get_volume_at_time(timepoint)
+                    volumes[timepoint] = (n_t, x_t, build_valid_mask(n_t, x_t))
+                n_t, x_t, valid_t = volumes[timepoint]
+                sources[name] = (n_t, x_t, mask, valid_t, timepoint)
+            import warnings as _warnings
+            with _warnings.catch_warnings():
+                # Dropped classes are reported in the health check instead
+                _warnings.simplefilter("ignore")
+                library = ClassLibrary.from_sources(
+                    sources, inert=settings["control_materials"],
+                    max_components=settings.get("max_components", 1),
+                )
+            predicted = self._physics_library(sources)
+            if predicted is not None:
+                from model.calibration import merge_libraries
+                library = merge_libraries(library, predicted)
+                for material in library:
+                    if material.name in settings["control_materials"]:
+                        material.inert = True
             segmenter = LockedSegmenter(
                 library, prior=ROIDerivedMRF(beta=1.0, n_sweeps=6),
                 bins=self.histogram_engine.bins,
@@ -6015,7 +4674,8 @@ class BiTS4DMainWindow(QMainWindow):
 
             reference_labels = np.zeros(valid.shape, dtype=np.int32)
             for index, name in enumerate(library.names):
-                reference_labels[masks[name]] = index
+                if name in masks:
+                    reference_labels[masks[name]] = index
             segmenter.learn_boundaries(reference_labels, valid_mask=valid)
 
             sweep = None
@@ -6027,9 +4687,20 @@ class BiTS4DMainWindow(QMainWindow):
                     if progress_callback:
                         progress_callback(8 + int(0.25 * value), message)
 
+                # Guards are also checked where a phase that appeared later
+                # is still thin, and in the middle and at the end
+                from model.locked import smoothing_check_timepoints
+                checked = smoothing_check_timepoints(
+                    self.dataset.num_timepoints, reference,
+                    [t for t, _m in definitions.values()],
+                )
                 strength, sweep = segmenter.auto_smoothing(
                     neutron_reference, xray_reference,
                     progress_callback=sweep_progress, cancel_check=cancel_check,
+                    extra_volumes=[
+                        tuple(self.dataset.get_volume_at_time(t)) + (t,)
+                        for t in checked[1:]
+                    ],
                 )
             else:
                 strength = settings["smoothing_strength"]
@@ -6044,6 +4715,9 @@ class BiTS4DMainWindow(QMainWindow):
                 enforce_guards=False,
             )
             outcome.smoothing_sweep = sweep
+            outcome.smoothing_report = (
+                segmenter.last_smoothing_report if sweep is not None else None
+            )
             return segmenter, outcome, library
 
         title = "Preview" if preview else "Track Materials"
@@ -6387,14 +5061,14 @@ class BiTS4DMainWindow(QMainWindow):
             )
             return
 
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save Spatial Metrics", "", "CSV Files (*.csv);;All Files (*)"
+        output = ask_figure_output(
+            self, "Save Spatial Metrics", "spatial_metrics",
+            csv_label="Also save the metric values as CSV",
         )
-        if not filepath:
+        if output is None:
             return
-        if not filepath.lower().endswith(".csv"):
-            filepath += ".csv"
-        plot_path = filepath[:-4] + "_evolution.png"
+        filepath = str(output.data_path()) if output.save_csv else None
+        plot_path = str(output.figure_path)
 
         def operation(progress_callback=None, cancel_check=None):
             if progress_callback:
@@ -6403,12 +5077,13 @@ class BiTS4DMainWindow(QMainWindow):
             info, scalars, per_class = combined_registry()
             if progress_callback:
                 progress_callback(85, "Writing CSV and plot...")
-            write_metrics_csv(
-                rows, filepath, metric_info=info,
-                scalar_metrics=scalars, per_class_metrics=per_class,
-            )
+            if filepath:
+                write_metrics_csv(
+                    rows, filepath, metric_info=info,
+                    scalar_metrics=scalars, per_class_metrics=per_class,
+                )
             saved = plot_metric_evolution(
-                rows, plot_path, metric_info=info,
+                rows, plot_path, dpi=output.dpi, metric_info=info,
                 scalar_metrics=scalars, per_class_metrics=per_class,
             )
             return rows, saved
@@ -6424,43 +5099,76 @@ class BiTS4DMainWindow(QMainWindow):
             return
 
         rows, saved_plot = result
-        message = f"Spatial metrics written to:\n{filepath}\n\n"
+        message = (f"Spatial metric values written to:\n{filepath}\n\n"
+                   if filepath else "")
         message += f"{len(rows)} timepoint(s) measured."
         if saved_plot:
             message += f"\n\nEvolution plot:\n{saved_plot}"
         else:
             message += "\n\n(No evolution plot — it needs at least 2 timepoints.)"
-        self.status_bar.showMessage(f"Spatial metrics saved: {filepath}")
+        self.status_bar.showMessage(
+            f"Spatial metrics saved: {saved_plot or filepath or 'nothing written'}"
+        )
         QMessageBox.information(self, "Spatial Metrics Saved", message)
+
+    @staticmethod
+    def _joint_evolution_renderer(reference_mode):
+        """Save the joint-histogram panels, and optionally their data: a
+        per-timepoint summary CSV and a per-bin CSV (``_bins``)."""
+        def render(histograms, output):
+            from utils.histogram_evolution import (
+                save_histogram_evolution_image, write_evolution_csv,
+            )
+            written = [save_histogram_evolution_image(
+                histograms, str(output.figure_path), dpi=output.dpi,
+                reference_mode=reference_mode,
+            )]
+            if output.save_csv:
+                written += write_evolution_csv(
+                    histograms, output.data_path(), output.data_path("_bins"),
+                    reference_mode=reference_mode,
+                )
+            return written
+        return render
+
+    @staticmethod
+    def _marginal_evolution_renderer(reference_mode):
+        """Save the marginal kymographs, and optionally their data."""
+        def render(histograms, output):
+            from utils.histogram_evolution import (
+                save_marginal_evolution_image, write_marginal_csv,
+            )
+            written = [save_marginal_evolution_image(
+                histograms, str(output.figure_path), dpi=output.dpi,
+                reference_mode=reference_mode,
+            )]
+            if output.save_csv:
+                written.append(write_marginal_csv(
+                    histograms, output.data_path(), reference_mode=reference_mode,
+                ))
+            return written
+        return render
 
     def _on_export_histogram_evolution(self):
         """Save each timepoint's log-histogram change against T0."""
-        from utils.histogram_evolution import (
-            REFERENCE_FIRST, save_histogram_evolution_image,
-        )
+        from utils.histogram_evolution import REFERENCE_FIRST
 
         self._run_histogram_time_analysis(
             "Histogram Evolution",
-            "Save Histogram Evolution Image",
-            lambda histograms, path: save_histogram_evolution_image(
-                histograms, path, reference_mode=REFERENCE_FIRST
-            ),
+            "Save Histogram Evolution",
+            self._joint_evolution_renderer(REFERENCE_FIRST),
             "Red areas gained voxels relative to T0, blue areas lost them "
             "(log scale). This is the cumulative drift from the start.",
         )
 
     def _on_export_histogram_increment(self):
         """Save each timepoint's log-histogram change against the previous one."""
-        from utils.histogram_evolution import (
-            REFERENCE_PREVIOUS, save_histogram_evolution_image,
-        )
+        from utils.histogram_evolution import REFERENCE_PREVIOUS
 
         self._run_histogram_time_analysis(
             "Incremental Histogram Change",
-            "Save Incremental Histogram Change Image",
-            lambda histograms, path: save_histogram_evolution_image(
-                histograms, path, reference_mode=REFERENCE_PREVIOUS
-            ),
+            "Save Incremental Histogram Change",
+            self._joint_evolution_renderer(REFERENCE_PREVIOUS),
             "Each panel compares a timepoint with the one before it, so the "
             "steps where change actually happens stand out instead of being "
             "buried in cumulative drift.",
@@ -6468,16 +5176,12 @@ class BiTS4DMainWindow(QMainWindow):
 
     def _on_export_marginal_evolution(self):
         """Save marginal kymographs of each modality against T0."""
-        from utils.histogram_evolution import (
-            REFERENCE_FIRST, save_marginal_evolution_image,
-        )
+        from utils.histogram_evolution import REFERENCE_FIRST
 
         self._run_histogram_time_analysis(
             "Marginal Evolution",
-            "Save Marginal Evolution Image",
-            lambda histograms, path: save_marginal_evolution_image(
-                histograms, path, reference_mode=REFERENCE_FIRST
-            ),
+            "Save Marginal Evolution",
+            self._marginal_evolution_renderer(REFERENCE_FIRST),
             "Each panel stacks one modality's 1-D histogram against time "
             "(log2 vs T0). Red intensity bands grew, blue bands shrank — "
             "this separates a shift in neutron from a shift in X-ray.",
@@ -6485,16 +5189,12 @@ class BiTS4DMainWindow(QMainWindow):
 
     def _on_export_marginal_increment(self):
         """Save marginal kymographs comparing each timepoint with the previous."""
-        from utils.histogram_evolution import (
-            REFERENCE_PREVIOUS, save_marginal_evolution_image,
-        )
+        from utils.histogram_evolution import REFERENCE_PREVIOUS
 
         self._run_histogram_time_analysis(
             "Incremental Marginal Change",
-            "Save Incremental Marginal Change Image",
-            lambda histograms, path: save_marginal_evolution_image(
-                histograms, path, reference_mode=REFERENCE_PREVIOUS
-            ),
+            "Save Incremental Marginal Change",
+            self._marginal_evolution_renderer(REFERENCE_PREVIOUS),
             "Each column compares a timepoint with the one before it, so the "
             "steps where an intensity band actually moves stand out. T0 is "
             "blank because it has no predecessor.",
@@ -6839,6 +5539,8 @@ class BiTS4DMainWindow(QMainWindow):
         canvas = FigureCanvasQTAgg(fig)
         layout.addWidget(canvas)
         
+        plotted = []  # (name, timepoints, values) currently drawn
+
         def do_plot():
             selected_names = [name for cb, name in checkboxes if cb.isChecked()]
             
@@ -6846,6 +5548,7 @@ class BiTS4DMainWindow(QMainWindow):
                 return
             
             ax.clear()
+            plotted.clear()
             
             for name in selected_names:
                 timepoints, values = self.time_series_analyzer.get_time_series(
@@ -6854,6 +5557,7 @@ class BiTS4DMainWindow(QMainWindow):
                 
                 if len(timepoints) > 0:
                     ax.plot(timepoints, values, 'o-', label=name, linewidth=2)
+                    plotted.append((name, timepoints, values))
             
             ax.set_xlabel('Timepoint')
             ax.set_ylabel('Neutron Mean Intensity')
@@ -6864,6 +5568,38 @@ class BiTS4DMainWindow(QMainWindow):
             canvas.draw()
         
         plot_btn.clicked.connect(do_plot)
+
+        save_btn = QPushButton("💾 Save Figure...")
+        save_btn.setToolTip(
+            "Save the plot (SVG, PDF, PNG or TIFF) and, optionally, the\n"
+            "plotted values as CSV."
+        )
+
+        def do_save():
+            if not plotted:
+                do_plot()
+            if not plotted:
+                return
+            output = ask_figure_output(
+                dialog, "Save Time Series Plot", "time_series",
+                csv_label="Also save the plotted values as CSV",
+            )
+            if output is None:
+                return
+            from utils.figure_io import save_figure, write_csv
+            written = [save_figure(fig, output.figure_path, output.dpi)]
+            if output.save_csv:
+                written.append(write_csv(
+                    output.data_path(),
+                    ("selection", "timepoint", "neutron_mean"),
+                    ((name, int(t), float(v))
+                     for name, times, values in plotted
+                     for t, v in zip(times, values)),
+                ))
+            self.status_bar.showMessage("Saved: " + ", ".join(written))
+
+        save_btn.clicked.connect(do_save)
+        layout.addWidget(save_btn)
         
         dialog.setLayout(layout)
         dialog.exec_()

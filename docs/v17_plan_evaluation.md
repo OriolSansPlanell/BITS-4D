@@ -68,9 +68,12 @@ classifier being replaced. This is stated plainly in the plan and it is right.
 **Drift tracking on inert anchors is the core of the answer** to improving
 time-series segmentation, and it works: on a synthetic series where the
 histogram drifts by a full class spacing, a frozen boundary loses a class
-entirely by the fourth timepoint (Air → 0 voxels, absorbed into Aluminium),
-while the anchored model tracks all three classes to within a handful of
-voxels — including a genuine shrinkage that is *not* drift.
+entirely from the third timepoint on (T2: Air → 0 voxels, absorbed into
+Aluminium), while the anchored model tracks all three classes to within 1%
+— including a genuine shrinkage that is *not* drift. Reproduced by
+`tests/test_model_segmentation.py::test_frozen_boundary_loses_air_as_documented`.
+The 3-D phantom benchmark (`docs/validation.md`), whose drift is a gain
+change rather than a shift, does **not** show the same collapse; see there.
 
 ## 3. Corrections made
 
@@ -148,11 +151,14 @@ Two further additions the plan does not call for:
   per-voxel rejection at the output. For a method whose whole purpose is
   tracking drift, the honest failure mode is saying "I don't recognise this",
   so labels carry `-1` for voxels no class claims.
-- **A memory-scalable MRF.** The plan says "chunked over z", but mean-field
-  needs a `[Z, Y, X, K]` responsibility array — 1.4 GB for 38 M voxels and 9
-  classes, before temporaries. An ICM solver is provided that keeps hard
-  labels instead and costs ~9 bytes per voxel *regardless of K*; `refine`
-  picks between them from a memory budget.
+- **A memory-scalable MRF.** The plan says "chunked over z"; mean-field
+  needs a `[Z, Y, X, K]` responsibility array and its temporaries. An ICM
+  solver keeps hard labels instead, and — added later — both solvers run in
+  z-slabs with a halo of `n_sweeps + 1` slices, giving labels identical to a
+  whole-volume pass. `refine` plans the pass from a memory budget. *(The
+  figures first given here, `K × 4` and 9 bytes per voxel, were estimates;
+  measured peaks are ≈ `32·K + 30` and ≈ 75 bytes per voxel — see
+  `python -m validation.scaling` and docs/validation.md.)*
 
 Two smaller corrections found while testing:
 

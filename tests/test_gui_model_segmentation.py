@@ -288,6 +288,8 @@ def test_spatial_metrics_export(window, monkeypatch, tmp_path):
     window._segment_all_volumes()
 
     target = tmp_path / "spatial.csv"
+    from gui.figure_save_dialog import FigureSaveDialog
+    monkeypatch.setattr(FigureSaveDialog, "exec_", lambda self: QDialog.Accepted)
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName",
         staticmethod(lambda *a, **k: (str(target), "")),
@@ -301,7 +303,7 @@ def test_spatial_metrics_export(window, monkeypatch, tmp_path):
     assert {"com_z_k", "rg_k", "n_components_k", "sa_vol_k"} <= metrics
     classes = {record["class"] for record in records if record["class"]}
     assert {"Matrix", "Deposit"} <= classes
-    assert (tmp_path / "spatial_evolution.png").exists()
+    assert (tmp_path / "spatial.svg").exists()
 
 
 def test_spatial_metrics_need_a_segmentation(window, monkeypatch):
@@ -312,3 +314,29 @@ def test_spatial_metrics_need_a_segmentation(window, monkeypatch):
     )
     window._on_export_spatial_metrics()
     assert shown and "Segment at least one timepoint" in shown[-1]
+
+
+def test_materials_placed_from_coefficients_are_tracked(window, monkeypatch):
+    from gui.physics_dialog import PhysicsMaterialsDialog
+
+    _segment_two_classes(window, monkeypatch)
+
+    def fill_in(dialog):
+        # Grey = 500 · μ in both modalities for this synthetic data
+        dialog.set_reference("Matrix", 1.0, 1.0)
+        dialog.set_reference("Deposit", 2.2, 2.2)
+        dialog.add_target("Film", 3.0, 3.0)
+        return QDialog.Accepted
+
+    monkeypatch.setattr(PhysicsMaterialsDialog, "exec_", fill_in)
+    window._on_physics_materials()
+    assert window.physics_materials["targets"] == {"Film": (3.0, 3.0)}
+    np.testing.assert_allclose(window.physics_calibration.gain, (500, 500),
+                               rtol=0.05)
+    assert "Film" in window.material_panel.material_names()
+
+    _configure_panel(window)
+    window._on_model_segmentation()
+    assert "Film" in window.model_result.class_names
+    library = window.model_result.library
+    assert library[library.index_of("Film")].source == "physics"

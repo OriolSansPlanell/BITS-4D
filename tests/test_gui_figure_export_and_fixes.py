@@ -117,7 +117,7 @@ def test_export_action_writes_the_file(window, monkeypatch, tmp_path):
     _save_class(window, monkeypatch, "Lithium")
     monkeypatch.setattr(
         main_window.FigureExportDialog, "exec_",
-        lambda self: (self._on_accept(), QDialog.Accepted)[1],
+        lambda self: QDialog.Accepted,
     )
     target = tmp_path / "figure.svg"
     monkeypatch.setattr(

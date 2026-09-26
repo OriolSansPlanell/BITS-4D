@@ -46,6 +46,34 @@ It answers three questions:
 Read this before anything else. It is cheap and it decides whether the rest
 of the numbers mean anything.
 
+### Check alignment
+
+*Analytics → Time Series Segmentation → Check Alignment…* The bivariate
+histogram pairs each neutron voxel with the X-ray voxel at the same index,
+so it assumes the two volumes are co-registered. If they are offset by even
+one voxel, every interface pairs two different materials: the clouds smear
+towards each other and a thin phase can vanish. On the synthetic validation
+a one-voxel offset costs 0.08 mean Dice and almost a third of the thin
+phase's accuracy ([validation.md](validation.md)).
+
+The check measures the offset of the X-ray volume at the first, middle and
+last timepoints by maximising the mutual information of the two volumes
+(the modalities have different contrast, so their dependence is compared,
+not their values). An axis along which the sample has no structure is
+reported as unmeasurable rather than guessed. If a whole-voxel offset is
+found, it offers to correct it — once for the series if the offset is
+constant (a mounting offset), per timepoint if it changes (something
+moved). The correction moves the X-ray volumes by whole voxels, in memory
+only; the vacated edge is treated as unmeasured. A sub-voxel remainder is
+reported but not interpolated: resampling averages away X-ray noise, which
+on the validation phantom cost more accuracy than the half-voxel offset
+itself.
+
+Only a rigid translation is measured. Rotation, scaling or deformation
+between the instruments need a registration tool (elastix, ANTs) before
+loading; resampling a volume scanned at a different resolution onto the
+other's grid is `model.registration.resample_to_shape`.
+
 ## 3. Define materials
 
 Draw a rectangle or polygon on the global histogram — neutron on the x-axis,
@@ -95,6 +123,46 @@ each cluster's share of the sample over time. A large instrument drift can
 look like a new phase, so run *Check Instrument Stability* when one appears
 unexpectedly.
 
+### Phases that appear during the experiment
+
+A material does not have to exist at the first timepoint. If its region
+selects nothing at the reference timepoint — a reaction product that has not
+formed yet, a layer still thinner than the region — it is defined at the
+first timepoint where it has voxels, and the panel shows that timepoint next
+to its source ("drawn (T3)"). The health check then expects it to be absent
+before, and says so. A material that cannot be defined anywhere is **not
+dropped silently**: the run goes ahead without it and the health check
+fails, naming it and why.
+
+### Materials from attenuation coefficients
+
+For a phase you cannot draw at all, *Analytics → Time Series Segmentation →
+Add Materials from Attenuation Coefficients…* places it from its neutron and
+X-ray attenuation coefficients. Tick two (or more) materials you have drawn
+whose coefficients you know — air and aluminium are ideal — and enter theirs;
+they fix a straight line from coefficient to grey value for each instrument.
+Then list the materials to place. Their spread is taken from the reference
+materials (it is a property of the instrument, not the material). The
+calibration and the predicted positions are shown before anything runs.
+
+Enter X-ray coefficients at the effective energy of your spectrum — the
+prediction is only as good as that number. On the validation phantom a
+predicted phase scored within 0.04 Dice of a drawn one with exact
+coefficients, and lost a further 0.1 with coefficients 15% off
+([validation.md](validation.md)). A predicted material that is never found
+is a warning in the health check.
+
+### Irregular material shapes
+
+By default each material is described by a single elliptical cloud. Tick
+*Allow irregular material shapes* on the Materials tab when a material
+occupies more than one place on the histogram — two states of the same
+phase, or a cloud bent by an artefact — and its single ellipse would cover a
+neighbour. Each material then gets as many sub-clouds (up to three) as its
+own voxels justify (by the Bayesian information criterion); a material that
+is one cloud stays one cloud, so ticking it costs nothing when it is not
+needed.
+
 ## 4. Mark control materials
 
 On the **🧱 Materials** tab every material is listed with where it came from,
@@ -136,8 +204,26 @@ Leave **Smoothing strength** on **Auto**. Smoothing uses neighbouring voxels
 to clean up noisy assignments, and it is the one setting that can destroy a
 result invisibly: too strong and a small material is simply erased, with
 everything downstream still looking healthy. Auto does not guess — it tries a
-range and keeps the strongest setting that costs no material any of its
-volume, and shows you the sweep it used.
+range and applies three rules:
+
+- **no material may lose volume** to smoothing, and **no thin sheet may be
+  eroded** (a structure one or two voxels thick keeps at least 80% of
+  itself);
+- these are checked at the reference timepoint **and** where phases that
+  appear later are still thin, and in the middle and at the end of the
+  series;
+- among the settings that pass, it stops at the first one after which **more
+  smoothing changes almost nothing** (under 0.2% of voxels). If the labels
+  are still changing at the top of the range, the range is extended; if they
+  never settle, the health check warns that the chosen value sits at the
+  ceiling.
+
+The chosen value, the reason, and how much the labels would change at the
+next setting are reported with the results. On the validation phantom the
+accuracy is flat over a wide range of settings, so the choice is not
+fragile; at high noise the thin-sheet rule holds smoothing back to protect a
+one-voxel layer, at a small cost to the thicker parts
+([validation.md](validation.md)).
 
 ## 7. Run the series
 
@@ -157,7 +243,9 @@ sentences. Each failure names the material involved and what to do:
 
 | Check | What a failure means |
 | --- | --- |
-| every material present at every timepoint | Something vanished. The report says whether smoothing did it. |
+| materials defined | A material could not be defined from its region anywhere, and is missing from the results. |
+| every material present at every timepoint | Something vanished. The report says whether smoothing did it. A material defined at a later timepoint, or placed from coefficients, is expected to be absent before it forms. |
+| smoothing strength | How the value was chosen; a warning if the labels were still changing at the top of the tested range. |
 | control materials stable | A material you said would not change, changed. Something is wrong with the segmentation. |
 | unmatched voxels | Voxels that matched nothing. Either a material is missing, or the measurement has drifted. |
 | voxel budget | Every voxel counted exactly once. A failure here is a bug — please report it. |

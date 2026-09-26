@@ -16,12 +16,26 @@ mixture prior.
 
 Two solvers, chosen by memory
 ─────────────────────────────
-Mean-field keeps a full ``[Z, Y, X, K]`` responsibility array, which is
-K × 4 bytes per voxel — around 1.4 GB for a 38-million-voxel volume with 9
-classes, before temporaries. ICM keeps hard labels instead and costs about
-9 bytes per voxel *regardless of K*, at the price of a coarser, greedier
-optimum. :meth:`ROIDerivedMRF.refine` picks between them from a memory
-budget unless told which to use.
+Mean-field keeps a full ``[Z, Y, X, K]`` responsibility array and several
+of its kind while it updates: measured peak ≈ ``32·K + 30`` bytes per voxel
+(``python -m validation.scaling``) — about 11 GB for a 38-million-voxel
+volume with 9 classes. ICM keeps hard labels instead: ≈ 75 bytes per voxel
+*regardless of K*, at the price of a coarser, greedier optimum.
+:meth:`ROIDerivedMRF.refine` picks between them from a memory budget unless
+told which to use.
+
+Chunking
+────────
+Both solvers update every voxel from its neighbours' previous state
+(synchronous sweeps), so after ``n`` sweeps a voxel depends only on voxels
+within ``n`` steps of it. A volume that does not fit is therefore refined
+in slabs along z, each padded with ``n_sweeps + 1`` extra slices on either
+side (the halo) that are computed and thrown away. Edge weights and their
+scale are computed once for the whole volume, so the labels are *identical*
+to an unchunked run — only the peak memory changes. With a lazy
+:class:`UnaryScores` input, the volume-wide cost falls to the 4-byte label
+output; the ``32·K + 30`` bytes apply to the slab (plus its halo) only, so
+mean-field stays the default solver on volumes of any size.
 """
 
 from __future__ import annotations
@@ -33,6 +47,11 @@ import numpy as np
 
 # 6-connectivity: one entry per positive axis direction
 _AXES = (0, 1, 2)
+
+#: Measured peak bytes per voxel (validation/scaling.py, float32 scores)
+MEAN_FIELD_BYTES_PER_CLASS = 32
+MEAN_FIELD_BYTES_FIXED = 30
+ICM_BYTES = 75
 FORBIDDEN_COST = 1e3
 
 
@@ -44,12 +63,15 @@ class MRFDiagnostics:
     energy: float
     energy_trace: list = None
     monotone: bool = True
+    chunks: int = 1
 
     def describe(self) -> str:
         text = (
             f"{self.method}, {self.sweeps} sweeps, "
             f"{100 * self.changed_fraction:.2f}% of voxels changed on the last"
         )
+        if self.chunks > 1:
+            text += f" (in {self.chunks} slabs)"
         if not self.monotone:
             text += " — WARNING: cost did not fall monotonically"
         return text
@@ -104,6 +126,10 @@ class UnaryScores:
 
     def valid_mask(self) -> np.ndarray:
         return self._known
+
+    def slab(self, start: int, stop: int) -> "UnaryScores":
+        """The same scores for slices ``start:stop`` (the table is shared)."""
+        return UnaryScores(self.table, self.row_index[start:stop], self.fill)
 
 
 class ROIDerivedMRF:
@@ -247,60 +273,130 @@ class ROIDerivedMRF:
                 self.forbid(int(component), other, cost)
 
     # ── edge weights ─────────────────────────────────────────────────────
-    def _edge_weights(self, neutron, xray) -> Optional[list]:
-        """Per-axis contrast-sensitive weights, or None for plain geometry."""
+    def _edge_parameters(self, neutron, xray, slab: int = 32):
+        """``(scales, sigma)`` of the contrast-sensitive weights, or None.
+
+        *scales* put both modalities on a comparable footing (each one's
+        standard deviation); *sigma* is the mean normalised gap between
+        face neighbours unless ``contrast_sigma`` fixes it. Both are
+        accumulated slab by slab, so no volume-sized temporary is made and a
+        chunked refinement uses exactly the numbers a whole-volume one does.
+        """
         if self.contrast_sigma is not None and self.contrast_sigma == 0:
             return None
         if neutron is None or xray is None:
             return None
-
-        first = np.asarray(neutron, dtype=np.float32)
-        second = np.asarray(xray, dtype=np.float32)
-        # Put both modalities on a comparable scale so neither dominates
-        weights = []
+        volumes = (neutron, xray)
+        depth = np.shape(neutron)[0]
         scales = []
-        for volume in (first, second):
-            finite = volume[np.isfinite(volume)]
-            spread = float(np.std(finite)) if finite.size else 1.0
+        for volume in volumes:
+            total, count = 0.0, 0
+            for start in range(0, depth, slab):
+                part = np.asarray(volume[start:start + slab], dtype=np.float64)
+                finite = part[np.isfinite(part)]
+                total += float(finite.sum())
+                count += finite.size
+            mean = total / count if count else 0.0
+            squares = 0.0
+            for start in range(0, depth, slab):
+                part = np.asarray(volume[start:start + slab], dtype=np.float64)
+                finite = part[np.isfinite(part)]
+                squares += float(np.square(finite - mean).sum())
+            spread = float(np.sqrt(squares / count)) if count else 1.0
             scales.append(spread if spread > 0 else 1.0)
 
-        differences = []
-        for axis in _AXES:
-            if first.shape[axis] < 2:
-                differences.append(None)
-                continue
-            delta = np.zeros(first.shape, dtype=np.float32)
-            slicer_low = [slice(None)] * 3
-            slicer_high = [slice(None)] * 3
-            slicer_low[axis] = slice(0, -1)
-            slicer_high[axis] = slice(1, None)
-            gap_first = (first[tuple(slicer_high)] - first[tuple(slicer_low)]) / scales[0]
-            gap_second = (second[tuple(slicer_high)] - second[tuple(slicer_low)]) / scales[1]
-            delta[tuple(slicer_low)] = np.sqrt(gap_first ** 2 + gap_second ** 2)
-            differences.append(delta)
-
-        finite_gaps = np.concatenate([
-            d[np.isfinite(d)].ravel() for d in differences if d is not None
-        ]) if any(d is not None for d in differences) else np.zeros(1, np.float32)
         sigma = self.contrast_sigma
         if sigma is None:
-            # Mean gap is a scale-free, outlier-tolerant default
-            sigma = float(np.mean(finite_gaps)) if finite_gaps.size else 1.0
-        sigma = max(float(sigma), 1e-6)
+            shape = np.shape(neutron)
+            total, count = 0.0, 0
+            for axis in _AXES:
+                if shape[axis] < 2:
+                    continue
+                # The last layer along each axis has no forward neighbour and
+                # counts as a zero gap (as it always has)
+                count += int(np.prod(shape)) // shape[axis]
+                for start in range(0, depth, slab):
+                    stop = min(start + slab + (1 if axis == 0 else 0), depth)
+                    gaps = _normalised_gaps(neutron[start:stop], xray[start:stop],
+                                            scales, axis)
+                    if gaps is None:
+                        continue
+                    finite = gaps[np.isfinite(gaps)]
+                    total += float(finite.sum(dtype=np.float64))
+                    count += finite.size
+            sigma = total / count if count else 1.0
+        return scales, max(float(sigma), 1e-6)
 
-        for delta in differences:
-            if delta is None:
+    def _edge_weights(self, neutron, xray, parameters="auto") -> Optional[list]:
+        """Per-axis contrast-sensitive weights, or None for plain geometry.
+
+        ``weights[axis][i]`` weighs the face between voxel ``i`` and its
+        forward neighbour along *axis* (0 on the last layer). A face touching
+        an unmeasured voxel gets weight 0: it carries no evidence.
+        """
+        if isinstance(parameters, str):
+            parameters = self._edge_parameters(neutron, xray)
+        if parameters is None or neutron is None or xray is None:
+            return None
+        scales, sigma = parameters
+        weights = []
+        shape = np.shape(neutron)
+        for axis in _AXES:
+            if shape[axis] < 2:
                 weights.append(None)
-            else:
-                weights.append(
-                    np.exp(-0.5 * np.square(delta / sigma, dtype=np.float32))
-                )
+                continue
+            weight = np.zeros(shape, dtype=np.float32)
+            low = [slice(None)] * 3
+            low[axis] = slice(0, -1)
+            gaps = _normalised_gaps(neutron, xray, scales, axis)
+            gaps /= np.float32(sigma)
+            np.square(gaps, out=gaps)
+            gaps *= np.float32(-0.5)
+            np.exp(gaps, out=gaps)
+            weight[tuple(low)] = np.nan_to_num(gaps, nan=0.0)
+            weights.append(weight)
         return weights
 
     # ── inference ────────────────────────────────────────────────────────
+    @staticmethod
+    def mean_field_bytes_per_voxel(n_classes: int) -> int:
+        return MEAN_FIELD_BYTES_PER_CLASS * n_classes + MEAN_FIELD_BYTES_FIXED
+
     def estimate_memory_gb(self, n_voxels: int, n_classes: int) -> float:
-        """Mean-field peak memory, in GiB (two float32 [V, K] arrays)."""
-        return 2.0 * n_voxels * n_classes * 4 / (1024 ** 3)
+        """Mean-field peak memory on *n_voxels*, in GiB (measured model)."""
+        return (n_voxels * self.mean_field_bytes_per_voxel(n_classes)
+                / (1024 ** 3))
+
+    @property
+    def halo(self) -> int:
+        """Slices of padding that make a slab's result exact."""
+        return self.n_sweeps + 1
+
+    def plan_slabs(self, shape, n_classes: int) -> Tuple[str, Optional[int]]:
+        """``(method, slab_thickness)`` for a volume under the budget.
+
+        Mean-field on the whole volume if it fits; otherwise mean-field on
+        z-slabs as thick as the budget allows (at least as thick as the halo,
+        or the padding would cost more than the slab); otherwise ICM, in
+        slabs if even its ~75 bytes per voxel do not fit. ``None`` means no
+        chunking.
+        """
+        depth = int(shape[0])
+        per_slice = int(np.prod(shape[1:]))
+        budget = self.memory_budget_gb * 1024 ** 3
+        if self.estimate_memory_gb(depth * per_slice, n_classes) <= self.memory_budget_gb:
+            return "mean_field", None
+        # The label output (4 B per voxel) is volume-wide; the rest per slab
+        budget_for_slabs = budget - 4 * depth * per_slice
+        rows = int(budget_for_slabs // (self.mean_field_bytes_per_voxel(n_classes)
+                                        * per_slice)) - 2 * self.halo
+        if rows >= max(1, self.halo):
+            return "mean_field", rows
+        icm_bytes = ICM_BYTES * per_slice
+        if icm_bytes * depth <= budget:
+            return "icm", None
+        rows = int(budget // icm_bytes) - 2 * self.halo
+        return "icm", (rows if rows >= 1 else None)
 
     def refine(
         self,
@@ -311,13 +407,15 @@ class ROIDerivedMRF:
         method: str = "auto",
         initial_labels=None,
         cancel_check=None,
+        slab_thickness: Optional[int] = None,
     ) -> Tuple[np.ndarray, MRFDiagnostics]:
         """Regularise per-voxel unary scores into a coherent labelling.
 
         *log_unary* is ``[Z, Y, X, K]``: the log of the mixture posterior (or
         any per-voxel score) before spatial smoothing. Returns
         ``(labels, diagnostics)`` where labels are ``int32`` and ``-1`` marks
-        an invalid voxel.
+        an invalid voxel. *slab_thickness* forces chunking along z (see the
+        module notes); ``"auto"`` also chooses it from the memory budget.
         """
         if isinstance(log_unary, UnaryScores):
             scores = log_unary
@@ -339,10 +437,18 @@ class ROIDerivedMRF:
             None if valid_mask is None else np.asarray(valid_mask, dtype=bool)
         )
         if method == "auto":
-            budget = self.estimate_memory_gb(int(np.prod(shape)), n_classes)
-            method = "mean_field" if budget <= self.memory_budget_gb else "icm"
+            method, planned = self.plan_slabs(shape, n_classes)
+            if slab_thickness is None:
+                slab_thickness = planned
 
-        weights = self._edge_weights(neutron, xray)
+        chunked = (slab_thickness is not None
+                   and 0 < slab_thickness < shape[0])
+        parameters = None
+        weights = None
+        if self.beta > 0 and self.n_sweeps > 0:
+            parameters = self._edge_parameters(neutron, xray)
+            if not chunked:
+                weights = self._edge_weights(neutron, xray, parameters)
         if self.beta <= 0 or self.n_sweeps <= 0:
             labels = _argmax_scores(scores).astype(np.int32)
             if valid is not None:
@@ -350,19 +456,19 @@ class ROIDerivedMRF:
             return labels, MRFDiagnostics(method="none", sweeps=0,
                                           changed_fraction=0.0, energy=float("nan"))
 
-        if method == "mean_field":
-            dense = scores.dense() if isinstance(scores, UnaryScores) else scores
-            labels, changed, trace = self._mean_field(
-                dense, weights, valid, cancel_check
-            )
-        elif method == "icm":
-            labels, changed, trace = self._icm(
-                scores, weights, valid, initial_labels, cancel_check
-            )
-        else:
+        if method not in ("mean_field", "icm"):
             raise ValueError(f"Unknown method {method!r}")
-
-        energy = self._energy(scores, labels, weights, valid)
+        chunks = 1
+        if chunked:
+            labels, changed, trace, chunks = self._refine_in_slabs(
+                method, scores, neutron, xray, parameters, valid,
+                initial_labels, cancel_check, int(slab_thickness))
+            # The last sweep's energy is the energy of these labels
+            energy = trace[-1] if trace else float("nan")
+        else:
+            labels, changed, trace = self._solve(
+                method, scores, weights, valid, initial_labels, cancel_check)
+            energy = self._energy(scores, labels, weights, valid)
         # The total cost should fall every sweep. If it rises, the refinement
         # is cycling rather than settling, and any result it produces is an
         # arbitrary point in that cycle rather than an answer.
@@ -376,8 +482,59 @@ class ROIDerivedMRF:
         return labels, MRFDiagnostics(
             method=method, sweeps=self.n_sweeps,
             changed_fraction=changed, energy=energy,
-            energy_trace=trace, monotone=monotone,
+            energy_trace=trace, monotone=monotone, chunks=chunks,
         )
+
+    def _solve(self, method, scores, weights, valid, initial_labels,
+               cancel_check, core=None):
+        if method == "mean_field":
+            dense = scores.dense() if isinstance(scores, UnaryScores) else scores
+            return self._mean_field(dense, weights, valid, cancel_check, core)
+        return self._icm(scores, weights, valid, initial_labels, cancel_check,
+                         core)
+
+    def _refine_in_slabs(self, method, scores, neutron, xray, parameters,
+                         valid, initial_labels, cancel_check, thickness):
+        """Run the solver slab by slab; each slab's core is exact.
+
+        Returns the same ``(labels, changed, trace)`` as an unchunked run
+        (up to floating-point summation order in the energies), plus the
+        number of slabs.
+        """
+        depth = scores.shape[0]
+        halo = self.halo
+        labels = np.empty(scores.shape[:3], dtype=np.int32)
+        changed_voxels = 0.0
+        trace = None
+        chunks = 0
+        for start in range(0, depth, thickness):
+            stop = min(start + thickness, depth)
+            low, high = max(0, start - halo), min(depth, stop + halo)
+            part = (scores.slab(low, high) if isinstance(scores, UnaryScores)
+                    else scores[low:high])
+            # Weights for the slab (one extra slice gives the faces of its
+            # last layer), from the volume-wide scale
+            part_weights = None
+            if parameters is not None:
+                extra = min(high + 1, depth)
+                part_weights = [
+                    None if w is None else w[:high - low]
+                    for w in self._edge_weights(neutron[low:extra],
+                                                xray[low:extra], parameters)
+                ]
+            part_valid = None if valid is None else valid[low:high]
+            part_initial = (None if initial_labels is None
+                            else np.asarray(initial_labels)[low:high])
+            core = (start - low, stop - low)
+            result, changed, part_trace = self._solve(
+                method, part, part_weights, part_valid, part_initial,
+                cancel_check, core)
+            labels[start:stop] = result[core[0]:core[1]]
+            changed_voxels += changed * (stop - start)
+            trace = (list(part_trace) if trace is None else
+                     [a + b for a, b in zip(trace, part_trace)])
+            chunks += 1
+        return labels, changed_voxels / depth, trace or [], chunks
 
     # ── solvers ──────────────────────────────────────────────────────────
     def _neighbour_message(self, responsibilities, weights):
@@ -403,7 +560,8 @@ class ROIDerivedMRF:
                 total[high_key] += backward
         return total
 
-    def _mean_field(self, scores, weights, valid, cancel_check):
+    def _mean_field(self, scores, weights, valid, cancel_check, core=None):
+        region = _core_slice(core)
         pairwise = self.pairwise.astype(np.float32)
         responsibilities = _softmax(scores)
         if valid is not None:
@@ -430,17 +588,19 @@ class ROIDerivedMRF:
             if valid is not None:
                 responsibilities[~valid] = 0.0
             current = np.argmax(responsibilities, axis=3)
-            changed = float(np.mean(current != previous))
+            changed = float(np.mean(current[region] != previous[region]))
             previous = current
             trace.append(self._energy(scores, _mask_labels(current, valid),
-                                      weights, valid))
+                                      weights, valid, core))
 
         labels = previous.astype(np.int32)
         if valid is not None:
             labels[~valid] = -1
         return labels, changed, trace
 
-    def _icm(self, scores, weights, valid, initial_labels, cancel_check):
+    def _icm(self, scores, weights, valid, initial_labels, cancel_check,
+             core=None):
+        region = _core_slice(core)
         pairwise = self.pairwise.astype(np.float32)
         n_classes = scores.shape[3]
         column = (
@@ -486,21 +646,32 @@ class ROIDerivedMRF:
                 improved = candidate > best_score
                 best_score = np.where(improved, candidate, best_score)
                 best_label = np.where(improved, k, best_label)
-            changed = float(np.mean(best_label != labels))
+            changed = float(np.mean(best_label[region] != labels[region]))
             labels = best_label.astype(np.int32)
             trace.append(
-                self._energy(scores, _mask_labels(labels, valid), weights, valid)
+                self._energy(scores, _mask_labels(labels, valid), weights,
+                             valid, core)
             )
 
         if valid is not None:
             labels[~valid] = -1
         return labels, changed, trace
 
-    def _energy(self, scores, labels, weights, valid) -> float:
-        """Total energy of a labelling — lower is better."""
+    def _energy(self, scores, labels, weights, valid, core=None) -> float:
+        """Total energy of a labelling — lower is better.
+
+        With *core* ``(start, stop)`` only the unary terms of slices
+        ``start:stop`` count, and the pair terms whose lower voxel lies
+        there: summed over the slabs of a chunked run, that is the energy
+        of the whole volume, each term counted once.
+        """
         usable = labels >= 0
         if not usable.any():
             return float("nan")
+        if core is not None:
+            owned = np.zeros(labels.shape[0], dtype=bool)
+            owned[core[0]:core[1]] = True
+            owned = np.broadcast_to(owned[:, None, None], labels.shape)
         safe = np.where(usable, labels, 0)
         if isinstance(scores, UnaryScores):
             chosen = np.zeros(labels.shape, dtype=np.float32)
@@ -509,7 +680,8 @@ class ROIDerivedMRF:
             unary = -chosen
         else:
             unary = -np.take_along_axis(scores, safe[..., None], axis=3)[..., 0]
-        energy = float(unary[usable].sum())
+        counted = usable if core is None else usable & owned
+        energy = float(unary[counted].sum())
 
         pairwise = self.pairwise
         for axis in _AXES:
@@ -521,6 +693,8 @@ class ROIDerivedMRF:
             high[axis] = slice(1, None)
             low_key, high_key = tuple(low), tuple(high)
             pair_ok = usable[low_key] & usable[high_key]
+            if core is not None:
+                pair_ok &= owned[low_key]
             if not pair_ok.any():
                 continue
             cost = pairwise[safe[low_key][pair_ok], safe[high_key][pair_ok]]
@@ -535,6 +709,38 @@ def potts_cost(n_classes: int, off_diagonal: float = 1.0) -> np.ndarray:
     cost = np.full((n_classes, n_classes), float(off_diagonal), dtype=np.float64)
     np.fill_diagonal(cost, 0.0)
     return cost
+
+
+def _normalised_gaps(neutron, xray, scales, axis):
+    """Joint intensity step to the forward neighbour along *axis*.
+
+    ``sqrt((Δn / s_n)² + (Δx / s_x)²)`` as float32, one layer shorter than
+    the input along *axis*; None if the input is a single layer there.
+    """
+    first = np.asarray(neutron, dtype=np.float32)
+    second = np.asarray(xray, dtype=np.float32)
+    if first.shape[axis] < 2:
+        return None
+    low = [slice(None)] * 3
+    high = [slice(None)] * 3
+    low[axis] = slice(0, -1)
+    high[axis] = slice(1, None)
+    low, high = tuple(low), tuple(high)
+    gap = np.subtract(first[high], first[low])
+    gap /= np.float32(scales[0])
+    np.square(gap, out=gap)
+    other = np.subtract(second[high], second[low])
+    other /= np.float32(scales[1])
+    np.square(other, out=other)
+    gap += other
+    del other
+    np.sqrt(gap, out=gap)
+    return gap
+
+
+def _core_slice(core):
+    """Index selecting a slab's core slices (everything when None)."""
+    return slice(None) if core is None else slice(core[0], core[1])
 
 
 def _mask_labels(labels, valid):

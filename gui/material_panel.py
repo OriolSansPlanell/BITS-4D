@@ -193,6 +193,17 @@ class MaterialPanel(QWidget):
         )
         options_layout.addWidget(self.mixed_check)
 
+        self.flexible_check = QCheckBox("Allow irregular material shapes")
+        self.flexible_check.setChecked(False)
+        self.flexible_check.setToolTip(
+            "Lets a material's region on the histogram be made of up to\n"
+            "three blobs instead of one — for a material in two states, or\n"
+            "a cloud bent by beam hardening, cupping or scatter. How many\n"
+            "blobs each material needs is measured from its voxels; a\n"
+            "material that is one blob stays one blob."
+        )
+        options_layout.addWidget(self.flexible_check)
+
         self.lock_check = QCheckBox("Lock material definitions")
         self.lock_check.setChecked(True)
         self.lock_check.setToolTip(
@@ -357,6 +368,7 @@ class MaterialPanel(QWidget):
             "smoothing_strength": self.smoothing_strength,
             "find_mixed_boundaries": self.find_mixed_boundaries,
             "lock_definitions": self.lock_definitions,
+            "max_components": 3 if self.flexible_check.isChecked() else 1,
         }
 
     # ── results ──────────────────────────────────────────────────────────

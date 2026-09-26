@@ -30,6 +30,9 @@ FORBIDDEN_TERMS = [
 #: Files whose string literals reach the user.
 USER_FACING = [
     "gui/main_window.py",
+    "gui/slice_viewer.py",
+    "gui/dialogs.py",
+    "gui/physics_dialog.py",
     "gui/material_panel.py",
     "gui/dual_histogram_widget.py",
     "gui/statistics_panel.py",

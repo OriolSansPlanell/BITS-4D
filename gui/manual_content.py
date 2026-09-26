@@ -413,10 +413,46 @@ material you want left out — hidden materials are left out of both panels.
 You can also include the regions you have drawn but not saved, set the
 resolution, and turn the legends and the outlines around the highlights on or
 off.</p>
-<p>The figure is saved as <b>SVG</b>: outlines, text and legends stay vector
-graphics, and the text stays editable in Inkscape or Illustrator. The
-resolution you choose applies to the two images inside it (the histogram and
-the slice). PDF, PNG and TIFF can still be picked in the save dialog.</p>
+<p>Like every figure (below), it is saved as <b>SVG</b> by default, and the
+label counts can be saved alongside as CSV.</p>
+
+<h2>Saving any figure: format and CSV</h2>
+<p>Every analysis figure — the histogram time analyses, both metric plots,
+the histogram + slice figure, the K-means cluster timeline and the time-series
+plot — first opens a small window asking:</p>
+<ul>
+<li><b>Figure format</b> — <b>SVG</b> (recommended: outlines, text and
+    legends stay vector graphics and the text stays editable in Inkscape or
+    Illustrator), PDF, PNG or TIFF.</li>
+<li><b>Resolution</b> — for PNG and TIFF, the image resolution; in SVG and
+    PDF, the resolution of any image inside the figure (a histogram), while
+    lines and text stay vector.</li>
+<li><b>Also save the data as CSV</b> — the numbers the figure is drawn from,
+    written next to it with the same name, so the plot can be redrawn or
+    checked in another program.</li>
+</ul>
+<p>The window remembers your last answers. What the CSV holds:</p>
+<table>
+<tr><th>Figure</th><th>CSV</th></tr>
+<tr><td>Histogram evolution / change vs previous</td><td><code>name.csv</code>:
+    per timepoint, the share of voxels that changed bin against the
+    reference; <code>name_bins.csv</code>: every non-empty bin with both
+    counts and the plotted log-difference.</td></tr>
+<tr><td>Marginal evolution / change</td><td>Per timepoint, modality and
+    intensity bin: its share of the voxels and the plotted log2
+    change.</td></tr>
+<tr><td>Histogram &amp; segmentation metrics, spatial metrics</td><td>Every
+    metric value (the long-format metrics table).</td></tr>
+<tr><td>Histogram + slice figure</td><td>Per label: voxels inside its
+    histogram region, and pixels highlighted on the slice.</td></tr>
+<tr><td>K-means cluster timeline</td><td>Per timepoint and cluster: voxels,
+    share, and whether it is present.</td></tr>
+<tr><td>Time-series plot</td><td>The plotted values per selection and
+    timepoint.</td></tr>
+</table>
+<p>In <i>File → Export</i>, the per-class histograms have their own format
+choice and a <i>counts as CSV</i> option, since one export writes many of
+them.</p>
 
 <h2>Quality metrics</h2>
 <p><i>Analytics → Histogram Time Analysis</i>:</p>
@@ -632,14 +668,19 @@ is used, chosen from a memory budget:</p>
 <li><b>Mean-field.</b> Keep a soft assignment <i>r<sub>ik</sub></i> and
 iterate
 <span class="m">r<sub>ik</sub> ∝ exp( U<sub>i</sub>(k) − β Σ<sub>j∈N(i)</sub> w<sub>ij</sub> Σ<sub>l</sub> r<sub>jl</sub> V(k,l) )</span>
-Costs <i>K</i> floats per voxel. The update is <b>damped</b>, mixing each
+Holds several arrays of <i>K</i> numbers per voxel (measured: about
+32·<i>K</i> + 30 bytes per voxel). The update is <b>damped</b>, mixing each
 sweep with the previous one — an undamped synchronous sweep can settle into a
 two-cycle that flips a whole region back and forth forever and looks, from
 outside, like an unstable segmentation.</li>
 <li><b>ICM.</b> Keep hard labels and give each voxel its best label given its
-current neighbours. About 9 bytes per voxel whatever <i>K</i> is; greedier,
-but it runs where mean-field will not fit.</li>
+current neighbours. About 75 bytes per voxel whatever <i>K</i> is; greedier.</li>
 </ul>
+<p>A volume that does not fit is processed in slabs along z, each padded
+with one more slice than there are sweeps. Every voxel is updated from its
+neighbours' previous state, so after <i>n</i> sweeps it depends only on voxels
+within <i>n</i> steps: the padded slabs give exactly the whole-volume result,
+and mean-field is used at any size.</p>
 <p>The total cost is recorded every sweep and should fall. If it rises, the
 refinement is cycling rather than settling, and that is reported.</p>
 """
@@ -649,21 +690,38 @@ _MATH_AUTOSMOOTH = """
 
 <p>β is the most destructive parameter in the method: raise it far enough and
 a small material disappears, with every downstream number still looking
-healthy. It is therefore chosen by measurement.</p>
+healthy. It is therefore chosen by measurement, with a limit on each side.</p>
 
-<p>For each candidate β on a grid, the reference timepoint is segmented and
+<p>For each candidate β on a grid, each checked timepoint is segmented and
 compared against the same timepoint segmented with β = 0:</p>
 
 <span class="m">retention<sub>k</sub>(β) = |{ i : L<sub>i</sub><sup>β</sup> = k }| / |{ i : L<sub>i</sub><sup>0</sup> = k }|</span>
 
-<p>The chosen value is the largest β for which</p>
+<h2>Lower guards: what smoothing may not do</h2>
 <ul>
 <li>every material keeps at least a set share of its unsmoothed volume
-    (default 80 %),</li>
+    (default 80 %);</li>
+<li><b>thin sheets survive</b>: the voxels of each material that belong to
+    a structure one or two voxels thick (those a 3-D opening would remove,
+    in components of at least 30 voxels) keep at least 80 % of
+    themselves — a volume guard alone lets a one-voxel layer be eaten
+    long before the material's total volume notices;</li>
 <li>every control material's volume changes by no more than a small
-    tolerance, and</li>
-<li>the unmatched fraction stays below its limit.</li>
+    tolerance, and the unmatched fraction stays below its limit.</li>
 </ul>
+<p>These are checked at the reference timepoint, at every timepoint where a
+material that appears later was defined (where it is thinnest), and in the
+middle and at the end of the series.</p>
+
+<h2>Upper rule: enough, not more</h2>
+<p>The label change from one grid value to the next,</p>
+<span class="m">Δ(β<sub>j</sub>) = fraction of voxels whose label differs between β<sub>j−1</sub> and β<sub>j</sub></span>
+<p>falls as smoothing takes hold. The chosen β is the first acceptable value
+with Δ below 0.2 %: beyond it more smoothing changes almost nothing, so there
+is no reason to pay for it. If the top of the grid is reached with the labels
+still changing, the grid is doubled (twice at most); if they never settle,
+the health check says the choice sits at the ceiling. A failed guard after
+an acceptable value stops the search there.</p>
 
 <div class="note"><b>Note what the comparison is against.</b> Retention is
 measured at the <i>same timepoint</i> with and without smoothing — never
@@ -672,8 +730,104 @@ genuinely shrinks would look as though smoothing had destroyed it, and the
 software would refuse to report exactly the change it exists to
 measure.</div>
 
-<p>The whole sweep is retained. A chosen number is only trustworthy if you
-can see the curve it came from.</p>
+<p>The whole sweep is retained, with the reason for the choice and the change
+the next value would have made (its sensitivity). A chosen number is only
+trustworthy if you can see the curve it came from.</p>
+"""
+
+_ALIGNMENT = """
+<h1>Alignment and materials you cannot draw</h1>
+
+<h2>Check the alignment first</h2>
+<p><i>Analytics → Time Series Segmentation → Check Alignment…</i> The
+histogram pairs each neutron voxel with the X-ray voxel at the same position,
+so the two volumes must sit on the same grid. An offset of one voxel pairs
+two different materials at every interface: the clouds smear together and a
+thin phase can vanish.</p>
+<p>The check measures the offset at the first, middle and last timepoints and
+offers to correct it — once, if it is constant (a mounting offset), or per
+timepoint if it changes. Correction moves the X-ray volumes by whole voxels
+in memory; files on disk are not changed. Offsets under a voxel are reported
+but left alone: interpolating them away does more harm than good. Only
+shifts are measured — a rotation or a scale difference must be removed with
+a registration tool before loading.</p>
+
+<h2>A material that appears later</h2>
+<p>Draw it where it exists. A material whose region selects nothing at the
+first timepoint is defined at the first timepoint where it does, and the
+panel shows that timepoint next to it. The health check then expects it to
+be absent before. A material that cannot be defined at all is reported as a
+failure, never left out silently.</p>
+
+<h2>A material you cannot draw at all</h2>
+<p><i>Add Materials from Attenuation Coefficients…</i> places it from its
+neutron and X-ray attenuation coefficients. Pick two drawn materials whose
+coefficients you know (air and aluminium are ideal) to calibrate each
+instrument's grey scale, then list the materials to place. Use the X-ray
+coefficient at the effective energy of your spectrum.</p>
+
+<h2>A material in two places on the histogram</h2>
+<p>Tick <i>Allow irregular material shapes</i> on the Materials tab. Each
+material is then described by as many clouds as its own voxels support (up
+to three), instead of one ellipse that may cover a neighbour.</p>
+"""
+
+_MATH_ALIGNMENT = """
+<h1>Alignment, calibration and material shapes</h1>
+
+<h2>Measuring the offset</h2>
+<p>The two modalities have different contrast, so their values cannot be
+compared directly. What they share is dependence: when aligned, the X-ray
+value is best predicted by the neutron value. The mutual information of the
+joint histogram</p>
+<span class="m">I(N; X) = Σ p(n, x) · log[ p(n, x) / (p(n) p(x)) ]</span>
+<p>is largest at the correct alignment. Both volumes are smoothed lightly
+(σ = 1 voxel) so noise does not dominate, then I is maximised over
+whole-voxel shifts, one axis at a time, on a fixed sample of voxels (whole
+voxels need no interpolation, which would itself raise I). A parabola
+through I at the best shift and its two neighbours gives the sub-voxel
+part. An axis counts as measured only if I two voxels either side of the
+peak is at least 1 % lower; along an axis without structure the component
+is reported as zero, not guessed.</p>
+
+<h2>Calibrating grey values to coefficients</h2>
+<p>For each modality, grey = g · μ + o. With reference materials r of known
+μ<sub>r</sub> and measured mean grey value m<sub>r</sub>, (g, o) is the
+least-squares fit; with more than two references the root-mean-square misfit
+is reported. A predicted material's centre is g · μ + o per modality, and
+its spread is the root-mean-square spread of the reference regions — noise
+and partial volume, properties of the instrument.</p>
+
+<h2>Materials as mixtures of clouds</h2>
+<p>With irregular shapes allowed, a material's voxels (standardised per
+channel) are fitted with Gaussian mixtures of 1, 2 and 3 components, and
+the one with the lowest Bayesian information criterion is kept:</p>
+<span class="m">BIC = −2 log L + p log n</span>
+<p>The match score of a bin is then the log of the weighted sum of the
+component densities, so a material occupies only where its voxels are,
+instead of the ellipse that covers all of them.</p>
+"""
+
+_MATH_VALIDATION = """
+<h1>How the method was validated</h1>
+
+<p>Every quantitative claim can be reproduced from the repository:
+<code>python -m validation.run</code> builds a synthetic 4-D cell with exact
+labels — air, an aluminium casing, electrolyte, a lithium electrode and a
+reaction product that is absent at the first timepoint and grows one voxel
+per step — blurs and adds noise to it as a scanner would, and scores BiTS
+and seven other methods (Otsu, multi-level Otsu, K-means, Gaussian mixture,
+random walker, a random-forest pixel classifier) by Dice overlap per
+material and timepoint,</p>
+<span class="m">Dice(A, B) = 2 |A ∩ B| / (|A| + |B|)</span>
+<p>(1 when a material is correctly absent). It also varies the noise, the smoothing strength,
+the alignment, instrument drift, and artefacts, and reports each.</p>
+
+<p>Results and their limits are in <code>docs/validation.md</code>. The
+phantom is simpler than a real cell; unsupervised baselines are named with
+the truth (the most favourable naming possible), and no deep network is
+included, since training one needs labelled volumes this setting does not
+have.</p>
 """
 
 _MATH_VALIDITY = """
@@ -1016,6 +1170,10 @@ SECTIONS: List[Dict[str, str]] = [
     {"id": "health", "group": "How to", "title": "The health check",
      "body": _HEALTH,
      "keywords": "check warning failure refuse unmatched budget"},
+    {"id": "align", "group": "How to",
+     "title": "Alignment and materials you cannot draw", "body": _ALIGNMENT,
+     "keywords": "alignment offset registration shift coefficient attenuation "
+                 "calibration appear later product irregular shape"},
     {"id": "drift", "group": "How to", "title": "When the instrument moves",
      "body": _DRIFT,
      "keywords": "drift stability shift gain beam detector"},
@@ -1045,7 +1203,16 @@ SECTIONS: List[Dict[str, str]] = [
      "keywords": "neighbours cost matrix adjacency damping icm energy"},
     {"id": "m_auto", "group": "Mathematics",
      "title": "Choosing the smoothing strength", "body": _MATH_AUTOSMOOTH,
-     "keywords": "retention sweep grid automatic beta"},
+     "keywords": "retention sweep grid automatic beta thin sheet converged "
+                 "ceiling sensitivity"},
+    {"id": "m_align", "group": "Mathematics",
+     "title": "Alignment, calibration and material shapes",
+     "body": _MATH_ALIGNMENT,
+     "keywords": "mutual information registration calibration least squares "
+                 "bic mixture components"},
+    {"id": "m_validation", "group": "Mathematics",
+     "title": "How the method was validated", "body": _MATH_VALIDATION,
+     "keywords": "validation benchmark phantom dice ground truth baseline"},
     {"id": "m_valid", "group": "Mathematics", "title": "Which voxels count",
      "body": _MATH_VALIDITY,
      "keywords": "mask padding nan saturation field of view floor mad"},

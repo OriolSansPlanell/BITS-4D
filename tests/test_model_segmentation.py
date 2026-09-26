@@ -726,6 +726,29 @@ def test_drift_tracking_beats_a_frozen_boundary_on_a_drifting_series():
     assert tracked_error < frozen_error / 5, (tracked_error, frozen_error)
 
 
+def test_frozen_boundary_loses_air_as_documented():
+    """The exact claim in docs/v17_plan_evaluation.md, pinned down.
+
+    Drift of 90 grey levels per step (a full class spacing over the
+    series): the frozen boundary finds no Air from T2 on — it is absorbed
+    into Aluminium — while the anchored model stays within 1% of the truth
+    for every class at every timepoint.
+    """
+    dataset, masks, neutron, xray = _series()
+    frozen = _run(dataset, masks, neutron, xray, None, StaticTransition())
+    tracked = _run(
+        dataset, masks, neutron, xray,
+        DriftTracker(anchor_classes=("Air", "Aluminium")),
+        DriftTransition(memory=0.5),
+    )
+    air = [entry.voxel_counts.get("Air", 0) for entry in frozen.timepoints]
+    assert air[0] > 0 and air[1] > 0 and air[2:] == [0, 0, 0]
+    for entry in tracked.timepoints:
+        for name, mask in masks[entry.timepoint].items():
+            truth = int(mask.sum())
+            assert abs(entry.voxel_counts.get(name, 0) - truth) <= 0.01 * truth
+
+
 def test_the_model_does_not_invent_change_when_there_is_none():
     """A static series must produce flat curves, drift tracking or not."""
     static = [_volume(shift=0.0, seed=t) for t in range(4)]

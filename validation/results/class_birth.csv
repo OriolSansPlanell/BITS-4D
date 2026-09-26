@@ -1,0 +1,3 @@
+scenario,setting,method,seconds,Air,Aluminium,Electrolyte,Lithium,Product,mean,unclassified
+class birth,product absent at T0,all classes from T0,2.42,0.9682,0.9228,0.9773,0.978,0.1667,0.8026,0.0756
+class birth,product absent at T0,defined where it exists,3.99,0.9752,0.9413,0.9942,0.9831,0.7884,0.9364,0.0379
