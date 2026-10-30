@@ -207,6 +207,56 @@ voxel near a boundary can be assigned sensibly instead of by which side of a
 hand-drawn line it happened to fall on.</p>
 """
 
+_CROP = """
+<h1>Looking at one part of the volume</h1>
+
+<p>A battery cell is a stack of thin layers, and the histogram of the whole
+volume mixes them with the housing, the plungers and everything between.
+The <b>virtual crop</b> lets you look at one part of the volume at a time
+without changing the data.</p>
+
+<h2>Cropping</h2>
+<ol>
+<li>Press <b>⬚ Crop</b> on the slice viewer and drag a rectangle on the
+    slice. The rectangle is <i>propagated along the view axis</i>: on an XY
+    slice it becomes a column through every Z, on an XZ slice a slab through
+    every Y, and so on. Its footprint is drawn on all three planes and the
+    outside is dimmed.</li>
+<li>The <b>local histogram</b> now shows only the voxels inside the box, the
+    <b>axial profile</b> is computed inside it, and <b>✂ Segment
+    Current</b> labels only voxels inside it.</li>
+<li><b>✕ Crop</b> removes it. Nothing was cut: the data, the global
+    histogram and your classes are untouched.</li>
+</ol>
+<div class="note">The global histogram still covers the whole volume so that
+classes drawn on it keep meaning the same thing. If you want it, too, to
+cover only the box, use <i>Analytics → Global Histogram Inside Crop</i>;
+the bin grid then follows the crop's intensity range.</div>
+
+<h2>The axial profile</h2>
+<p>Under the slice viewer, the <b>axial profile</b> plots the mean neutron
+(blue) and X-ray (red) value of every slice along the current view axis,
+inside the crop if there is one. A layered sample reads directly: each
+material is a plateau, each boundary a step, and a layer that is invisible
+in one modality often stands out in the other. The dashed line is the slice
+on screen.</p>
+<ul>
+<li><b>Drag</b> a range on the profile: the crop is bounded to those slices
+    along the stack axis, and the local histogram shows exactly that
+    layer's cloud. Draw your region there, save it as a class.</li>
+<li><b>Click</b> a position to jump the slice viewer to that slice.</li>
+<li><b>Full extent</b> releases the range; <b>± σ band</b> shades the spread
+    of each slice.</li>
+</ul>
+<p>A good way to segment a planar stack: crop the pellet interior on an XY
+slice, switch to the XZ plane so the profile runs along the stack, then
+walk the plateaus one at a time — select the range, name the class, move
+on. Layers with the same histogram position but different places in the
+stack (two cathode formulations, say) are separated by their range, not by
+the histogram.</p>
+"""
+
+
 _CONTROLS = """
 <h1>Control materials</h1>
 
@@ -1161,6 +1211,10 @@ SECTIONS: List[Dict[str, str]] = [
                  "cluster edit slice volume time series transient phase "
                  "timeline "
                  "select move arrow keys keyboard backspace delete several"},
+    {"id": "crop", "group": "How to", "title": "Looking at one part of the volume",
+     "body": _CROP,
+     "keywords": "crop virtual box rectangle propagate stack axis profile "
+                 "axial layer plateau range slice mean neutron xray dim"},
     {"id": "controls", "group": "How to", "title": "Control materials",
      "body": _CONTROLS,
      "keywords": "inert unchanged null check casing support steel"},

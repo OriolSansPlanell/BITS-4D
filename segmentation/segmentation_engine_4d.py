@@ -46,16 +46,34 @@ class SegmentationEngine4D:
         xray_3d: np.ndarray,
         roi_manager: ROIManager,
         progress_callback: ProgressCallback = None,
+        box=None,
     ) -> np.ndarray:
-        """Return a boolean mask for one paired 3-D volume."""
+        """Return a boolean mask for one paired 3-D volume.
+
+        With *box* (a :class:`utils.crop_box.CropBox`) only the voxels inside
+        the virtual crop are tested against the ROI; everything outside is
+        False. The mask keeps the full volume shape either way.
+        """
         self._validate_pair(neutron_3d, xray_3d, expected_ndim=3)
         if not roi_manager.has_roi():
             raise ValueError("No ROI defined in ROI manager")
 
         self._report(progress_callback, 10, "Checking voxels against ROI...")
-        mask = np.asarray(
-            roi_manager.is_inside_roi(neutron_3d, xray_3d), dtype=bool
-        )
+        if box is not None:
+            if tuple(box.shape) != tuple(neutron_3d.shape):
+                raise ValueError(
+                    f"Crop box shape {tuple(box.shape)} does not match volume "
+                    f"{tuple(neutron_3d.shape)}"
+                )
+            inside = np.asarray(
+                roi_manager.is_inside_roi(box.crop(neutron_3d), box.crop(xray_3d)),
+                dtype=bool,
+            )
+            mask = box.embed(inside, fill=False)
+        else:
+            mask = np.asarray(
+                roi_manager.is_inside_roi(neutron_3d, xray_3d), dtype=bool
+            )
         if mask.shape != neutron_3d.shape:
             raise ValueError(
                 f"ROI manager returned shape {mask.shape}; expected {neutron_3d.shape}"

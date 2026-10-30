@@ -191,7 +191,19 @@ class BiTS4DMainWindow(QMainWindow):
         self.slice_viewer.clusters_detected.connect(self._on_clusters_detected)
         self.slice_viewer.kmeans_requested.connect(self._show_kmeans_controls)
         self.slice_viewer.highlight_cleared.connect(self._on_highlight_cleared)
-        viewer_layout.addWidget(self.slice_viewer)
+        # Virtual crop and the axial profile it feeds
+        self.crop_box = None
+        self.slice_viewer.crop_rectangle_drawn.connect(self._on_crop_rectangle_drawn)
+        self.slice_viewer.crop_cleared.connect(self._on_crop_cleared)
+        self.slice_viewer.axis_changed.connect(self._on_view_axis_changed)
+        self.slice_viewer.slice_index_changed.connect(self._on_view_slice_changed)
+        viewer_layout.addWidget(self.slice_viewer, stretch=1)
+        from gui.axial_profile_widget import AxialProfileWidget
+        self.axial_profile = AxialProfileWidget()
+        self.axial_profile.range_selected.connect(self._on_profile_range_selected)
+        self.axial_profile.range_cleared.connect(self._on_profile_range_cleared)
+        self.axial_profile.index_clicked.connect(self._on_profile_index_clicked)
+        viewer_layout.addWidget(self.axial_profile)
         viewer_group.setLayout(viewer_layout)
         centre_vbox.addWidget(viewer_group)
         centre_widget.setLayout(centre_vbox)
@@ -690,6 +702,15 @@ class BiTS4DMainWindow(QMainWindow):
         compare_action.triggered.connect(self._on_compare_selections)
         analytics_menu.addAction(compare_action)
 
+        # Virtual crop: the global histogram of the box over all timepoints
+        crop_global_action = QAction("Global Histogram Inside Crop", self)
+        crop_global_action.setToolTip(
+            "Recompute the global (all-timepoints) histogram from the voxels\n"
+            "inside the virtual crop drawn on the slice viewer."
+        )
+        crop_global_action.triggered.connect(self._on_global_histogram_in_crop)
+        analytics_menu.addAction(crop_global_action)
+
         # Temporal histogram analyses
         hist_menu = analytics_menu.addMenu("Histogram Time Analysis")
 
@@ -1069,6 +1090,9 @@ class BiTS4DMainWindow(QMainWindow):
             return
         
         self.dataset = dataset
+        # A crop belongs to one volume shape; drop it with the old dataset
+        self.crop_box = None
+        self.slice_viewer.set_crop_box(None)
         self.segmentation_masks.clear()  # Clear any previous segmentation masks
         self._cleared_layers = {}
         self._last_hidden_classes = set()
@@ -1301,17 +1325,12 @@ class BiTS4DMainWindow(QMainWindow):
         self.dataset.set_timepoint(timepoint)
 
         # Serve the local histogram from the in-memory cache; only compute
-        # when this timepoint has not been visited/precomputed yet.
+        # when this timepoint has not been visited/precomputed yet. With a
+        # virtual crop the local histogram is the crop's.
         try:
-            local_hist = self.histogram_engine.get_cached_local_histogram(
-                timepoint
-            )
-            if local_hist is None:
-                neutron_vol, xray_vol = self.dataset.get_current_volume()
-                local_hist = self.histogram_engine.compute_local_histogram(
-                    neutron_vol, xray_vol, timepoint
-                )
+            local_hist = self._local_histogram_for(timepoint)
             self.dual_histogram.set_local_histogram(local_hist)
+            self._set_local_histogram_title()
         except RuntimeError as e:
             # Global histogram not computed yet — leave local display empty
             print(f"Local histogram unavailable: {e}", file=sys.stderr)
@@ -1327,8 +1346,158 @@ class BiTS4DMainWindow(QMainWindow):
         # so redraw them rather than leaving the previous timepoint's.
         self._update_class_histogram_overlays(timepoint)
 
+        self._refresh_axial_profile()
         self.status_bar.showMessage(f"Viewing timepoint {timepoint}")
-    
+
+    # ── Virtual crop and axial profile ───────────────────────────────────────
+
+    def _local_histogram_for(self, timepoint):
+        """The local histogram of *timepoint*: the whole volume, or the crop."""
+        if self.crop_box is not None:
+            neutron_vol, xray_vol = self.dataset.get_volume_at_time(timepoint)
+            return self.histogram_engine.compute_box_histogram(
+                neutron_vol, xray_vol, self.crop_box, timepoint
+            )
+        local_hist = self.histogram_engine.get_cached_local_histogram(timepoint)
+        if local_hist is None:
+            neutron_vol, xray_vol = self.dataset.get_volume_at_time(timepoint)
+            local_hist = self.histogram_engine.compute_local_histogram(
+                neutron_vol, xray_vol, timepoint
+            )
+        return local_hist
+
+    def _set_local_histogram_title(self):
+        canvas = self.dual_histogram.local_canvas
+        if self.crop_box is None:
+            canvas.title = "Local Histogram"
+        else:
+            canvas.title = f"Local Histogram — crop {self.crop_box.describe()}"
+        canvas.ax.set_title(canvas.title)
+        canvas.draw_idle()
+
+    def _full_resolution_shape(self):
+        return tuple(int(v) for v in self.dataset.shape[-3:])
+
+    def _on_crop_rectangle_drawn(self, rect, axis):
+        """A crop rectangle was drawn on the slice viewer's current plane."""
+        if not self.dataset:
+            return
+        from utils.crop_box import CropBox
+        shape = self._full_resolution_shape()
+        # keep a range already chosen along this axis on the profile
+        along = None
+        if (self.crop_box is not None
+                and self.crop_box.bounds(axis) != (0, shape["zyx".index(axis)])):
+            along = self.crop_box.bounds(axis)
+        self.crop_box = CropBox.from_plane_rectangle(
+            axis, rect, shape, bin_factor=self.display_bin_factor, along=along
+        )
+        self._apply_crop()
+
+    def _on_crop_cleared(self):
+        self.crop_box = None
+        self._apply_crop()
+
+    def _on_profile_range_selected(self, axis, lo, hi):
+        """A range dragged on the axial profile bounds the crop along *axis*."""
+        if not self.dataset:
+            return
+        from utils.crop_box import CropBox
+        base = self.crop_box or CropBox.full(self._full_resolution_shape())
+        self.crop_box = base.with_range(axis, lo, hi)
+        self._apply_crop()
+
+    def _on_profile_range_cleared(self, axis):
+        if self.crop_box is None:
+            return
+        box = self.crop_box.with_full_range(axis)
+        self.crop_box = None if box.is_full() else box
+        self._apply_crop()
+
+    def _on_profile_index_clicked(self, axis, index):
+        """Jump the slice viewer to a slice clicked on the profile."""
+        self.slice_viewer.go_to_slice(axis, index // max(self.display_bin_factor, 1))
+
+    def _on_view_axis_changed(self, axis):
+        self._refresh_axial_profile()
+
+    def _on_view_slice_changed(self, axis, index):
+        if self.axial_profile.profile is not None and self.axial_profile.axis == axis:
+            self.axial_profile.set_current_index(index * max(self.display_bin_factor, 1))
+
+    def _apply_crop(self):
+        """Push the current crop to the viewer, the local histogram and the profile."""
+        self.slice_viewer.set_crop_box(self.crop_box)
+        if not self.dataset or not self.histogram_engine:
+            return
+        timepoint = self.dataset.current_timepoint
+        try:
+            self.dual_histogram.set_local_histogram(self._local_histogram_for(timepoint))
+            self._set_local_histogram_title()
+        except Exception as e:
+            print(f"Crop histogram unavailable: {e}", file=sys.stderr)
+        self._refresh_axial_profile()
+        if self.crop_box is None:
+            self.status_bar.showMessage("Crop removed: whole volume")
+        else:
+            self.status_bar.showMessage(
+                f"Crop {self.crop_box.describe()} — local histogram, profile and "
+                "Segment Current use the crop only"
+            )
+
+    def _refresh_axial_profile(self):
+        """Recompute the axial profile along the viewer's axis for this timepoint."""
+        if not self.dataset or not hasattr(self, 'axial_profile'):
+            return
+        from utils.crop_box import axial_profile
+        try:
+            neutron_vol, xray_vol = self.dataset.get_current_volume()
+            axis = self.slice_viewer.current_axis
+            full = neutron_vol.shape["zyx".index(axis)]
+            selected = None
+            box = self.crop_box
+            if box is not None and box.bounds(axis) != (0, full):
+                # the profile shows the whole stack axis so the selected range
+                # is seen in context
+                selected = box.bounds(axis)
+                box = box.with_full_range(axis)
+            prof = axial_profile(neutron_vol, xray_vol, axis, box)
+            index = self.slice_viewer.current_slice_index
+            current = None if index is None else int(index) * max(self.display_bin_factor, 1)
+            self.axial_profile.set_profile(prof, current_index=current,
+                                           selected_range=selected,
+                                           cropped=self.crop_box is not None)
+        except Exception as e:
+            print(f"Axial profile unavailable: {e}", file=sys.stderr)
+
+    def _on_global_histogram_in_crop(self):
+        """Recompute the global histogram from the crop only (all timepoints)."""
+        if not self.dataset or not self.histogram_engine:
+            return
+        if self.crop_box is None:
+            QMessageBox.information(self, "No crop", "Draw a crop on the slice viewer first.")
+            return
+        box = self.crop_box
+
+        def compute_operation(progress_callback):
+            return self.histogram_engine.compute_global_histogram(
+                box.crop(self.dataset.neutron_data),
+                box.crop(self.dataset.xray_data),
+                progress_callback=progress_callback,
+            )
+
+        global_hist = run_with_progress(
+            self, "Computing Global Histogram",
+            f"Histogram of the crop over all timepoints ({box.describe()})...",
+            compute_operation,
+        )
+        if global_hist is not None:
+            self.global_histogram = global_hist
+            self.histogram_engine.clear_cache()      # bin grid changed
+            self.dual_histogram.set_global_histogram(global_hist)
+            self._apply_crop()
+            self.status_bar.showMessage("Global histogram now covers the crop only")
+
     @pyqtSlot()
     def _on_roi_updated(self):
         """Handle ROI update.
@@ -2750,7 +2919,7 @@ class BiTS4DMainWindow(QMainWindow):
                         tmp_rm.set_rectangle_roi(*roi['rectangle'])
 
                     mask = self.segmentation_engine.segment_volume(
-                        neutron_vol, xray_vol, tmp_rm
+                        neutron_vol, xray_vol, tmp_rm, box=self.crop_box
                     )
                     results.append((mask, roi['color'], roi['name']))
                 return results
@@ -2824,7 +2993,7 @@ class BiTS4DMainWindow(QMainWindow):
             def segment_operation(progress_callback):
                 return self.segmentation_engine.segment_volume(
                     neutron_vol, xray_vol, roi_manager,
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback, box=self.crop_box
                 )
 
             mask = run_with_progress(

@@ -56,6 +56,10 @@ class HistogramEngine4D:
             use_gpu and torch is not None and torch.cuda.is_available()
         )
         self._local_cache: OrderedDict[tuple, HistogramData] = OrderedDict()
+        # Histograms of a virtual crop (utils.crop_box.CropBox) live apart from
+        # the per-timepoint cache, so get_cached_local_histogram never hands
+        # back a cropped histogram for the whole volume.
+        self._box_cache: OrderedDict[tuple, HistogramData] = OrderedDict()
         self._global_histogram: Optional[HistogramData] = None
         self._data_range: Optional[Range2D] = None
 
@@ -401,6 +405,61 @@ class HistogramEngine4D:
             del n_tensor, x_tensor, n_bins, x_bins, counts
         return histogram
 
+    def compute_box_histogram(
+        self,
+        neutron_3d: np.ndarray,
+        xray_3d: np.ndarray,
+        box,
+        timepoint: int,
+        progress_callback: Progress = None,
+        cancel_check: CancelCheck = None,
+    ) -> HistogramData:
+        """2-D histogram of the voxels inside a virtual crop *box* only.
+
+        *box* is a :class:`utils.crop_box.CropBox` in full-resolution
+        coordinates. The bin grid is the global histogram's, so the result
+        compares bin-for-bin with every other histogram. Only the box is
+        read (a view of the volume), and results are cached per
+        ``(timepoint, box)`` separately from the whole-volume cache.
+        """
+        self._validate_pair(neutron_3d, xray_3d, ndim=3)
+        if self._data_range is None:
+            raise RuntimeError("Must compute global histogram first")
+        if tuple(box.shape) != tuple(neutron_3d.shape):
+            raise ValueError(
+                f"Crop box shape {tuple(box.shape)} does not match volume "
+                f"{tuple(neutron_3d.shape)}"
+            )
+        key = (int(timepoint), box.z, box.y, box.x, tuple(box.shape),
+               str(neutron_3d.dtype), str(xray_3d.dtype))
+        if key in self._box_cache:
+            self._box_cache.move_to_end(key)
+            self._report(progress_callback, 100, "Retrieved crop histogram from cache")
+            return self._box_cache[key]
+
+        n_box = box.crop(neutron_3d)
+        x_box = box.crop(xray_3d)
+        valid = 0
+        ignored = 0
+        for n_chunk, x_chunk in self._iter_chunks(n_box, x_box):
+            finite = np.isfinite(n_chunk) & np.isfinite(x_chunk)
+            valid += int(np.count_nonzero(finite))
+            ignored += int(finite.size - np.count_nonzero(finite))
+        if valid == 0:
+            raise ValueError("No finite neutron/X-ray voxel pairs inside the crop")
+
+        result = self._accumulate(
+            n_box, x_box, self._data_range, 1, valid, ignored,
+            progress_callback, cancel_check, progress_start=0,
+        )
+        if self.cache_size > 0:
+            self._box_cache[key] = result
+            self._box_cache.move_to_end(key)
+            while len(self._box_cache) > self.cache_size:
+                self._box_cache.popitem(last=False)
+        self._report(progress_callback, 100, "Crop histogram complete")
+        return result
+
     def compute_masked_histogram(
         self,
         neutron_3d: np.ndarray,
@@ -510,6 +569,7 @@ class HistogramEngine4D:
 
     def clear_cache(self, include_global: bool = False) -> None:
         self._local_cache.clear()
+        self._box_cache.clear()
         if include_global:
             self._global_histogram = None
             self._data_range = None

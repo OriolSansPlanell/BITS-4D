@@ -62,6 +62,16 @@ class SliceViewerWidget(QWidget):
 
     # The Clear Highlight button: the window hides the layers behind it
     highlight_cleared = pyqtSignal()
+
+    # Virtual crop: a rectangle drawn on the displayed slice, to be
+    # propagated along the view axis. Arguments: ((x1, y1, x2, y2) in display
+    # pixels of the plane, view axis). The window turns it into a CropBox.
+    crop_rectangle_drawn = pyqtSignal(tuple, str)
+    # The ✕ Crop button
+    crop_cleared = pyqtSignal()
+    # The view axis or the displayed slice changed: (axis) / (axis, index)
+    axis_changed = pyqtSignal(str)
+    slice_index_changed = pyqtSignal(str, int)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -101,17 +111,17 @@ class SliceViewerWidget(QWidget):
         
         self.z_axis_btn = QRadioButton("XY (Z-slice)")
         self.z_axis_btn.setChecked(True)
-        self.z_axis_btn.toggled.connect(lambda: self._on_axis_changed('z'))
+        self.z_axis_btn.toggled.connect(lambda checked: checked and self._on_axis_changed('z'))
         self.axis_group.addButton(self.z_axis_btn)
         controls.append(self.z_axis_btn)
         
         self.y_axis_btn = QRadioButton("XZ (Y-slice)")
-        self.y_axis_btn.toggled.connect(lambda: self._on_axis_changed('y'))
+        self.y_axis_btn.toggled.connect(lambda checked: checked and self._on_axis_changed('y'))
         self.axis_group.addButton(self.y_axis_btn)
         controls.append(self.y_axis_btn)
         
         self.x_axis_btn = QRadioButton("YZ (X-slice)")
-        self.x_axis_btn.toggled.connect(lambda: self._on_axis_changed('x'))
+        self.x_axis_btn.toggled.connect(lambda checked: checked and self._on_axis_changed('x'))
         self.axis_group.addButton(self.x_axis_btn)
         controls.append(self.x_axis_btn)
         
@@ -267,6 +277,23 @@ class SliceViewerWidget(QWidget):
         self.auto_detect_btn.clicked.connect(self._on_auto_detect)
         spatial.append(self.auto_detect_btn)
         
+        self.crop_tool_btn = QPushButton("⬚ Crop")
+        self.crop_tool_btn.setCheckable(True)
+        self.crop_tool_btn.setToolTip(
+            "Virtual crop: draw a rectangle on this slice; it is propagated\n"
+            "along the view axis through the whole stack. The local histogram,\n"
+            "the axial profile and Segment Current then use only the voxels\n"
+            "inside the box. Nothing is cut from the data."
+        )
+        self.crop_tool_btn.clicked.connect(self._on_crop_tool_clicked)
+        spatial.append(self.crop_tool_btn)
+
+        self.clear_crop_btn = QPushButton("✕ Crop")
+        self.clear_crop_btn.setToolTip("Remove the virtual crop (whole volume again)")
+        self.clear_crop_btn.clicked.connect(self._on_clear_crop_clicked)
+        self.clear_crop_btn.setEnabled(False)
+        spatial.append(self.clear_crop_btn)
+
         self.clear_spatial_roi_btn = QPushButton("✕ Clear")
         self.clear_spatial_roi_btn.setToolTip("Clear spatial ROI")
         self.clear_spatial_roi_btn.clicked.connect(self._clear_spatial_roi)
@@ -309,6 +336,12 @@ class SliceViewerWidget(QWidget):
         # Initialize spatial ROI state
         self.spatial_roi_selector = None
         self.spatial_roi_coords = None
+
+        # Virtual crop (utils.crop_box.CropBox, full-resolution indices) and
+        # the one-shot selector used to draw it
+        self.crop_box = None
+        self.crop_selector = None
+        self._crop_artists = []
         
         # Region growing state
         self.region_grow_mode = False
@@ -509,16 +542,30 @@ class SliceViewerWidget(QWidget):
     
     def _on_axis_changed(self, axis):
         """Handle axis selection change"""
+        if axis == self.current_axis:
+            return                      # the other radio button toggling off
         print(f"Axis changed to: {axis}", file=sys.stderr)
         self.current_axis = axis
         self._configure_slider()
         self._update_display()
+        self.axis_changed.emit(axis)
     
     def _on_slice_changed(self, value):
         """Handle slice index change (debounced while dragging)"""
         self.current_slice_index = value
         self.slice_label.setText(str(value))
         self._redraw_timer.start()
+        self.slice_index_changed.emit(self.current_axis, int(value))
+
+    def go_to_slice(self, axis, index):
+        """Show slice *index* along *axis* (used by the axial profile)."""
+        if axis != self.current_axis:
+            button = {'z': self.z_axis_btn, 'y': self.y_axis_btn,
+                      'x': self.x_axis_btn}[axis]
+            button.setChecked(True)     # triggers _on_axis_changed
+        index = int(min(max(index, self.slice_slider.minimum()),
+                        self.slice_slider.maximum()))
+        self.slice_slider.setValue(index)
     
     def _on_view_mode_changed(self, mode):
         """Handle view mode change (neutron vs X-ray)"""
@@ -627,6 +674,98 @@ class SliceViewerWidget(QWidget):
         
         print(f"  Spatial ROI stored: {self.spatial_roi_coords}", file=sys.stderr)
     
+    # ── virtual crop ───────────────────────────────────────────────────────
+    def _on_crop_tool_clicked(self, checked):
+        """Arm (or disarm) the one-shot crop rectangle."""
+        if checked:
+            # one spatial tool at a time
+            if self.rect_tool_btn.isChecked():
+                self.rect_tool_btn.setChecked(False)
+                self._on_rect_tool_clicked(False)
+            if self.region_grow_btn.isChecked():
+                self.region_grow_btn.setChecked(False)
+                self._on_region_grow_clicked(False)
+            from matplotlib.widgets import RectangleSelector
+            if self.crop_selector is not None:
+                try:
+                    self.crop_selector.set_active(False)
+                except Exception:
+                    pass
+            try:
+                self.crop_selector = RectangleSelector(
+                    self.ax, self._on_crop_rectangle_selected, useblit=True,
+                    button=[1], minspanx=2, minspany=2, interactive=False,
+                    props=dict(facecolor='#f2b134', edgecolor='#f2b134',
+                               alpha=0.25, linewidth=2),
+                )
+            except TypeError:
+                self.crop_selector = RectangleSelector(
+                    self.ax, self._on_crop_rectangle_selected)
+            self.info_label.setText(
+                "Crop: drag a rectangle; it is propagated along the "
+                f"{self.current_axis.upper()} axis"
+            )
+        else:
+            if self.crop_selector is not None:
+                try:
+                    self.crop_selector.set_active(False)
+                except Exception:
+                    pass
+            self.info_label.setText("Crop tool deactivated")
+
+    def _on_crop_rectangle_selected(self, eclick, erelease):
+        """The crop rectangle is finished: hand it to the window."""
+        if None in (eclick.xdata, eclick.ydata, erelease.xdata, erelease.ydata):
+            return
+        rect = (float(eclick.xdata), float(eclick.ydata),
+                float(erelease.xdata), float(erelease.ydata))
+        # one-shot: disarm and remove the selector's own drawing; the crop
+        # is drawn by _draw_crop_overlay on every redraw instead
+        if self.crop_selector is not None:
+            try:
+                self.crop_selector.set_active(False)
+                self.crop_selector.set_visible(False)
+            except Exception:
+                pass
+        self.crop_tool_btn.setChecked(False)
+        self.crop_rectangle_drawn.emit(rect, self.current_axis)
+
+    def _on_clear_crop_clicked(self):
+        self.set_crop_box(None)
+        self.crop_cleared.emit()
+
+    def set_crop_box(self, box):
+        """Show *box* (a CropBox in full-resolution indices, or None)."""
+        self.crop_box = box
+        self.clear_crop_btn.setEnabled(box is not None)
+        if self.current_slice_data is not None:
+            self._update_display()
+
+    def _draw_crop_overlay(self, data_slice):
+        """Outline the crop's footprint on this plane and dim the outside."""
+        for artist in self._crop_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._crop_artists = []
+        if self.crop_box is None:
+            return
+        from matplotlib.patches import Rectangle
+        x1, y1, x2, y2 = self.crop_box.rectangle_on_plane(
+            self.current_axis, self.display_bin_factor)
+        h, w = data_slice.shape
+        # dim everything outside the footprint (four bands)
+        dim = dict(facecolor='black', alpha=0.35, edgecolor='none', zorder=4)
+        for (x0, y0, ww, hh) in ((0, 0, w, y1), (0, y2, w, h - y2),
+                                 (0, y1, x1, y2 - y1), (x2, y1, w - x2, y2 - y1)):
+            if ww > 0 and hh > 0:
+                self._crop_artists.append(self.ax.add_patch(
+                    Rectangle((x0, y0), ww, hh, **dim)))
+        self._crop_artists.append(self.ax.add_patch(Rectangle(
+            (x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor='#f2b134',
+            linewidth=1.8, linestyle='--', zorder=5)))
+
     def _clear_spatial_roi(self):
         """Clear spatial ROI (rectangle or region growing)"""
         import sys
@@ -1303,6 +1442,8 @@ class SliceViewerWidget(QWidget):
         # The grown region survives redraws (contrast, slice, plane changes)
         if self.region_grow_mask is not None:
             self._display_mask_overlay()
+        # The virtual crop's footprint on this plane
+        self._draw_crop_overlay(data_slice)
 
         # Report what is actually highlighted on this slice
         if self._visible_mask_pixels > 0:
@@ -1322,6 +1463,8 @@ class SliceViewerWidget(QWidget):
                 f" | display binned x{self.display_bin_factor} (median) — "
                 "segmentation runs at full resolution"
             )
+        if self.crop_box is not None:
+            info += f" | crop: {self.crop_box.describe()}"
 
         self.info_label.setText(info)
 

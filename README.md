@@ -22,6 +22,16 @@ back to voxels.
   or hide each class (hidden classes are excluded from segmentation too, so
   you can work with one at a time), pull one back for reshaping with *Edit*,
   rename, remove, or isolate with *Only This*.
+- **Virtual crop and axial profile** — press **⬚ Crop** and draw a
+  rectangle on the slice: it is propagated along the view axis through the
+  whole stack, and the local histogram, the axial profile and *Segment
+  Current* then use only the voxels inside the box (nothing is cut from the
+  data; the box is drawn on all three planes). The **axial profile** under
+  the slice viewer plots the mean neutron and X-ray value of every slice
+  along the view axis inside the crop — a layered sample reads as steps —
+  and dragging a range on it bounds the crop along the stack axis, so the
+  histogram shows exactly one layer at a time. *Analytics → Global Histogram
+  Inside Crop* recomputes the all-timepoints histogram from the box.
 - **Spatial → histogram selection** — draw a rectangle or grow a region
   (2-D or full 3-D, univariate or bivariate) on the slice viewer and convert
   it into a histogram ROI automatically.
