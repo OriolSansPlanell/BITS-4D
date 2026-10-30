@@ -1,6 +1,33 @@
 # Bug-fix and cleanup notes
 
-## Answering a methods review (latest)
+## Virtual crop and axial profile (latest)
+
+Segmenting a planar cell from the bivariate histogram alone is hard when the
+housing, plungers and several thin layers share one cloud. Two additions on
+the slice viewer:
+
+* **⬚ Crop** draws a rectangle on the displayed slice and propagates it
+  along the view axis (`utils/crop_box.py`, `CropBox`). The local histogram
+  (`HistogramEngine4D.compute_box_histogram`, cached apart from the
+  whole-volume cache), the axial profile and *Segment Current*
+  (`SegmentationEngine4D.segment_volume(box=)`) use only the voxels inside.
+  Display binning is undone when the box is built, so a rectangle drawn on
+  a binned slice selects the right full-resolution voxels; the footprint is
+  drawn on all three planes with the outside dimmed. *Analytics → Global
+  Histogram Inside Crop* recomputes the all-timepoints histogram from the
+  box.
+* **Axial profile** (`gui/axial_profile_widget.py`): mean neutron and X-ray
+  value per slice along the view axis inside the crop. Dragging a range on
+  it bounds the crop along the stack axis; clicking jumps the viewer to that
+  slice. Layers that overlap in the histogram but sit at different depths
+  are separated by their range.
+
+Also: the view-axis radio buttons now react only to the button that becomes
+checked (each change used to run the handler twice, once for the button
+toggling off), and the slice viewer emits `axis_changed` /
+`slice_index_changed`.
+
+## Answering a methods review
 
 A review of BiTS for publication listed nine weaknesses. What changed for
 each:

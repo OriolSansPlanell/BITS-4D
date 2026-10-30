@@ -9,7 +9,8 @@ coordinate conventions every module must respect, and how to extend it.
 main.py
 └── gui/                          PyQt5 presentation layer
     ├── main_window.py            BiTS4DMainWindow (re-exports the two below)
-    ├── slice_viewer.py           SliceViewerWidget
+    ├── slice_viewer.py           SliceViewerWidget (incl. the ⬚ Crop tool)
+    ├── axial_profile_widget.py   Mean per slice along the view axis, range picker
     ├── dialogs.py                Anchor, export-options and figure-export dialogs
     ├── physics_dialog.py         Materials from attenuation coefficients
     ├── runtime_fixes.py          Behavioural overrides applied at import time
@@ -54,6 +55,7 @@ Computation layer (GUI-independent, scriptable):
     utils/region_growing.py       2-D flood fill (uni/bivariate)
     utils/region_growing_3d.py    3-D connected region growing
     utils/value_extractor.py      Spatial rectangle → intensity values
+    utils/crop_box.py             Virtual crop (CropBox) and the axial profile
     utils/progress_dialog.py      Worker thread + cancellable progress dialogs
     utils/cancellation.py         CancellationToken, OperationCancelled/Failed
     utils/selection_library.py    Selection persistence + CSV/Excel export
@@ -576,3 +578,19 @@ in place — cached histograms remain valid, so no recomputation occurs.
   stops tifffile from storing a 3- or 4-slice volume as an RGB image.
 - **Testing:** engines are GUI-free, so test them directly with pytest. GUI
   logic can be exercised offscreen (`QT_QPA_PLATFORM=offscreen`).
+
+## The virtual crop
+
+`utils.crop_box.CropBox` is an axis-aligned box in **full-resolution**
+`(Z, Y, X)` indices, half-open per axis. The slice viewer builds one from a
+rectangle drawn on the displayed plane (`CropBox.from_plane_rectangle`),
+undoing the display binning and propagating the rectangle along the view
+axis; the axial profile can then bound it along that axis
+(`CropBox.with_range`). Everything that honours the crop reads the same
+object: `HistogramEngine4D.compute_box_histogram` (cached apart from the
+whole-volume cache, so `get_cached_local_histogram` never returns a cropped
+histogram), `SegmentationEngine4D.segment_volume(..., box=)` (mask keeps the
+full shape, False outside), `axial_profile` and the viewer overlay
+(`CropBox.rectangle_on_plane` gives the footprint on any plane). The crop is
+virtual: `CropBox.crop` returns a view, never a copy, so memory-mapped data
+stays on disk.
